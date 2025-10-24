@@ -12,7 +12,6 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const app = express();
 
-// Allow JSON bodies (HubSpot webhooks)
 app.use(express.json({ limit: "5mb" }));
 
 // ---------- Helpers ----------
@@ -85,11 +84,30 @@ app.post("/process-call", async (req, res) => {
     const keys = Object.keys(body);
     console.log("Incoming webhook keys:", keys);
 
-    // Pull candidate fields (support multiple names)
-    const candidateRecordingUrl = body.recordingUrl ?? body.hs_call_recording_url ?? body.recording_url ?? null;
-    const candidateCallId = body.callId ?? body.hs_object_id ?? body.call_id ?? null;
+    const props = body.properties || {};
+    if (body.properties) {
+      console.log("properties keys:", Object.keys(props));
+    }
 
-    // Debug: type/length of incoming values (not the full content)
+    // Accept multiple names at top level AND inside `properties`
+    const candidateRecordingUrl =
+      body.recordingUrl ??
+      body.hs_call_recording_url ??
+      body.recording_url ??
+      props.hs_call_recording_url ??
+      props.recording_url ??
+      props.recordingUrl ??
+      null;
+
+    const candidateCallId =
+      body.callId ??
+      body.hs_object_id ??
+      body.call_id ??
+      props.hs_object_id ??
+      props.call_id ??
+      props.callId ??
+      null;
+
     const urlType = typeof candidateRecordingUrl;
     const urlLen = candidateRecordingUrl ? String(candidateRecordingUrl).length : 0;
     const callIdType = typeof candidateCallId;
@@ -97,23 +115,23 @@ app.post("/process-call", async (req, res) => {
     console.log(`recordingUrl -> type: ${urlType}, length: ${urlLen}`);
     console.log(`callId       -> type: ${callIdType}, length: ${callIdLen}`);
 
-    // Validate
-    const recordingUrl = candidateRecordingUrl && String(candidateRecordingUrl).trim().length > 0
-      ? String(candidateRecordingUrl).trim()
-      : null;
+    const recordingUrl =
+      candidateRecordingUrl && String(candidateRecordingUrl).trim().length > 0
+        ? String(candidateRecordingUrl).trim()
+        : null;
 
-    const callId = candidateCallId && String(candidateCallId).trim().length > 0
-      ? String(candidateCallId).trim()
-      : null;
+    const callId =
+      candidateCallId && String(candidateCallId).trim().length > 0
+        ? String(candidateCallId).trim()
+        : null;
 
     if (!recordingUrl) {
-      // Return extra info to help us fix the workflow mapping
       return res.status(400).json({
         error: "Missing recordingUrl",
         receivedKeys: keys,
-        debug: {
-          urlType, urlLen, callIdType, callIdLen
-        }
+        hasProperties: !!body.properties,
+        propertiesKeys: Object.keys(props || {}),
+        debug: { urlType, urlLen, callIdType, callIdLen }
       });
     }
 
