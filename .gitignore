@@ -1,0 +1,13 @@
+# Node
+node_modules/
+npm-debug.log*
+*.log
+
+# Environment / secrets
+.env
+
+# Temporary audio artefacts
+temp_audio.mp3
+
+# Misc
+.DS_Store
