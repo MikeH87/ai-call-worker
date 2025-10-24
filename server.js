@@ -12,12 +12,10 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const app = express();
 
-// Increase body size just in case HubSpot sends large payloads
+// Allow JSON bodies (HubSpot webhooks)
 app.use(express.json({ limit: "5mb" }));
 
-// ---- Helpers ---------------------------------------------------------------
-
-// Download the recording audio file from a URL and save to temp file
+// ---------- Helpers ----------
 async function downloadRecording(url) {
   const response = await fetch(url);
   if (!response.ok) {
@@ -29,7 +27,6 @@ async function downloadRecording(url) {
   return filePath;
 }
 
-// Transcribe audio using OpenAI Whisper
 async function transcribeAudio(filePath) {
   const formData = new FormData();
   formData.append("file", fs.createReadStream(filePath));
@@ -49,7 +46,6 @@ async function transcribeAudio(filePath) {
   return data.text;
 }
 
-// Analyse transcript with GPT-4o-mini and return JSON-ish string
 async function analyseTranscript(transcript) {
   const prompt = `
 You are an AI call analyst. Summarise the call, identify next actions, and sentiment.
@@ -77,37 +73,48 @@ Return JSON with keys: summary, actions, sentiment.
     throw new Error(`Analysis failed: ${response.status} ${response.statusText} ${errText}`);
   }
   const data = await response.json();
-  const message = data?.choices?.[0]?.message?.content ?? "";
-  return message;
+  return data?.choices?.[0]?.message?.content ?? "";
 }
 
-// ---- Routes ----------------------------------------------------------------
-
-// Health check
+// ---------- Routes ----------
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
-// Webhook entry point
 app.post("/process-call", async (req, res) => {
   try {
     const body = req.body || {};
-    // Log the keys we received to make debugging easy
-    console.log("Incoming webhook keys:", Object.keys(body));
+    const keys = Object.keys(body);
+    console.log("Incoming webhook keys:", keys);
 
-    // Accept multiple possible field names for compatibility with HubSpot
-    const recordingUrl =
-      body.recordingUrl ||              // our custom key (recommended)
-      body.hs_call_recording_url ||     // HubSpot Call property (internal name)
-      body.recording_url ||             // sometimes appears without the "hs_" prefix
-      null;
+    // Pull candidate fields (support multiple names)
+    const candidateRecordingUrl = body.recordingUrl ?? body.hs_call_recording_url ?? body.recording_url ?? null;
+    const candidateCallId = body.callId ?? body.hs_object_id ?? body.call_id ?? null;
 
-    const callId =
-      body.callId ||                    // our custom key
-      body.hs_object_id ||              // HubSpot Call record ID
-      body.call_id ||                   // alternate
-      null;
+    // Debug: type/length of incoming values (not the full content)
+    const urlType = typeof candidateRecordingUrl;
+    const urlLen = candidateRecordingUrl ? String(candidateRecordingUrl).length : 0;
+    const callIdType = typeof candidateCallId;
+    const callIdLen = candidateCallId ? String(candidateCallId).length : 0;
+    console.log(`recordingUrl -> type: ${urlType}, length: ${urlLen}`);
+    console.log(`callId       -> type: ${callIdType}, length: ${callIdLen}`);
+
+    // Validate
+    const recordingUrl = candidateRecordingUrl && String(candidateRecordingUrl).trim().length > 0
+      ? String(candidateRecordingUrl).trim()
+      : null;
+
+    const callId = candidateCallId && String(candidateCallId).trim().length > 0
+      ? String(candidateCallId).trim()
+      : null;
 
     if (!recordingUrl) {
-      return res.status(400).send("Missing recordingUrl");
+      // Return extra info to help us fix the workflow mapping
+      return res.status(400).json({
+        error: "Missing recordingUrl",
+        receivedKeys: keys,
+        debug: {
+          urlType, urlLen, callIdType, callIdLen
+        }
+      });
     }
 
     console.log("Downloading recording:", recordingUrl);
@@ -142,10 +149,8 @@ app.post("/process-call", async (req, res) => {
       }
     }
 
-    // Clean up temp file
     try { fs.unlinkSync(filePath); } catch {}
-
-    res.json({ status: "success", callId: callId ?? null, analysis });
+    res.json({ status: "success", callId: callId ?? null });
   } catch (err) {
     console.error("❗ Error in /process-call:", err);
     res.status(500).send(err?.message ?? "Internal error");
