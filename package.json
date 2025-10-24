@@ -2,14 +2,15 @@
   "name": "ai-call-worker",
   "version": "1.0.0",
   "description": "AI worker that transcribes and analyses HubSpot call recordings",
+  "type": "module",
   "scripts": {
     "start": "node server.js"
   },
   "engines": {
-    "node": "18.x"
+    "node": "20.x"
   },
   "dependencies": {
-    "dotenv": "^17.2.3",
+    "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "form-data": "^4.0.0",
     "node-fetch": "^3.3.2"
