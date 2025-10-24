@@ -1,207 +1,364 @@
-// Load environment variables from .env
-import 'dotenv/config';
+// server.js (ESM, Node 20+)
+// AI Call Worker: HubSpot (webhook) -> download recording -> Whisper transcription -> GPT analysis -> update 5 Call fields
 
-import express from "express";
-import fetch from "node-fetch";
-import FormData from "form-data";
-import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
+import express from 'express';
+import crypto from 'crypto';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+// ============ Config ============
+const PORT = process.env.PORT || 3000;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const HUBSPOT_TOKEN = process.env.HUBSPOT_TOKEN;
+
+if (!OPENAI_API_KEY) console.warn('[BOOT] Missing OPENAI_API_KEY');
+if (!HUBSPOT_TOKEN) console.warn('[BOOT] Missing HUBSPOT_TOKEN');
+
+// ============ App ============
 const app = express();
+app.use(express.json({ limit: '25mb' }));
 
-app.use(express.json({ limit: "5mb" }));
+app.get('/', (_req, res) => res.status(200).send('AI Call Worker up'));
 
-// ---------- Small helpers ----------
-function unwrapHubSpotValue(maybe) {
-  // HubSpot "Include all properties" often sends objects like { value: "..." }
-  if (maybe && typeof maybe === "object") {
-    if (typeof maybe.value !== "undefined") return maybe.value;
-    if (typeof maybe.link !== "undefined") return maybe.link;
-    // If it’s some other shape, return empty to avoid "[object Object]"
-    return "";
-  }
-  return maybe;
-}
-
-function resolveFirst(...candidates) {
-  for (const c of candidates) {
-    const v = unwrapHubSpotValue(c);
-    if (v !== undefined && v !== null && String(v).trim().length > 0) {
-      return String(v).trim();
-    }
-  }
-  return null;
-}
-
-// Download the recording audio file from a URL and save to temp file
-async function downloadRecording(url) {
-  // Basic guard
-  if (!/^https?:\/\//i.test(url)) {
-    throw new Error(`Invalid recording URL format: ${url}`);
-  }
-
-  // Try a simple download first (many public/Zoom links work directly)
-  const response = await fetch(url);
-  if (!response.ok) {
-    // If the link is auth-gated (401/403), note it in the error
-    throw new Error(`Failed to download recording: ${response.status} ${response.statusText}`);
-  }
-  const buffer = await response.arrayBuffer();
-  const filePath = path.join(__dirname, "temp_audio.mp3");
-  fs.writeFileSync(filePath, Buffer.from(buffer));
-  return filePath;
-}
-
-async function transcribeAudio(filePath) {
-  const formData = new FormData();
-  formData.append("file", fs.createReadStream(filePath));
-  formData.append("model", "whisper-1");
-
-  const response = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
-    body: formData,
-  });
-
-  if (!response.ok) {
-    const errText = await response.text().catch(() => "");
-    throw new Error(`Transcription failed: ${response.status} ${response.statusText} ${errText}`);
-  }
-  const data = await response.json();
-  return data.text;
-}
-
-async function analyseTranscript(transcript) {
-  const prompt = `
-You are an AI call analyst. Summarise the call, identify next actions, and sentiment.
-Return JSON with keys: summary, actions, sentiment.
-  `.trim();
-
-  const response = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: "gpt-4o-mini",
-      messages: [
-        { role: "system", content: "You are a helpful assistant." },
-        { role: "user", content: `${prompt}\n\nTranscript:\n${transcript}` },
-      ],
-      temperature: 0.3,
-    }),
-  });
-
-  if (!response.ok) {
-    const errText = await response.text().catch(() => "");
-    throw new Error(`Analysis failed: ${response.status} ${response.statusText} ${errText}`);
-  }
-  const data = await response.json();
-  return data?.choices?.[0]?.message?.content ?? "";
-}
-
-// ---------- Routes ----------
-app.get("/health", (_req, res) => res.json({ ok: true }));
-
-app.post("/process-call", async (req, res) => {
+// Main webhook
+app.post('/process-call', async (req, res) => {
   try {
     const body = req.body || {};
-    const keys = Object.keys(body);
-    console.log("Incoming webhook keys:", keys);
+    const keys = Object.keys(body || {});
+    console.log('Incoming webhook keys:', JSON.stringify(keys, null, 2));
 
     const props = body.properties || {};
-    if (body.properties) {
-      console.log("properties keys:", Object.keys(props));
-    }
+    console.log('properties keys:', JSON.stringify(Object.keys(props || {}), null, 2));
 
-    // Raw (possibly object) values
+    // Helper to unwrap either top-level or properties.* and { value: ... } forms
+    const valueOf = (candidate) => {
+      if (candidate == null) return undefined;
+      if (typeof candidate === 'object' && 'value' in candidate) return candidate.value;
+      return candidate;
+    };
+    const firstDefined = (...arr) => arr.find((v) => v !== undefined && v !== null && v !== '');
+
+    // Resolve recording URL and call ID from multiple shapes
     const rawRecordingUrl =
-      body.recordingUrl ??
-      body.hs_call_recording_url ??
-      body.recording_url ??
-      props.hs_call_recording_url ??
-      props.recording_url ??
-      props.recordingUrl ??
-      null;
-
+      firstDefined(
+        body.recordingUrl,
+        props.hs_call_recording_url,
+        props.recordingUrl
+      );
     const rawCallId =
-      body.callId ??
-      body.hs_object_id ??
-      body.call_id ??
-      props.hs_object_id ??
-      props.call_id ??
-      props.callId ??
-      body.objectId ?? // fallback from the top-level wrapper
-      null;
+      firstDefined(
+        body.callId,
+        props.hs_object_id,
+        body.objectId // HubSpot often sends this too
+      );
 
-    // Log the raw types/lengths (before unwrapping)
-    const urlType = typeof rawRecordingUrl;
-    const urlLen = rawRecordingUrl ? String(rawRecordingUrl).length : 0;
-    const callIdType = typeof rawCallId;
-    const callIdLen = rawCallId ? String(rawCallId).length : 0;
-    console.log(`raw recordingUrl -> type: ${urlType}, length: ${urlLen}`);
-    console.log(`raw callId       -> type: ${callIdType}, length: ${callIdLen}`);
+    console.log('raw recordingUrl -> type:', typeof rawRecordingUrl, ', length:', String(JSON.stringify(rawRecordingUrl) || '').length);
+    console.log('raw callId       -> type:', typeof rawCallId, ', length:', String(JSON.stringify(rawCallId) || '').length);
 
-    // Resolve to usable strings
-    const recordingUrl = resolveFirst(rawRecordingUrl);
-    const callId = resolveFirst(rawCallId);
+    const recordingUrl = String(valueOf(rawRecordingUrl) || '').trim();
+    const callId = String(valueOf(rawCallId) || '').trim();
 
-    console.log(`resolved recordingUrl: ${recordingUrl ? recordingUrl.slice(0, 120) : "(null)"}`);
-    console.log(`resolved callId: ${callId ?? "(null)"}`);
+    console.log('resolved recordingUrl:', recordingUrl);
+    console.log('resolved callId:', callId);
 
-    if (!recordingUrl) {
-      return res.status(400).json({
-        error: "Missing recordingUrl",
-        receivedKeys: keys,
-        hasProperties: !!body.properties,
-        propertiesKeys: Object.keys(props || {}),
-        debug: { urlType, urlLen, callIdType, callIdLen }
-      });
+    if (!recordingUrl || !callId) {
+      console.warn('Missing recordingUrl or callId');
+      return res.status(200).json({ ok: true, note: 'Missing recordingUrl or callId — nothing to do' });
     }
 
-    console.log("Downloading recording:", recordingUrl);
-    const filePath = await downloadRecording(recordingUrl);
+    // Build a downloadable URL if HubSpot uses the auth retriever pattern
+    const downloadUrl = normaliseRecordingUrl(recordingUrl, callId);
+    console.log('Downloading recording:', downloadUrl);
 
-    console.log("Transcribing...");
-    const transcript = await transcribeAudio(filePath);
+    // 1) Download with HubSpot auth if 401/403 appears
+    const audioBuffer = await downloadRecording(downloadUrl);
 
-    console.log("Analysing...");
-    const analysis = await analyseTranscript(transcript);
+    // 2) Transcribe with OpenAI Whisper
+    console.log('Transcribing...');
+    const transcriptText = await transcribeAudioWithOpenAI(audioBuffer, `call_${callId}.mp3`);
 
-    console.log("Uploading to HubSpot...");
-    if (!callId) {
-      console.warn("No callId provided; skipping HubSpot update");
-    } else {
-      const hsResp = await fetch(`https://api.hubapi.com/crm/v3/objects/calls/${callId}`, {
-        method: "PATCH",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${process.env.HUBSPOT_TOKEN}`,
-        },
-        body: JSON.stringify({
-          properties: {
-            ai_transcript: transcript,
-            ai_analysis: analysis,
-          },
-        }),
-      });
-      if (!hsResp.ok) {
-        const t = await hsResp.text().catch(() => "");
-        throw new Error(`HubSpot update failed: ${hsResp.status} ${hsResp.statusText} ${t}`);
-      }
-    }
+    // 3) Analyse transcript into 5 outputs
+    console.log('Analysing...');
+    const analysisOutputs = await analyseTranscriptWithOpenAI(transcriptText);
 
-    try { fs.unlinkSync(filePath); } catch {}
-    res.json({ status: "success", callId: callId ?? null });
+    // 4) Update HubSpot Call with the five properties
+    console.log('Uploading to HubSpot...');
+    await updateHubSpotCall(callId, analysisOutputs);
+
+    console.log('✅ Done. Updated properties for Call', callId);
+    res.status(200).json({ ok: true, callId, updated: Object.keys(analysisOutputs) });
   } catch (err) {
-    console.error("❗ Error in /process-call:", err);
-    res.status(500).send(err?.message ?? "Internal error");
+    console.error('❗ Error in /process-call:', err);
+    res.status(200).json({ ok: false, error: String(err && err.message || err) }); // always 200 so HubSpot workflow doesn't retry forever
   }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ AI Call Worker listening on port ${PORT}`));
+// ============ Helpers ============
+
+// HubSpot sometimes sends an auth retriever URL that needs /engagement/{id}
+function normaliseRecordingUrl(url, callId) {
+  try {
+    const u = new URL(url);
+    const needsEngagement =
+      u.pathname.includes('/getAuthRecording/') && !u.pathname.includes('/engagement/');
+    if (needsEngagement && callId) {
+      // Ensure trailing slash before appending engagement path
+      if (!u.pathname.endsWith('/')) u.pathname += '/';
+      u.pathname += `engagement/${callId}`;
+      return u.toString();
+    }
+    return url;
+  } catch {
+    return url;
+  }
+}
+
+// Download MP3/WAV/etc. from HubSpot — always send Bearer token (some URLs require it)
+async function downloadRecording(url) {
+  const resp = await fetch(url, {
+    headers: {
+      Authorization: `Bearer ${HUBSPOT_TOKEN}`,
+    }
+  });
+
+  if (resp.status === 401 || resp.status === 403) {
+    const text = await resp.text();
+    throw new Error(`Failed to download recording: ${resp.status} ${text}`);
+  }
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Failed to download recording: ${resp.status} ${text}`);
+  }
+  const arrayBuf = await resp.arrayBuffer();
+  return Buffer.from(arrayBuf);
+}
+
+// Whisper transcription (OpenAI)
+// Uses multipart/form-data via Web FormData & Blob (Node 20+)
+async function transcribeAudioWithOpenAI(buffer, filename = 'audio.mp3') {
+  const form = new FormData();
+  // Best guess mime; OpenAI Whisper doesn't require exact type, but we'll set audio/mpeg
+  const blob = new Blob([buffer], { type: 'audio/mpeg' });
+  form.append('file', blob, filename);
+  form.append('model', 'whisper-1');
+  form.append('response_format', 'text'); // plain text back
+
+  const resp = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      // Do NOT set Content-Type here; fetch will set proper multipart boundary
+    },
+    body: form
+  });
+
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`OpenAI transcription failed: ${resp.status} ${text}`);
+  }
+
+  return await resp.text();
+}
+
+// ==== ANALYSIS: build five outputs for Call properties ====
+// Uses OpenAI to analyse a transcript and return exactly the five fields you want.
+async function analyseTranscriptWithOpenAI(transcript) {
+  const enforceSSAS = (text) => String(text || '').replace(/\bsaas\b/gi, 'SSAS');
+  const splitBullets = (v) =>
+    Array.isArray(v) ? v : String(v || '').split(/\r?\n|•|- |\u2022/).map(s => s.trim()).filter(Boolean);
+  const normalizeBullets = (arr, { min = 3, max = 5, maxWords = 12 } = {}) => {
+    const trimmed = arr
+      .map(s => s.replace(/^[•\-\s]+/, '').trim())
+      .filter(Boolean)
+      .map(s => {
+        const words = s.split(/\s+/);
+        return words.length > maxWords ? words.slice(0, maxWords).join(' ') : s;
+      });
+    return trimmed.length < min ? trimmed : trimmed.slice(0, max);
+  };
+  const normalizeSuggestions = (arr) =>
+    normalizeBullets(arr, { min: 3, max: 3, maxWords: 12 }).map(s => {
+      const parts = s.split(/\s+/);
+      if (!parts[0]) return s;
+      parts[0] = parts[0].charAt(0).toUpperCase() + parts[0].slice(1);
+      return parts.join(' ');
+    });
+  const clampScore = (val) => {
+    if (typeof val === 'number' && isFinite(val)) return Math.max(1, Math.min(10, Math.round(val)));
+    const m = String(val || '').match(/\b(10|[1-9])\b/);
+    return m ? Math.max(1, Math.min(10, parseInt(m[1], 10))) : 5;
+  };
+  const cleanSummary = (txt) => String(txt || '').replace(/^[\s"']+|[\s"']+$/g, '');
+
+  const PROMPT_SALES_PERF_SUMMARY =
+    'You are evaluating a sales call transcript against this scorecard:\n\n' +
+    'Opening & Rapport\n' +
+    '1. Clear, professional intro?\n' +
+    '2. Early rapport/trust attempt?\n\n' +
+    'Discovery & Qualification\n' +
+    '3. Open-ended question to understand needs?\n' +
+    '4. Identified pain/opportunity re: corp/business tax/inheritance tax or loaning money to prospect’s business?\n\n' +
+    'Value Positioning\n' +
+    '5. Explained firm’s services clearly and simply?\n' +
+    '6. Connected benefits to client’s specific needs?\n\n' +
+    'Handling Concerns\n' +
+    '7. Active listening and acknowledged concerns/questions?\n' +
+    '8. Clear, confident responses (follow-up if needed)?\n\n' +
+    'Closing & Next Steps\n' +
+    '9. Asked for a commitment (next meeting/docs/proposal)?\n' +
+    '10. Confirmed clear next steps?\n\n' +
+    'Return a short plain text summary in bullet points.\n\n' +
+    'Rules:\n' +
+    '- Maximum of 4 bullets total.\n' +
+    '- Prioritise "Areas to improve" if more important.\n' +
+    '- Each bullet ≤10 words.\n' +
+    '- Use this exact format (plain text, no JSON, no arrays):\n\n' +
+    'What went well:\n' +
+    '- [bullet(s)]\n\n' +
+    'Areas to improve:\n' +
+    '- [bullet(s)]\n';
+
+  const PROMPT_SALES_PERF_RATING =
+    'EVALUATE THE CONSULTANT USING THIS DETERMINISTIC RUBRIC:\n\n' +
+    'For each of the 10 criteria below, assign:\n' +
+    '- 1 = clearly met (explicit evidence in transcript)\n' +
+    '- 0.5 = partially met (some evidence but incomplete)\n' +
+    '- 0 = not met / absent / ambiguous\n\n' +
+    'Criteria (same order):\n' +
+    '1) Clear, professional intro\n' +
+    '2) Early rapport/trust attempt\n' +
+    '3) At least one open-ended question for needs\n' +
+    '4) Pain/opportunity relevant to corp/business tax/IHT/funding identified\n' +
+    '5) Services explained clearly, simply\n' +
+    '6) Benefits connected to client’s specific needs\n' +
+    '7) Active listening & acknowledgment of concerns\n' +
+    '8) Clear, confident responses (or committed follow-up)\n' +
+    '9) Asked for a commitment (next meeting/docs/proposal)\n' +
+    '10) Confirmed clear next steps\n\n' +
+    'SCORE = sum of the 10 items (0..10 in 0.5 increments), then round to nearest integer (0.5 rounds up). If final <1, output 1.\n\n' +
+    'Output ONLY the integer 1..10 (no words).\n';
+
+  const PROMPT_LIKELIHOOD_SCORE =
+    'EVALUATE LIKELIHOOD TO PROCEED USING THIS DETERMINISTIC RUBRIC (0..10):\n\n' +
+    'Signals and weights:\n' +
+    'A) Explicit interest in TLPI services (0..3)\n' +
+    'B) Pain/urgency/motivation (0..3)\n' +
+    'C) Engagement/detail & responsiveness (0..2)\n' +
+    'D) Next-step commitment (0..2)\n\n' +
+    'SCORE = A+B+C+D. Clamp to 1..10 (if 0, output 1). Output ONLY the integer (no words).\n' +
+    'Consider only transcript evidence.\n';
+
+  const PROMPT_SCORE_REASONING =
+    'Apply the same likelihood rubric you just used and explain WHY the chosen score fits the transcript.\n\n' +
+    'Output RULES:\n' +
+    '- 3–5 short bullets (≤12 words each)\n' +
+    '- Mention both positive and negative signals where relevant\n' +
+    '- Each bullet must reference concrete transcript evidence (no generic language)\n';
+
+  const PROMPT_SUGGESTIONS =
+    'Provide transcript-specific suggestions to increase conversion at the Zoom stage.\n\n' +
+    'STRICT RULES:\n' +
+    '- EXACTLY 3 bullets\n' +
+    '- Each bullet ≤12 words\n' +
+    '- Start with an imperative verb (e.g., "Quantify", "Confirm", "Show", "Send", "Prepare")\n' +
+    '- Tie each bullet to specific statements/concerns in the transcript\n' +
+    '- No generic coaching unless explicitly indicated by transcript\n' +
+    '- Plain text bullets only (no sub-bullets, no numbering)\n';
+
+  const systemMsg =
+    'You are TLPI’s transcript analysis bot. Follow rubrics exactly. ' +
+    'Use the following glossary strictly: "SSAS" refers to Small Self-Administered Scheme. ' +
+    'Never write "saas" (software as a service). Always use "SSAS". ' +
+    'Return ONLY valid JSON. No extra text.';
+
+  const userMsg =
+    'You will analyze ONE transcript and produce FIVE outputs as if each prompt were run separately.\n' +
+    'Base everything ONLY on the transcript. Keep outputs concise. Follow the rubrics exactly for consistent scoring.\n' +
+    'Glossary: Always use "SSAS" (Small Self-Administered Scheme); never "saas".\n\n' +
+    'Transcript:\n' + enforceSSAS(transcript) + '\n\n' +
+    'Return ONLY valid JSON with EXACT keys:\n' +
+    '{\n' +
+    '  "likeliness_to_proceed_score": <integer 1-10>,\n' +
+    '  "score_reasoning": ["<bullet>", "<bullet>", "<bullet>"],\n' +
+    '  "increase_likelihood_of_sale_suggestions": ["<bullet>", "<bullet>", "<bullet>"],\n' +
+    '  "sales_performance": <integer 1-10>,\n' +
+    '  "sales_performance_summary": "<plain text with \'What went well\' and \'Areas to improve\' bullets; no JSON>"\n' +
+    '}\n\n' +
+    '- likeliness_to_proceed_score:\n' + PROMPT_LIKELIHOOD_SCORE + '\n\n' +
+    '- score_reasoning:\n' + PROMPT_SCORE_REASONING + '\n\n' +
+    '- increase_likelihood_of_sale_suggestions:\n' + PROMPT_SUGGESTIONS + '\n\n' +
+    '- sales_performance:\n' + PROMPT_SALES_PERF_RATING + '\n\n' +
+    '- sales_performance_summary:\n' + PROMPT_SALES_PERF_SUMMARY + '\n\n' +
+    'Rules:\n' +
+    '- "likeliness_to_proceed_score" and "sales_performance" MUST be integers 1..10 (no words).\n' +
+    '- "score_reasoning" MUST be 3–5 short bullets (list/array).\n' +
+    '- "increase_likelihood_of_sale_suggestions" MUST be EXACTLY 3 bullets (list/array).\n' +
+    '- "sales_performance_summary" MUST be plain text in the specified format (no JSON).\n' +
+    '- Do not invent details; use only transcript evidence.\n';
+
+  const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: 'gpt-4o-mini',
+      response_format: { type: 'json_object' },
+      temperature: 0.1,
+      top_p: 0.9,
+      presence_penalty: 0,
+      frequency_penalty: 0,
+      messages: [{ role: 'system', content: systemMsg }, { role: 'user', content: userMsg }]
+    })
+  });
+
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`OpenAI analysis failed: ${resp.status} ${text}`);
+  }
+
+  const data = await resp.json();
+  const content = data?.choices?.[0]?.message?.content || '{}';
+
+  let out;
+  try { out = JSON.parse(content); } catch { out = {}; }
+
+  // Normalise
+  const likeScore = clampScore(out.likeliness_to_proceed_score);
+  const perfScore = clampScore(out.sales_performance);
+  const reasoning = normalizeBullets(splitBullets(out.score_reasoning), { min: 3, max: 5, maxWords: 12 });
+  const suggestions = normalizeSuggestions(splitBullets(out.increase_likelihood_of_sale_suggestions));
+  const summaryText = enforceSSAS(cleanSummary(out.sales_performance_summary));
+
+  // Return the exact property map expected by HubSpot
+  return {
+    chat_gpt___likeliness_to_proceed_score: String(likeScore),
+    chat_gpt___score_reasoning: reasoning.join(' • '),
+    chat_gpt___increase_likelihood_of_sale_suggestions: suggestions.join(' • '),
+    chat_gpt___sales_performance: String(perfScore),
+    sales_performance_summary: summaryText
+  };
+}
+
+// Patch Call properties via HubSpot CRM v3
+async function updateHubSpotCall(callId, propertiesMap) {
+  const url = `https://api.hubapi.com/crm/v3/objects/calls/${encodeURIComponent(callId)}`;
+  const resp = await fetch(url, {
+    method: 'PATCH',
+    headers: {
+      Authorization: `Bearer ${HUBSPOT_TOKEN}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ properties: propertiesMap })
+  });
+
+  if (resp.status === 404) {
+    const text = await resp.text();
+    throw new Error(`HubSpot update failed: 404 Not Found ${text}`);
+  }
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`HubSpot update failed: ${resp.status} ${text}`);
+  }
+}
+
+// ============ Start ============
+app.listen(PORT, () => {
+  console.log(`AI Call Worker listening on :${PORT}`);
+});
