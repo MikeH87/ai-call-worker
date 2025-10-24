@@ -1,6 +1,6 @@
 // server.js (ESM, Node 20+)
-// HubSpot webhook -> download recording (HubSpot or Zoom) -> TRANSCODE to Opus 24kbps mono 16kHz -> Whisper -> GPT analysis -> update 5 fields
-// Features: fast 200 OK, background processing, idempotency, retry logic, Zoom auth support, ffmpeg-static transcoding.
+// HubSpot webhook -> download recording (HubSpot or Zoom) -> Zoom-only transcode to Opus (with timeout+fallback) -> Whisper -> GPT -> update 5 fields
+// Features: fast 200 OK, background processing, idempotency, retry logic, Zoom auth, conditional transcoding, transcode timeout+fallback, input format logging.
 
 import express from "express";
 import { spawn } from "child_process";
@@ -17,7 +17,6 @@ const ZOOM_BEARER_TOKEN = process.env.ZOOM_BEARER_TOKEN;   // Authorization: Bea
 
 if (!OPENAI_API_KEY) console.warn("[BOOT] Missing OPENAI_API_KEY");
 if (!HUBSPOT_TOKEN) console.warn("[BOOT] Missing HUBSPOT_TOKEN");
-if (!ffmpegPath) console.warn("[BOOT] ffmpeg-static not found (transcoding will fail)");
 
 // Target HubSpot fields
 const TARGET_PROPS = [
@@ -94,12 +93,36 @@ app.post("/process-call", async (req, res) => {
       const url = normaliseRecordingUrl(recordingUrl, callId);
       console.log("[bg] Downloading recording:", url);
       const audioOriginal = await downloadRecording(url);
+      const sizeMB = (audioOriginal.length / (1024 * 1024)).toFixed(2);
+      const magic = sniffMagic(audioOriginal);
+      const guessedMime = guessMimeFromUrl(url) || magic.mime || "application/octet-stream";
+      console.log(`[bg] Downloaded ${sizeMB} MB, detected=${magic.short || "unknown"} mime=${guessedMime}`);
 
-      console.log("[bg] Transcoding to Opus 24kbps mono 16kHz...");
-      const audioOpus = await transcodeToOpus(audioOriginal);
+      // Conditional: Zoom => transcode to Opus; HubSpot => use as-is
+      const zoom = isZoomUrl(url);
+      let audioForWhisper = audioOriginal;
+      let whisperFilename = `call_${callId}${zoom ? ".ogg" : magic.ext || ".mp3"}`;
+      let whisperMime = zoom ? "audio/ogg" : guessedMime;
+
+      if (zoom) {
+        console.log("[bg] Transcoding (Zoom) to Opus 24kbps mono 16kHz (3 min timeout)...");
+        try {
+          audioForWhisper = await transcodeToOpus(audioOriginal, { timeoutMs: 180000 });
+          whisperFilename = `call_${callId}.ogg`;
+          whisperMime = "audio/ogg";
+          console.log("[bg] Transcode complete:", (audioForWhisper.length / (1024 * 1024)).toFixed(2), "MB");
+        } catch (e) {
+          console.warn("[bg] Transcode failed or timed out — falling back to original audio. Reason:", e.message);
+          audioForWhisper = audioOriginal; // fallback
+          whisperFilename = `call_${callId}${magic.ext || ".bin"}`;
+          whisperMime = guessedMime || "application/octet-stream";
+        }
+      } else {
+        console.log("[bg] Skipping transcoding for HubSpot recording");
+      }
 
       console.log("[bg] Transcribing...");
-      const transcript = await transcribeAudioWithOpenAI(audioOpus, `call_${callId}.ogg`);
+      const transcript = await transcribeAudioWithOpenAI(audioForWhisper, whisperFilename, whisperMime);
 
       console.log("[bg] Analysing...");
       const outputs = await analyseTranscriptWithOpenAI(transcript);
@@ -147,6 +170,33 @@ function withZoomAuth(url) {
   }
 }
 
+function guessMimeFromUrl(url) {
+  try {
+    const { pathname } = new URL(url);
+    if (pathname.endsWith(".mp3")) return "audio/mpeg";
+    if (pathname.endsWith(".m4a")) return "audio/mp4";
+    if (pathname.endsWith(".wav")) return "audio/wav";
+    if (pathname.endsWith(".aac")) return "audio/aac";
+    if (pathname.endsWith(".ogg") || pathname.endsWith(".opus")) return "audio/ogg";
+    if (pathname.endsWith(".mp4") || pathname.endsWith(".mkv") || pathname.endsWith(".mov")) return "video/mp4";
+  } catch {}
+  return null;
+}
+
+// quick-and-cheerful magic sniff (best-effort)
+function sniffMagic(buf) {
+  const head = buf.subarray(0, 16);
+  const asHex = [...head].map((b) => b.toString(16).padStart(2, "0")).join("");
+  const asStr = new TextDecoder().decode(head);
+
+  if (asStr.startsWith("OggS")) return { short: "ogg", mime: "audio/ogg", ext: ".ogg" };
+  if (asStr.startsWith("ID3") || asHex.startsWith("fffb") || asHex.startsWith("fff3") || asHex.startsWith("fff2"))
+    return { short: "mp3", mime: "audio/mpeg", ext: ".mp3" };
+  if (asStr.includes("ftyp")) return { short: "mp4/m4a", mime: "audio/mp4", ext: ".m4a" };
+  if (asStr.startsWith("RIFF")) return { short: "wav", mime: "audio/wav", ext: ".wav" };
+  return { short: "unknown", mime: null, ext: "" };
+}
+
 async function downloadRecording(url) {
   const u = new URL(url);
   let headers = {};
@@ -163,8 +213,8 @@ async function downloadRecording(url) {
   return Buffer.from(arrayBuf);
 }
 
-// ====== Transcoding: Buffer -> Opus OGG (24 kbps, mono, 16 kHz) ======
-async function transcodeToOpus(inputBuffer) {
+// ====== Transcoding: Buffer -> Opus OGG (24 kbps, mono, 16 kHz) with timeout ======
+async function transcodeToOpus(inputBuffer, { timeoutMs = 180000 } = {}) {
   if (!ffmpegPath) throw new Error("ffmpeg not available (ffmpeg-static missing)");
   return new Promise((resolve, reject) => {
     const args = [
@@ -181,23 +231,31 @@ async function transcodeToOpus(inputBuffer) {
     const ff = spawn(ffmpegPath, args, { stdio: ["pipe", "pipe", "pipe"] });
     const chunks = [];
     let errData = "";
+    const timer = setTimeout(() => {
+      errData += `\n[timeout] exceeded ${timeoutMs}ms — killing ffmpeg`;
+      try { ff.kill("SIGKILL"); } catch {}
+    }, timeoutMs);
 
     ff.stdout.on("data", (d) => chunks.push(d));
     ff.stderr.on("data", (d) => (errData += d.toString()));
     ff.on("close", (code) => {
+      clearTimeout(timer);
       if (code === 0) return resolve(Buffer.concat(chunks));
-      reject(new Error(`ffmpeg failed with code ${code}: ${errData || "unknown error"}`));
+      reject(new Error(`ffmpeg failed code ${code}: ${errData.slice(0, 2000)}`)); // cap stderr in logs
     });
 
-    ff.stdin.on("error", (e) => reject(e));
+    ff.stdin.on("error", (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
     ff.stdin.end(inputBuffer);
   });
 }
 
 // ====== Whisper transcription (OpenAI) ======
-async function transcribeAudioWithOpenAI(buffer, filename) {
+async function transcribeAudioWithOpenAI(buffer, filename, mimeType = "audio/mpeg") {
   const form = new FormData();
-  const blob = new Blob([buffer], { type: "audio/ogg" });
+  const blob = new Blob([buffer], { type: mimeType });
   form.append("file", blob, filename);
   form.append("model", "whisper-1");
   form.append("response_format", "text");
@@ -212,7 +270,7 @@ async function transcribeAudioWithOpenAI(buffer, filename) {
   return await resp.text();
 }
 
-// ====== GPT analysis (same prompt set you approved) ======
+// ====== GPT analysis (your approved prompts) ======
 async function analyseTranscriptWithOpenAI(transcript) {
   const enforceSSAS = (t) => String(t || "").replace(/\bsaas\b/gi, "SSAS");
 
