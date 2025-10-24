@@ -1,8 +1,8 @@
 // server.js (ESM, Node 20+)
-// AI Call Worker: HubSpot (webhook) -> download recording -> Whisper transcription -> GPT analysis -> update 5 Call fields
+// AI Call Worker: HubSpot webhook -> download recording -> Whisper transcription -> GPT analysis -> update 5 Call fields
+// Now with: fast 200 response, background processing, and idempotency.
 
 import express from 'express';
-import crypto from 'crypto';
 
 // ============ Config ============
 const PORT = process.env.PORT || 3000;
@@ -12,95 +12,108 @@ const HUBSPOT_TOKEN = process.env.HUBSPOT_TOKEN;
 if (!OPENAI_API_KEY) console.warn('[BOOT] Missing OPENAI_API_KEY');
 if (!HUBSPOT_TOKEN) console.warn('[BOOT] Missing HUBSPOT_TOKEN');
 
+// Target HubSpot properties (Call object)
+const TARGET_PROPS = [
+  'chat_gpt___likeliness_to_proceed_score',
+  'chat_gpt___score_reasoning',
+  'chat_gpt___increase_likelihood_of_sale_suggestions',
+  'chat_gpt___sales_performance',
+  'sales_performance_summary',
+];
+
+// In-memory guard to prevent concurrent double-processing
+const processingNow = new Set();
+
 // ============ App ============
 const app = express();
 app.use(express.json({ limit: '25mb' }));
 
 app.get('/', (_req, res) => res.status(200).send('AI Call Worker up'));
 
-// Main webhook
+// Main webhook — respond fast, then process async
 app.post('/process-call', async (req, res) => {
-  try {
-    const body = req.body || {};
-    const keys = Object.keys(body || {});
-    console.log('Incoming webhook keys:', JSON.stringify(keys, null, 2));
+  // 1) Extract what we need ASAP
+  const body = req.body || {};
+  const keys = Object.keys(body || {});
+  console.log('Incoming webhook keys:', JSON.stringify(keys, null, 2));
 
-    const props = body.properties || {};
-    console.log('properties keys:', JSON.stringify(Object.keys(props || {}), null, 2));
+  const props = body.properties || {};
+  console.log('properties keys:', JSON.stringify(Object.keys(props || {}), null, 2));
 
-    // Helper to unwrap either top-level or properties.* and { value: ... } forms
-    const valueOf = (candidate) => {
-      if (candidate == null) return undefined;
-      if (typeof candidate === 'object' && 'value' in candidate) return candidate.value;
-      return candidate;
-    };
-    const firstDefined = (...arr) => arr.find((v) => v !== undefined && v !== null && v !== '');
+  const valueOf = (candidate) =>
+    (candidate && typeof candidate === 'object' && 'value' in candidate) ? candidate.value : candidate;
+  const firstDefined = (...arr) => arr.find((v) => v !== undefined && v !== null && v !== '');
 
-    // Resolve recording URL and call ID from multiple shapes
-    const rawRecordingUrl =
-      firstDefined(
-        body.recordingUrl,
-        props.hs_call_recording_url,
-        props.recordingUrl
-      );
-    const rawCallId =
-      firstDefined(
-        body.callId,
-        props.hs_object_id,
-        body.objectId // HubSpot often sends this too
-      );
+  const rawRecordingUrl = firstDefined(body.recordingUrl, props.hs_call_recording_url, props.recordingUrl);
+  const rawCallId      = firstDefined(body.callId,        props.hs_object_id,           body.objectId);
 
-    console.log('raw recordingUrl -> type:', typeof rawRecordingUrl, ', length:', String(JSON.stringify(rawRecordingUrl) || '').length);
-    console.log('raw callId       -> type:', typeof rawCallId, ', length:', String(JSON.stringify(rawCallId) || '').length);
+  console.log('raw recordingUrl -> type:', typeof rawRecordingUrl, ', length:', String(JSON.stringify(rawRecordingUrl) || '').length);
+  console.log('raw callId       -> type:', typeof rawCallId, ', length:', String(JSON.stringify(rawCallId) || '').length);
 
-    const recordingUrl = String(valueOf(rawRecordingUrl) || '').trim();
-    const callId = String(valueOf(rawCallId) || '').trim();
+  const recordingUrl = String(valueOf(rawRecordingUrl) || '').trim();
+  const callId = String(valueOf(rawCallId) || '').trim();
 
-    console.log('resolved recordingUrl:', recordingUrl);
-    console.log('resolved callId:', callId);
+  console.log('resolved recordingUrl:', recordingUrl);
+  console.log('resolved callId:', callId);
 
-    if (!recordingUrl || !callId) {
-      console.warn('Missing recordingUrl or callId');
-      return res.status(200).json({ ok: true, note: 'Missing recordingUrl or callId — nothing to do' });
-    }
+  // 2) Return 200 immediately so HubSpot doesn't retry
+  res.status(200).json({ ok: true, accepted: Boolean(recordingUrl && callId) });
 
-    // Build a downloadable URL if HubSpot uses the auth retriever pattern
-    const downloadUrl = normaliseRecordingUrl(recordingUrl, callId);
-    console.log('Downloading recording:', downloadUrl);
-
-    // 1) Download with HubSpot auth if 401/403 appears
-    const audioBuffer = await downloadRecording(downloadUrl);
-
-    // 2) Transcribe with OpenAI Whisper
-    console.log('Transcribing...');
-    const transcriptText = await transcribeAudioWithOpenAI(audioBuffer, `call_${callId}.mp3`);
-
-    // 3) Analyse transcript into 5 outputs
-    console.log('Analysing...');
-    const analysisOutputs = await analyseTranscriptWithOpenAI(transcriptText);
-
-    // 4) Update HubSpot Call with the five properties
-    console.log('Uploading to HubSpot...');
-    await updateHubSpotCall(callId, analysisOutputs);
-
-    console.log('✅ Done. Updated properties for Call', callId);
-    res.status(200).json({ ok: true, callId, updated: Object.keys(analysisOutputs) });
-  } catch (err) {
-    console.error('❗ Error in /process-call:', err);
-    res.status(200).json({ ok: false, error: String(err && err.message || err) }); // always 200 so HubSpot workflow doesn't retry forever
+  // 3) Continue work in the background
+  if (!recordingUrl || !callId) {
+    console.warn('[bg] Missing recordingUrl or callId — skipping');
+    return;
   }
+
+  // Do not process same call concurrently
+  if (processingNow.has(callId)) {
+    console.log(`[bg] Call ${callId} already in-flight — skipping this trigger`);
+    return;
+  }
+  processingNow.add(callId);
+
+  // Kick off on next tick
+  setImmediate(async () => {
+    try {
+      // ---- Idempotency: skip if already processed (any of the target fields non-empty)
+      const already = await isAlreadyProcessed(callId);
+      if (already) {
+        console.log(`[bg] Call ${callId} already has outputs — skipping`);
+        processingNow.delete(callId);
+        return;
+      }
+
+      const downloadUrl = normaliseRecordingUrl(recordingUrl, callId);
+      console.log('[bg] Downloading recording:', downloadUrl);
+      const audioBuffer = await downloadRecording(downloadUrl);
+
+      console.log('[bg] Transcribing...');
+      const transcriptText = await transcribeAudioWithOpenAI(audioBuffer, `call_${callId}.mp3`);
+
+      console.log('[bg] Analysing...');
+      const analysisOutputs = await analyseTranscriptWithOpenAI(transcriptText);
+
+      console.log('[bg] Uploading to HubSpot...');
+      await updateHubSpotCall(callId, analysisOutputs);
+
+      console.log('✅ [bg] Done. Updated properties for Call', callId);
+    } catch (err) {
+      console.error('❗ [bg] Error processing Call', callId, err);
+    } finally {
+      processingNow.delete(callId);
+    }
+  });
 });
 
-// ============ Helpers ============
+// ============ HubSpot helpers ============
 
-// HubSpot sometimes sends an auth retriever URL that needs /engagement/{id}
+// Build the downloadable URL if HubSpot uses the auth retriever pattern
 function normaliseRecordingUrl(url, callId) {
   try {
     const u = new URL(url);
     const needsEngagement =
       u.pathname.includes('/getAuthRecording/') && !u.pathname.includes('/engagement/');
     if (needsEngagement && callId) {
-      // Ensure trailing slash before appending engagement path
       if (!u.pathname.endsWith('/')) u.pathname += '/';
       u.pathname += `engagement/${callId}`;
       return u.toString();
@@ -111,14 +124,11 @@ function normaliseRecordingUrl(url, callId) {
   }
 }
 
-// Download MP3/WAV/etc. from HubSpot — always send Bearer token (some URLs require it)
+// Auth download from HubSpot
 async function downloadRecording(url) {
   const resp = await fetch(url, {
-    headers: {
-      Authorization: `Bearer ${HUBSPOT_TOKEN}`,
-    }
+    headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` }
   });
-
   if (resp.status === 401 || resp.status === 403) {
     const text = await resp.text();
     throw new Error(`Failed to download recording: ${resp.status} ${text}`);
@@ -131,11 +141,9 @@ async function downloadRecording(url) {
   return Buffer.from(arrayBuf);
 }
 
-// Whisper transcription (OpenAI)
-// Uses multipart/form-data via Web FormData & Blob (Node 20+)
+// Whisper transcription (OpenAI) — multipart/form-data
 async function transcribeAudioWithOpenAI(buffer, filename = 'audio.mp3') {
   const form = new FormData();
-  // Best guess mime; OpenAI Whisper doesn't require exact type, but we'll set audio/mpeg
   const blob = new Blob([buffer], { type: 'audio/mpeg' });
   form.append('file', blob, filename);
   form.append('model', 'whisper-1');
@@ -143,10 +151,7 @@ async function transcribeAudioWithOpenAI(buffer, filename = 'audio.mp3') {
 
   const resp = await fetch('https://api.openai.com/v1/audio/transcriptions', {
     method: 'POST',
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      // Do NOT set Content-Type here; fetch will set proper multipart boundary
-    },
+    headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
     body: form
   });
 
@@ -154,12 +159,10 @@ async function transcribeAudioWithOpenAI(buffer, filename = 'audio.mp3') {
     const text = await resp.text();
     throw new Error(`OpenAI transcription failed: ${resp.status} ${text}`);
   }
-
   return await resp.text();
 }
 
 // ==== ANALYSIS: build five outputs for Call properties ====
-// Uses OpenAI to analyse a transcript and return exactly the five fields you want.
 async function analyseTranscriptWithOpenAI(transcript) {
   const enforceSSAS = (text) => String(text || '').replace(/\bsaas\b/gi, 'SSAS');
   const splitBullets = (v) =>
@@ -204,7 +207,7 @@ async function analyseTranscriptWithOpenAI(transcript) {
     '8. Clear, confident responses (follow-up if needed)?\n\n' +
     'Closing & Next Steps\n' +
     '9. Asked for a commitment (next meeting/docs/proposal)?\n' +
-    '10. Confirmed clear next steps?\n\n' +
+    '10. Confirmed clear next steps\n\n' +
     'Return a short plain text summary in bullet points.\n\n' +
     'Rules:\n' +
     '- Maximum of 4 bullets total.\n' +
@@ -326,7 +329,6 @@ async function analyseTranscriptWithOpenAI(transcript) {
   const suggestions = normalizeSuggestions(splitBullets(out.increase_likelihood_of_sale_suggestions));
   const summaryText = enforceSSAS(cleanSummary(out.sales_performance_summary));
 
-  // Return the exact property map expected by HubSpot
   return {
     chat_gpt___likeliness_to_proceed_score: String(likeScore),
     chat_gpt___score_reasoning: reasoning.join(' • '),
@@ -357,6 +359,58 @@ async function updateHubSpotCall(callId, propertiesMap) {
     throw new Error(`HubSpot update failed: ${resp.status} ${text}`);
   }
 }
+
+// Check if already processed (any of the five fields non-empty)
+async function isAlreadyProcessed(callId) {
+  try {
+    const params = new URLSearchParams({
+      properties: TARGET_PROPS.join(',')
+    });
+    const url = `https://api.hubapi.com/crm/v3/objects/calls/${encodeURIComponent(callId)}?${params.toString()}`;
+    const resp = await fetch(url, { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` } });
+    if (!resp.ok) {
+      console.warn(`[idempotency] GET call ${callId} failed: ${resp.status}`);
+      return false; // don’t block processing if we can’t read
+    }
+    const json = await resp.json();
+    const p = json?.properties || {};
+    return TARGET_PROPS.some((k) => {
+      const v = p[k];
+      return v != null && String(v).trim() !== '';
+    });
+  } catch (e) {
+    console.warn('[idempotency] error', e);
+    return false;
+  }
+}
+
+// ============ small prompt helpers used above ============
+function enforceSSAS(text) { return String(text || '').replace(/\bsaas\b/gi, 'SSAS'); }
+function splitBullets(v) { return Array.isArray(v) ? v : String(v || '').split(/\r?\n|•|- |\u2022/).map(s=>s.trim()).filter(Boolean); }
+function normalizeBullets(arr, { min = 3, max = 5, maxWords = 12 } = {}) {
+  const trimmed = arr
+    .map(s => s.replace(/^[•\-\s]+/, '').trim())
+    .filter(Boolean)
+    .map(s => {
+      const words = s.split(/\s+/);
+      return words.length > maxWords ? words.slice(0, maxWords).join(' ') : s;
+    });
+  return trimmed.length < min ? trimmed : trimmed.slice(0, max);
+}
+function normalizeSuggestions(arr) {
+  return normalizeBullets(arr, { min: 3, max: 3, maxWords: 12 }).map(s => {
+    const parts = s.split(/\s+/);
+    if (!parts[0]) return s;
+    parts[0] = parts[0].charAt(0).toUpperCase() + parts[0].slice(1);
+    return parts.join(' ');
+  });
+}
+function clampScore(val) {
+  if (typeof val === 'number' && isFinite(val)) return Math.max(1, Math.min(10, Math.round(val)));
+  const m = String(val || '').match(/\b(10|[1-9])\b/);
+  return m ? Math.max(1, Math.min(10, parseInt(m[1], 10))) : 5;
+}
+function cleanSummary(txt) { return String(txt || '').replace(/^[\s"']+|[\s"']+$/g, ''); }
 
 // ============ Start ============
 app.listen(PORT, () => {
