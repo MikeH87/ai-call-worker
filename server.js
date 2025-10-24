@@ -14,10 +14,39 @@ const app = express();
 
 app.use(express.json({ limit: "5mb" }));
 
-// ---------- Helpers ----------
+// ---------- Small helpers ----------
+function unwrapHubSpotValue(maybe) {
+  // HubSpot "Include all properties" often sends objects like { value: "..." }
+  if (maybe && typeof maybe === "object") {
+    if (typeof maybe.value !== "undefined") return maybe.value;
+    if (typeof maybe.link !== "undefined") return maybe.link;
+    // If it’s some other shape, return empty to avoid "[object Object]"
+    return "";
+  }
+  return maybe;
+}
+
+function resolveFirst(...candidates) {
+  for (const c of candidates) {
+    const v = unwrapHubSpotValue(c);
+    if (v !== undefined && v !== null && String(v).trim().length > 0) {
+      return String(v).trim();
+    }
+  }
+  return null;
+}
+
+// Download the recording audio file from a URL and save to temp file
 async function downloadRecording(url) {
+  // Basic guard
+  if (!/^https?:\/\//i.test(url)) {
+    throw new Error(`Invalid recording URL format: ${url}`);
+  }
+
+  // Try a simple download first (many public/Zoom links work directly)
   const response = await fetch(url);
   if (!response.ok) {
+    // If the link is auth-gated (401/403), note it in the error
     throw new Error(`Failed to download recording: ${response.status} ${response.statusText}`);
   }
   const buffer = await response.arrayBuffer();
@@ -89,8 +118,8 @@ app.post("/process-call", async (req, res) => {
       console.log("properties keys:", Object.keys(props));
     }
 
-    // Accept multiple names at top level AND inside `properties`
-    const candidateRecordingUrl =
+    // Raw (possibly object) values
+    const rawRecordingUrl =
       body.recordingUrl ??
       body.hs_call_recording_url ??
       body.recording_url ??
@@ -99,31 +128,30 @@ app.post("/process-call", async (req, res) => {
       props.recordingUrl ??
       null;
 
-    const candidateCallId =
+    const rawCallId =
       body.callId ??
       body.hs_object_id ??
       body.call_id ??
       props.hs_object_id ??
       props.call_id ??
       props.callId ??
+      body.objectId ?? // fallback from the top-level wrapper
       null;
 
-    const urlType = typeof candidateRecordingUrl;
-    const urlLen = candidateRecordingUrl ? String(candidateRecordingUrl).length : 0;
-    const callIdType = typeof candidateCallId;
-    const callIdLen = candidateCallId ? String(candidateCallId).length : 0;
-    console.log(`recordingUrl -> type: ${urlType}, length: ${urlLen}`);
-    console.log(`callId       -> type: ${callIdType}, length: ${callIdLen}`);
+    // Log the raw types/lengths (before unwrapping)
+    const urlType = typeof rawRecordingUrl;
+    const urlLen = rawRecordingUrl ? String(rawRecordingUrl).length : 0;
+    const callIdType = typeof rawCallId;
+    const callIdLen = rawCallId ? String(rawCallId).length : 0;
+    console.log(`raw recordingUrl -> type: ${urlType}, length: ${urlLen}`);
+    console.log(`raw callId       -> type: ${callIdType}, length: ${callIdLen}`);
 
-    const recordingUrl =
-      candidateRecordingUrl && String(candidateRecordingUrl).trim().length > 0
-        ? String(candidateRecordingUrl).trim()
-        : null;
+    // Resolve to usable strings
+    const recordingUrl = resolveFirst(rawRecordingUrl);
+    const callId = resolveFirst(rawCallId);
 
-    const callId =
-      candidateCallId && String(candidateCallId).trim().length > 0
-        ? String(candidateCallId).trim()
-        : null;
+    console.log(`resolved recordingUrl: ${recordingUrl ? recordingUrl.slice(0, 120) : "(null)"}`);
+    console.log(`resolved callId: ${callId ?? "(null)"}`);
 
     if (!recordingUrl) {
       return res.status(400).json({
