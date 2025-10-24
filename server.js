@@ -1,20 +1,23 @@
 // server.js (ESM, Node 20+)
-// AI Call Worker: HubSpot webhook -> download recording (HubSpot or Zoom) -> Whisper transcription -> GPT analysis -> update 5 Call fields
-// Features: fast 200 OK, background processing, idempotency, retry logic, Zoom auth support.
+// HubSpot webhook -> download recording (HubSpot or Zoom) -> TRANSCODE to Opus 24kbps mono 16kHz -> Whisper -> GPT analysis -> update 5 fields
+// Features: fast 200 OK, background processing, idempotency, retry logic, Zoom auth support, ffmpeg-static transcoding.
 
 import express from "express";
+import { spawn } from "child_process";
+import ffmpegPath from "ffmpeg-static";
 
 // ====== Config ======
 const PORT = process.env.PORT || 3000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const HUBSPOT_TOKEN = process.env.HUBSPOT_TOKEN;
 
-// Optional for Zoom downloads (use ONE of these if your Zoom links aren’t public)
+// Optional Zoom auth (use ONE if your Zoom links aren’t public)
 const ZOOM_ACCESS_TOKEN = process.env.ZOOM_ACCESS_TOKEN;   // appended as ?access_token=...
 const ZOOM_BEARER_TOKEN = process.env.ZOOM_BEARER_TOKEN;   // Authorization: Bearer ...
 
 if (!OPENAI_API_KEY) console.warn("[BOOT] Missing OPENAI_API_KEY");
 if (!HUBSPOT_TOKEN) console.warn("[BOOT] Missing HUBSPOT_TOKEN");
+if (!ffmpegPath) console.warn("[BOOT] ffmpeg-static not found (transcoding will fail)");
 
 // Target HubSpot fields
 const TARGET_PROPS = [
@@ -90,10 +93,13 @@ app.post("/process-call", async (req, res) => {
 
       const url = normaliseRecordingUrl(recordingUrl, callId);
       console.log("[bg] Downloading recording:", url);
-      const audio = await downloadRecording(url);
+      const audioOriginal = await downloadRecording(url);
+
+      console.log("[bg] Transcoding to Opus 24kbps mono 16kHz...");
+      const audioOpus = await transcodeToOpus(audioOriginal);
 
       console.log("[bg] Transcribing...");
-      const transcript = await transcribeAudioWithOpenAI(audio, `call_${callId}.mp3`);
+      const transcript = await transcribeAudioWithOpenAI(audioOpus, `call_${callId}.ogg`);
 
       console.log("[bg] Analysing...");
       const outputs = await analyseTranscriptWithOpenAI(transcript);
@@ -129,8 +135,7 @@ function isZoomUrl(url) {
 }
 
 function withZoomAuth(url) {
-  // If you have ZOOM_ACCESS_TOKEN, add ?access_token=...
-  // Else if you have ZOOM_BEARER_TOKEN, we’ll send Authorization header separately.
+  // Prefer ?access_token=... if provided
   try {
     const u = new URL(url);
     if (ZOOM_ACCESS_TOKEN && !u.searchParams.has("access_token")) {
@@ -143,20 +148,14 @@ function withZoomAuth(url) {
 }
 
 async function downloadRecording(url) {
-  // HubSpot downloads always require HubSpot token; Zoom may require Zoom auth.
   const u = new URL(url);
   let headers = {};
 
   if (u.hostname.endsWith("hubspot.com")) {
     headers = { Authorization: `Bearer ${HUBSPOT_TOKEN}` };
   } else if (isZoomUrl(url)) {
-    // If the Zoom link is public, no auth is needed. If it's not public:
-    // - Prefer ?access_token=... via ZOOM_ACCESS_TOKEN
-    // - Or send Authorization: Bearer <token> via ZOOM_BEARER_TOKEN
     url = withZoomAuth(url);
-    if (ZOOM_BEARER_TOKEN) {
-      headers = { Authorization: `Bearer ${ZOOM_BEARER_TOKEN}` };
-    }
+    if (ZOOM_BEARER_TOKEN) headers = { Authorization: `Bearer ${ZOOM_BEARER_TOKEN}` };
   }
 
   const resp = await fetchWithRetry(() => fetch(url, { headers }));
@@ -164,10 +163,41 @@ async function downloadRecording(url) {
   return Buffer.from(arrayBuf);
 }
 
-// Whisper transcription (OpenAI)
+// ====== Transcoding: Buffer -> Opus OGG (24 kbps, mono, 16 kHz) ======
+async function transcodeToOpus(inputBuffer) {
+  if (!ffmpegPath) throw new Error("ffmpeg not available (ffmpeg-static missing)");
+  return new Promise((resolve, reject) => {
+    const args = [
+      "-hide_banner", "-loglevel", "error",
+      "-i", "pipe:0",
+      "-vn",          // no video
+      "-ac", "1",     // mono
+      "-ar", "16000", // 16 kHz
+      "-c:a", "libopus",
+      "-b:a", "24k",  // 24 kbps
+      "-f", "ogg",
+      "pipe:1",
+    ];
+    const ff = spawn(ffmpegPath, args, { stdio: ["pipe", "pipe", "pipe"] });
+    const chunks = [];
+    let errData = "";
+
+    ff.stdout.on("data", (d) => chunks.push(d));
+    ff.stderr.on("data", (d) => (errData += d.toString()));
+    ff.on("close", (code) => {
+      if (code === 0) return resolve(Buffer.concat(chunks));
+      reject(new Error(`ffmpeg failed with code ${code}: ${errData || "unknown error"}`));
+    });
+
+    ff.stdin.on("error", (e) => reject(e));
+    ff.stdin.end(inputBuffer);
+  });
+}
+
+// ====== Whisper transcription (OpenAI) ======
 async function transcribeAudioWithOpenAI(buffer, filename) {
   const form = new FormData();
-  const blob = new Blob([buffer], { type: "audio/mpeg" });
+  const blob = new Blob([buffer], { type: "audio/ogg" });
   form.append("file", blob, filename);
   form.append("model", "whisper-1");
   form.append("response_format", "text");
@@ -182,7 +212,7 @@ async function transcribeAudioWithOpenAI(buffer, filename) {
   return await resp.text();
 }
 
-// ====== GPT analysis ======
+// ====== GPT analysis (same prompt set you approved) ======
 async function analyseTranscriptWithOpenAI(transcript) {
   const enforceSSAS = (t) => String(t || "").replace(/\bsaas\b/gi, "SSAS");
 
@@ -350,7 +380,7 @@ async function isAlreadyProcessed(callId) {
   }
 }
 
-// ====== Small text helpers ======
+// ====== Small text helper ======
 function enforceSSAS(text) { return String(text || "").replace(/\bsaas\b/gi, "SSAS"); }
 
 // ====== Start ======
