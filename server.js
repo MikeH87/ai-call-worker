@@ -12,19 +12,24 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const app = express();
 
-app.use(express.json());
+// Increase body size just in case HubSpot sends large payloads
+app.use(express.json({ limit: "5mb" }));
 
-// Helper to download the recording
+// ---- Helpers ---------------------------------------------------------------
+
+// Download the recording audio file from a URL and save to temp file
 async function downloadRecording(url) {
   const response = await fetch(url);
-  if (!response.ok) throw new Error(`Failed to download recording: ${response.status}`);
+  if (!response.ok) {
+    throw new Error(`Failed to download recording: ${response.status} ${response.statusText}`);
+  }
   const buffer = await response.arrayBuffer();
   const filePath = path.join(__dirname, "temp_audio.mp3");
   fs.writeFileSync(filePath, Buffer.from(buffer));
   return filePath;
 }
 
-// Helper to transcribe audio using OpenAI Whisper
+// Transcribe audio using OpenAI Whisper
 async function transcribeAudio(filePath) {
   const formData = new FormData();
   formData.append("file", fs.createReadStream(filePath));
@@ -36,17 +41,20 @@ async function transcribeAudio(filePath) {
     body: formData,
   });
 
-  if (!response.ok) throw new Error(`Transcription failed: ${response.status}`);
+  if (!response.ok) {
+    const errText = await response.text().catch(() => "");
+    throw new Error(`Transcription failed: ${response.status} ${response.statusText} ${errText}`);
+  }
   const data = await response.json();
   return data.text;
 }
 
-// Helper to analyse transcript
+// Analyse transcript with GPT-4o-mini and return JSON-ish string
 async function analyseTranscript(transcript) {
   const prompt = `
 You are an AI call analyst. Summarise the call, identify next actions, and sentiment.
 Return JSON with keys: summary, actions, sentiment.
-`;
+  `.trim();
 
   const response = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
@@ -64,17 +72,43 @@ Return JSON with keys: summary, actions, sentiment.
     }),
   });
 
-  if (!response.ok) throw new Error(`Analysis failed: ${response.status}`);
+  if (!response.ok) {
+    const errText = await response.text().catch(() => "");
+    throw new Error(`Analysis failed: ${response.status} ${response.statusText} ${errText}`);
+  }
   const data = await response.json();
-  const message = data.choices[0].message.content;
+  const message = data?.choices?.[0]?.message?.content ?? "";
   return message;
 }
 
-// Endpoint for handling HubSpot or Zoom webhook events
+// ---- Routes ----------------------------------------------------------------
+
+// Health check
+app.get("/health", (_req, res) => res.json({ ok: true }));
+
+// Webhook entry point
 app.post("/process-call", async (req, res) => {
   try {
-    const { recordingUrl, callId } = req.body;
-    if (!recordingUrl) return res.status(400).send("Missing recordingUrl");
+    const body = req.body || {};
+    // Log the keys we received to make debugging easy
+    console.log("Incoming webhook keys:", Object.keys(body));
+
+    // Accept multiple possible field names for compatibility with HubSpot
+    const recordingUrl =
+      body.recordingUrl ||              // our custom key (recommended)
+      body.hs_call_recording_url ||     // HubSpot Call property (internal name)
+      body.recording_url ||             // sometimes appears without the "hs_" prefix
+      null;
+
+    const callId =
+      body.callId ||                    // our custom key
+      body.hs_object_id ||              // HubSpot Call record ID
+      body.call_id ||                   // alternate
+      null;
+
+    if (!recordingUrl) {
+      return res.status(400).send("Missing recordingUrl");
+    }
 
     console.log("Downloading recording:", recordingUrl);
     const filePath = await downloadRecording(recordingUrl);
@@ -86,25 +120,35 @@ app.post("/process-call", async (req, res) => {
     const analysis = await analyseTranscript(transcript);
 
     console.log("Uploading to HubSpot...");
-    await fetch(`https://api.hubapi.com/crm/v3/objects/calls/${callId}`, {
-      method: "PATCH",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${process.env.HUBSPOT_TOKEN}`,
-      },
-      body: JSON.stringify({
-        properties: {
-          ai_transcript: transcript,
-          ai_analysis: analysis,
+    if (!callId) {
+      console.warn("No callId provided; skipping HubSpot update");
+    } else {
+      const hsResp = await fetch(`https://api.hubapi.com/crm/v3/objects/calls/${callId}`, {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${process.env.HUBSPOT_TOKEN}`,
         },
-      }),
-    });
+        body: JSON.stringify({
+          properties: {
+            ai_transcript: transcript,
+            ai_analysis: analysis,
+          },
+        }),
+      });
+      if (!hsResp.ok) {
+        const t = await hsResp.text().catch(() => "");
+        throw new Error(`HubSpot update failed: ${hsResp.status} ${hsResp.statusText} ${t}`);
+      }
+    }
 
-    fs.unlinkSync(filePath); // Clean up
-    res.json({ status: "success", analysis });
+    // Clean up temp file
+    try { fs.unlinkSync(filePath); } catch {}
+
+    res.json({ status: "success", callId: callId ?? null, analysis });
   } catch (err) {
-    console.error(err);
-    res.status(500).send(err.message);
+    console.error("❗ Error in /process-call:", err);
+    res.status(500).send(err?.message ?? "Internal error");
   }
 });
 
