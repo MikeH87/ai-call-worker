@@ -1,9 +1,10 @@
 // ai/parallelTranscribe.js
-// Parallel Whisper transcription for speed.
-// - Segments MP3 into short chunks (default 120s)
-// - Uploads chunks to Whisper in parallel with a safe concurrency limit
-// - Reuses the robust retry logic already in ai/analyse.js: transcribeFile()
-// - Joins all partial transcripts in order
+// Smarter, parallel Whisper transcription:
+// - Detects duration with ffprobe
+// - If duration <= 15 min: single upload (no segmentation)
+// - If duration > 15 min: segment into ~15-min chunks (900s)
+// - Parallel uploads with safe concurrency (default 3-4)
+// - Reuses robust retry logic in ai/analyse.js: transcribeFile()
 
 import os from "os";
 import fs from "fs";
@@ -13,11 +14,7 @@ import ffmpegInstaller from "@ffmpeg-installer/ffmpeg";
 import { transcribeFile } from "./analyse.js";
 
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
-
 const TMP_DIR = os.tmpdir();
-
-// Small helper
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function logSize(p) {
   try {
@@ -28,8 +25,19 @@ function logSize(p) {
   }
 }
 
-// Segment an audio file by fixed duration (in seconds)
-function segmentAudioByDuration(inPath, outPattern, seconds = 120) {
+// Probe duration (seconds)
+function getDurationSeconds(inPath) {
+  return new Promise((resolve, reject) => {
+    ffmpeg.ffprobe(inPath, (err, data) => {
+      if (err) return reject(err);
+      const dur = data?.format?.duration || 0;
+      resolve(Number(dur) || 0);
+    });
+  });
+}
+
+// Segment by fixed duration (seconds)
+function segmentAudio(inPath, outPattern, seconds) {
   return new Promise((resolve, reject) => {
     const outDir = path.dirname(outPattern);
     fs.mkdirSync(outDir, { recursive: true });
@@ -38,7 +46,7 @@ function segmentAudioByDuration(inPath, outPattern, seconds = 120) {
       .outputOptions([
         "-f", "segment",
         "-segment_time", String(seconds),
-        "-reset_timestamps", "1"
+        "-reset_timestamps", "1",
       ])
       .output(outPattern)
       .on("error", reject)
@@ -47,29 +55,28 @@ function segmentAudioByDuration(inPath, outPattern, seconds = 120) {
         const files = fs.readdirSync(outDir)
           .filter(f => f.startsWith(base))
           .map(f => path.join(outDir, f))
-          .sort(); // ensure order
+          .sort();
         resolve(files);
       })
       .run();
   });
 }
 
-// Simple promise pool for concurrency control
+// Simple promise pool
 async function promisePool(items, limit, worker) {
   const results = new Array(items.length);
-  let idx = 0;
-  let active = 0;
+  let idx = 0, active = 0;
 
   return new Promise((resolve, reject) => {
     const next = () => {
       if (idx >= items.length && active === 0) return resolve(results);
       while (active < limit && idx < items.length) {
         const myIndex = idx++;
-        const item = items[myIndex];
+        const it = items[myIndex];
         active++;
-        Promise.resolve(worker(item, myIndex))
-          .then((res) => { results[myIndex] = res; active--; next(); })
-          .catch((err) => reject(err));
+        Promise.resolve(worker(it, myIndex))
+          .then(res => { results[myIndex] = res; active--; next(); })
+          .catch(reject);
       }
     };
     next();
@@ -77,41 +84,44 @@ async function promisePool(items, limit, worker) {
 }
 
 /**
- * Transcribe an MP3 by splitting into short chunks and sending to Whisper in parallel.
- * @param {string} mp3Path - Prepared MP3 path (mono, 16kHz).
- * @param {string|number} callId - Call id for logging.
- * @param {object} opts - Options { segmentSeconds, concurrency }
+ * Transcribe with dynamic chunking:
+ *  - <= 15 min → single upload
+ *  - >  15 min → chunks of ~15 min (900s) in parallel
  */
 export async function transcribeAudioParallel(mp3Path, callId, opts = {}) {
-  const segmentSeconds = Number(opts.segmentSeconds ?? 120);
-  const concurrency = Math.max(1, Number(process.env.WHISPER_CONCURRENCY ?? opts.concurrency ?? 4));
+  const concurrency = Math.max(1, Number(process.env.WHISPER_CONCURRENCY ?? opts.concurrency ?? 3));
+  const maxChunkSeconds = 900; // 15 minutes
 
-  console.log(`[seg] input MP3 ${logSize(mp3Path)}; splitting into ~${segmentSeconds}s chunks…`);
+  const durationSec = await getDurationSeconds(mp3Path).catch(() => 0);
+  console.log(`[dur] ${durationSec ? durationSec.toFixed(1) : "?"}s total; file ${logSize(mp3Path)}`);
+
+  if (!durationSec || durationSec <= maxChunkSeconds) {
+    console.log("[seg] duration <= 15 min → single-file transcription");
+    return await transcribeFile(mp3Path); // robust retry inside
+  }
+
+  console.log("[seg] duration > 15 min → splitting into ~15-min chunks");
   const baseName = `call_${callId}_part_%03d.mp3`;
   const pattern = path.join(TMP_DIR, baseName);
-
-  const chunks = await segmentAudioByDuration(mp3Path, pattern, segmentSeconds);
+  const chunks = await segmentAudio(mp3Path, pattern, maxChunkSeconds);
 
   if (!chunks.length) {
-    console.log("[seg] no chunks produced; falling back to single-file transcription");
+    console.log("[seg] segmentation produced 0 chunks; falling back to single-file transcription");
     return await transcribeFile(mp3Path);
   }
 
-  console.log(`[seg] created ${chunks.length} chunk(s). Transcribing in parallel (concurrency=${concurrency})…`);
+  console.log(`[seg] created ${chunks.length} chunk(s). Parallel transcription (concurrency=${concurrency})…`);
+  const t0 = Date.now();
 
-  const startedAt = Date.now();
-  const texts = await promisePool(chunks, concurrency, async (file, i) => {
+  const pieces = await promisePool(chunks, concurrency, async (file, i) => {
     const n = i + 1;
-    const size = logSize(file);
-    console.log(`[whisper-par] chunk ${n}/${chunks.length} (${size}) starting…`);
-    const t0 = Date.now();
-    const text = await transcribeFile(file);  // robust retry logic inside
-    const ms = Date.now() - t0;
-    console.log(`[whisper-par] chunk ${n}/${chunks.length} finished in ${(ms / 1000).toFixed(1)}s`);
-    return text || "";
+    console.log(`[whisper-par] chunk ${n}/${chunks.length} (${logSize(file)}) starting…`);
+    const s0 = Date.now();
+    const txt = await transcribeFile(file);
+    console.log(`[whisper-par] chunk ${n}/${chunks.length} finished in ${((Date.now()-s0)/1000).toFixed(1)}s`);
+    return txt || "";
   });
 
-  const totalMs = Date.now() - startedAt;
-  console.log(`[whisper-par] all ${chunks.length} chunks done in ${(totalMs / 1000).toFixed(1)}s; stitching…`);
-  return texts.join("\n");
+  console.log(`[whisper-par] all chunks done in ${((Date.now()-t0)/1000).toFixed(1)}s; stitching…`);
+  return pieces.join("\n");
 }
