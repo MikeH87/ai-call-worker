@@ -1,10 +1,11 @@
 // =============================================================
-// TLPI – AI Call Worker (v3.1)
+// TLPI – AI Call Worker (v3.2)
+// - Fix: include associationCategory + associationTypeId when creating
+//   Sales Scorecards (pull from v4 types/labels), best-effort per assoc.
 // - IC fields: ai_data_points_captured / ai_missing_information
 // - Scorecards for Qualification / Initial Consultation / Follow up
 // - Strong call-type rules (Zoom vs phone; data capture vs DocuSign)
 // - Robust HubSpot updater (prunes unknown props; retry; continue)
-// - Best-effort associations (always to Call; Contact/Deal if available)
 // - Whisper compression/chunking; grace for hs_activity_type
 // =============================================================
 
@@ -22,8 +23,6 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const HUBSPOT_TOKEN  = process.env.HUBSPOT_TOKEN;
 const ZOOM_BEARER_TOKEN = process.env.ZOOM_BEARER_TOKEN || process.env.ZOOM_ACCESS_TOKEN;
 const GRACE_MS = Number(process.env.GRACE_MS ?? 0); // 0 during testing
-
-// Optional: create scorecard if metrics exist even when type misclassified
 const SCORECARD_BY_METRICS = String(process.env.SCORECARD_BY_METRICS ?? "true").toLowerCase() === "true";
 
 // IC field keys in your portal
@@ -533,32 +532,40 @@ async function updateHubSpotCall(callId, properties) {
   throw new Error(`HubSpot update failed: ${r.status} ${text1}`);
 }
 
-// Association helpers — best-effort (never block creation)
-const assocCache = new Map(); // key: `${from}::${to}` -> typeId
+// Association helpers — fetch typeId + category, best-effort (never block)
+const assocCache = new Map(); // key: `${from}::${to}` -> { typeId, category }
 
-async function findAssocTypeId(from, to) {
+async function findAssocType(from, to) {
   const key = `${from}::${to}`;
   if (assocCache.has(key)) return assocCache.get(key);
 
   const headers = { Authorization: `Bearer ${HUBSPOT_TOKEN}` };
 
-  // Try labels
+  // Prefer /labels (often includes custom labels)
   let r = await fetch(`https://api.hubapi.com/crm/v4/associations/${encodeURIComponent(from)}/${encodeURIComponent(to)}/labels`, { headers });
   if (r.ok) {
     const j = await r.json();
-    const id = j?.results?.[0]?.typeId;
-    if (id) { assocCache.set(key, id); return id; }
+    const first = j?.results?.[0];
+    if (first?.typeId && first?.category) {
+      const val = { typeId: first.typeId, category: first.category };
+      assocCache.set(key, val);
+      return val;
+    }
   }
 
-  // Try types
+  // Fallback to /types
   r = await fetch(`https://api.hubapi.com/crm/v4/associations/${encodeURIComponent(from)}/${encodeURIComponent(to)}/types`, { headers });
   if (r.ok) {
     const j = await r.json();
-    const id = j?.results?.[0]?.typeId;
-    if (id) { assocCache.set(key, id); return id; }
+    const first = j?.results?.[0];
+    if (first?.typeId && first?.category) {
+      const val = { typeId: first.typeId, category: first.category };
+      assocCache.set(key, val);
+      return val;
+    }
   }
 
-  return null; // not found (don’t throw)
+  return null; // not found
 }
 
 async function getCallAssociations(callId) {
@@ -582,9 +589,12 @@ async function createSalesScorecard(fields, { callId, contactIds = [], dealIds =
 
   // Always try to associate to the Call (primary)
   if (callId) {
-    const typeId = await findAssocTypeId(SCORECARD_TYPE, "calls");
-    if (typeId) {
-      assocBlocks.push({ to: { id: String(callId) }, types: [{ associationTypeId: typeId }] });
+    const t = await findAssocType(SCORECARD_TYPE, "calls");
+    if (t) {
+      assocBlocks.push({
+        to: { id: String(callId) },
+        types: [{ associationCategory: t.category, associationTypeId: t.typeId }],
+      });
     } else {
       console.warn(`[assoc] no scorecard→call association type; creating scorecard without call link`);
     }
@@ -592,9 +602,12 @@ async function createSalesScorecard(fields, { callId, contactIds = [], dealIds =
 
   // Contacts (optional)
   for (const cId of contactIds) {
-    const typeId = await findAssocTypeId(SCORECARD_TYPE, "contacts");
-    if (typeId) {
-      assocBlocks.push({ to: { id: String(cId) }, types: [{ associationTypeId: typeId }] });
+    const t = await findAssocType(SCORECARD_TYPE, "contacts");
+    if (t) {
+      assocBlocks.push({
+        to: { id: String(cId) },
+        types: [{ associationCategory: t.category, associationTypeId: t.typeId }],
+      });
     } else {
       console.warn(`[assoc] no scorecard→contact association type; skipping contact ${cId}`);
     }
@@ -602,9 +615,12 @@ async function createSalesScorecard(fields, { callId, contactIds = [], dealIds =
 
   // Deals (optional)
   for (const dId of dealIds) {
-    const typeId = await findAssocTypeId(SCORECARD_TYPE, "deals");
-    if (typeId) {
-      assocBlocks.push({ to: { id: String(dId) }, types: [{ associationTypeId: typeId }] });
+    const t = await findAssocType(SCORECARD_TYPE, "deals");
+    if (t) {
+      assocBlocks.push({
+        to: { id: String(dId) },
+        types: [{ associationCategory: t.category, associationTypeId: t.typeId }],
+      });
     } else {
       console.warn(`[assoc] no scorecard→deal association type; skipping deal ${dId}`);
     }
