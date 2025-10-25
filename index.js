@@ -33,6 +33,24 @@ async function downloadToFile(url, destPath) {
   return destPath;
 }
 
+// Try to derive recording URL from the Call if the webhook didn’t send it
+async function getRecordingUrlFromCall(callId) {
+  try {
+    const call = await getHubSpotObject("calls", callId, [
+      "hs_call_video_recording_url",
+      "hs_call_recording_url",
+      "hs_call_recording_duration",
+      "hs_call_status",
+    ]);
+    const p = call?.properties || {};
+    // Prefer video URL, then plain recording URL
+    return p.hs_call_video_recording_url || p.hs_call_recording_url || null;
+  } catch (e) {
+    console.warn("[warn] Could not fetch call to find recording URL:", e.message);
+    return null;
+  }
+}
+
 /* ---------- routes ---------- */
 app.get("/", (req, res) => {
   res.send("AI Call Worker v4.x modular running ✅");
@@ -55,6 +73,7 @@ app.post("/process-call", async (req, res) => {
     // Accept either our direct payload or HubSpot Automation JSON
     let { callId, recordingUrl, chunkSeconds, concurrency } = req.body || {};
     if (!callId) callId = req.body?.objectId || req.body?.object_id || req.body?.id;
+
     if (!recordingUrl) {
       recordingUrl =
         req.body?.recordingUrl ||
@@ -63,7 +82,15 @@ app.post("/process-call", async (req, res) => {
         req.body?.inputFields?.recording_url;
     }
 
+    // If still no recordingUrl, try to look it up on the Call itself
+    if (callId && !recordingUrl) {
+      console.log("[info] recordingUrl missing in webhook — fetching from HubSpot Call…");
+      recordingUrl = await getRecordingUrlFromCall(callId);
+      if (recordingUrl) console.log("[info] Found recording URL on Call.");
+    }
+
     if (!callId || !recordingUrl) {
+      console.warn("[warn] Missing callId or recordingUrl", { callIdPresent: !!callId, recordingUrlPresent: !!recordingUrl });
       return res.status(400).send({ ok: false, error: "callId and recordingUrl are required" });
     }
 
@@ -86,7 +113,7 @@ app.post("/process-call", async (req, res) => {
       concurrency: conc,
     });
 
-    // fail-safe: skip blank/near-blank calls to avoid token waste
+    // fail-safe: skip blank/near-blank calls
     const cleaned = (transcript || "").replace(/\s+/g, " ").trim();
     if (!cleaned || cleaned.length < 40) {
       console.log("[bg] Transcript is empty/very short; skipping analysis & updates.");
@@ -144,6 +171,9 @@ app.post("/process-call", async (req, res) => {
     console.log(`✅ Done ${callId}`);
   } catch (err) {
     console.error("❌ Background error:", err);
+    try {
+      res.status(500).send({ ok: false, error: err.message || "server error" });
+    } catch {}
   }
 });
 
