@@ -13,7 +13,7 @@ ffmpeg.setFfmpegPath(ffmpegBin.path);
 /**
  * Split audio into N-second segments and transcribe with limited concurrency.
  * @param {string} audioPath
- * @param {string} callId
+ * @param {string|number} callId
  * @param {{segmentSeconds?: number, concurrency?: number}} opts
  * @returns {Promise<string>} combined transcript
  */
@@ -21,7 +21,10 @@ export async function transcribeAudioParallel(audioPath, callId, opts = {}) {
   const segmentSeconds = Math.max(30, Number(opts.segmentSeconds) || 120);
   const concurrency = Math.max(1, Number(opts.concurrency) || 4);
 
-  const baseDir = path.join(os.tmpdir(), "ai-call-worker", callId);
+  // Ensure callId is a string for filesystem paths
+  const callKey = String(callId);
+
+  const baseDir = path.join(os.tmpdir(), "ai-call-worker", callKey);
   const chunksDir = path.join(baseDir, "chunks");
   await fs.mkdir(chunksDir, { recursive: true });
 
