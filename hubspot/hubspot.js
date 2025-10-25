@@ -41,7 +41,7 @@ export async function getHubSpotObject(objectType, id, properties = []) {
  * Associations: from calls -> contacts or deals etc
  */
 export async function getAssociations(fromId, toType) {
-  // v4 association endpoint is simplest
+  // v4 association endpoint for reads
   const url = `${HS_BASE}/crm/v4/objects/calls/${encodeURIComponent(fromId)}/associations/${encodeURIComponent(toType)}?limit=100`;
   const res = await fetch(url, { headers: hsHeaders() });
   if (!res.ok) {
@@ -65,20 +65,22 @@ export async function updateCall(callId, analysis) {
   if (analysis?.summary) {
     let summaryStr;
     if (Array.isArray(analysis.summary)) {
-      // bulletish join
-      summaryStr = analysis.summary.map(s => (typeof s === "string" ? `• ${s}` : "")).filter(Boolean).join("\n");
+      summaryStr = analysis.summary
+        .map(s => (typeof s === "string" ? `• ${s}` : ""))
+        .filter(Boolean)
+        .join("\n");
     } else if (typeof analysis.summary === "string") {
       summaryStr = analysis.summary;
     }
     if (summaryStr) properties.hs_call_body = summaryStr.slice(0, 5000);
   }
 
-  // Safe mapping — adjust to your portal’s properties
+  // Safe mapping — adjust to your portal’s properties later
   if (typeof analysis?.likelihood_to_close === "number") properties.tlpi_likelihood_close = analysis.likelihood_to_close;
   if (analysis?.outcome) properties.tlpi_outcome = String(analysis.outcome);
-  if (Array.isArray(analysis?.objections)) properties.tlpi_objections = analysis.objections.join("; ");
-  if (Array.isArray(analysis?.next_actions)) properties.tlpi_next_actions = analysis.next_actions.join("; ");
-  if (Array.isArray(analysis?.materials_to_send)) properties.tlpi_materials = analysis.materials_to_send.join("; ");
+  if (Array.isArray(analysis?.objections) && analysis.objections.length) properties.tlpi_objections = analysis.objections.join("; ");
+  if (Array.isArray(analysis?.next_actions) && analysis.next_actions.length) properties.tlpi_next_actions = analysis.next_actions.join("; ");
+  if (Array.isArray(analysis?.materials_to_send) && analysis.materials_to_send.length) properties.tlpi_materials = analysis.materials_to_send.join("; ");
   if (analysis?.call_type) properties.tlpi_call_type_detected = String(analysis.call_type);
 
   await hubspotPatch(`crm/v3/objects/calls/${encodeURIComponent(callId)}`, { properties });
@@ -89,8 +91,8 @@ export async function updateCall(callId, analysis) {
  * Default implementation uses a Note if no custom object is configured.
  */
 export async function createScorecard(analysis, { callId, contactIds = [], dealIds = [], ownerId = null } = {}) {
-
   let objResponse;
+
   if (SCORECARD_OBJECT === "notes") {
     // Create a Note with a structured payload in the body
     const body = [
@@ -119,10 +121,10 @@ export async function createScorecard(analysis, { callId, contactIds = [], dealI
     });
 
     const noteId = objResponse?.id;
-    // Associate Note ↔ Call/Contacts/Deals
-    await associate("notes", noteId, "calls", callId);
-    for (const cId of contactIds) await associate("notes", noteId, "contacts", cId);
-    for (const dId of dealIds) await associate("notes", noteId, "deals", dId);
+    // Associate Note ↔ Call/Contacts/Deals (use v3 batch create; simple and reliable)
+    await associateV3("notes", noteId, "calls", callId, "note_to_call");
+    for (const cId of contactIds) await associateV3("notes", noteId, "contacts", cId, "note_to_contact");
+    for (const dId of dealIds) await associateV3("notes", noteId, "deals", dId, "note_to_deal");
     return { type: "note", id: noteId };
   }
 
@@ -145,10 +147,10 @@ export async function createScorecard(analysis, { callId, contactIds = [], dealI
   });
 
   const scoreId = objResponse?.id;
-  // Associate custom object ↔ Call/Contacts/Deals
-  await associate(SCORECARD_OBJECT, scoreId, "calls", callId);
-  for (const cId of contactIds) await associate(SCORECARD_OBJECT, scoreId, "contacts", cId);
-  for (const dId of dealIds) await associate(SCORECARD_OBJECT, scoreId, "deals", dId);
+  // Associate custom object ↔ Call/Contacts/Deals; try v3 first with a generic type name, then fall back to v4 auto-discovery
+  await associateWithFallback(SCORECARD_OBJECT, scoreId, "calls", callId);
+  for (const cId of contactIds) await associateWithFallback(SCORECARD_OBJECT, scoreId, "contacts", cId);
+  for (const dId of dealIds) await associateWithFallback(SCORECARD_OBJECT, scoreId, "deals", dId);
 
   return { type: SCORECARD_OBJECT, id: scoreId };
 }
@@ -160,7 +162,6 @@ async function hubspotPost(path, body) {
   const res = await fetch(url, { method: "POST", headers: hsHeaders(), body: JSON.stringify(body) });
   if (!res.ok) {
     const txt = await res.text().catch(() => "");
-    // If properties don’t exist, just log and continue
     if (txt.includes("PROPERTY_DOESNT_EXIST")) {
       console.warn(`[HubSpot] Missing property creating ${url}:`, txt.slice(0, 300));
     } else {
@@ -184,14 +185,74 @@ async function hubspotPatch(path, body) {
   try { return await res.json(); } catch { return null; }
 }
 
-async function associate(fromType, fromId, toType, toId) {
+/**
+ * Preferred: v3 batch association create
+ * type examples: note_to_contact, note_to_deal, note_to_call
+ */
+async function associateV3(fromType, fromId, toType, toId, type) {
   if (!fromId || !toId) return;
 
-  const url = `${HS_BASE}/crm/v4/objects/${encodeURIComponent(fromType)}/${encodeURIComponent(fromId)}/associations/${encodeURIComponent(toType)}/${encodeURIComponent(toId)}`;
-  const res = await fetch(url, { method: "PUT", headers: hsHeaders() });
+  const url = `${HS_BASE}/crm/v3/associations/${encodeURIComponent(fromType)}/${encodeURIComponent(toType)}/batch/create`;
+  const body = {
+    inputs: [
+      { from: { id: String(fromId) }, to: { id: String(toId) }, type: String(type) },
+    ],
+  };
+
+  const res = await fetch(url, { method: "POST", headers: hsHeaders(), body: JSON.stringify(body) });
   if (!res.ok) {
     const txt = await res.text().catch(() => "");
-    console.warn(`[HubSpot] Associate ${fromType}:${fromId} -> ${toType}:${toId} failed: ${res.status} ${txt.slice(0, 200)}`);
+    console.warn(`[HubSpot] v3 associate ${fromType}:${fromId} -> ${toType}:${toId} failed: ${res.status} ${txt.slice(0, 300)}`);
+    throw new Error("ASSOC_V3_FAIL");
+  }
+}
+
+/**
+ * Fallback: v4 auto-discovery of association type ID, then batch create
+ */
+async function associateWithFallback(fromType, fromId, toType, toId) {
+  try {
+    // Try a sensible v3 type string first
+    const typeGuess = `${singular(fromType)}_to_${singular(toType)}`; // e.g., customobject_to_call
+    await associateV3(fromType, fromId, toType, toId, typeGuess);
+    return;
+  } catch {
+    // continue to v4 fallback
+  }
+
+  if (!fromId || !toId) return;
+
+  // Discover available labels (type IDs)
+  const labelsUrl = `${HS_BASE}/crm/v4/associations/${encodeURIComponent(fromType)}/${encodeURIComponent(toType)}/labels`;
+  const labelsRes = await fetch(labelsUrl, { headers: hsHeaders() });
+  if (!labelsRes.ok) {
+    const txt = await labelsRes.text().catch(() => "");
+    console.warn(`[HubSpot] association labels fetch failed: ${labelsRes.status} ${txt.slice(0, 300)}`);
+    return;
+  }
+  const labels = await labelsRes.json();
+  const typeId = labels?.results?.[0]?.typeId; // pick the first available association type
+  if (!typeId) {
+    console.warn("[HubSpot] No association typeId available for", fromType, "->", toType);
+    return;
+  }
+
+  // v4 batch create with discovered typeId
+  const url = `${HS_BASE}/crm/v4/associations/${encodeURIComponent(fromType)}/${encodeURIComponent(toType)}/batch/create`;
+  const body = {
+    inputs: [
+      {
+        from: { id: String(fromId) },
+        to: { id: String(toId) },
+        types: [{ associationCategory: "HUBSPOT_DEFINED", associationTypeId: typeId }],
+      },
+    ],
+  };
+
+  const res = await fetch(url, { method: "POST", headers: hsHeaders(), body: JSON.stringify(body) });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    console.warn(`[HubSpot] v4 associate ${fromType}:${fromId} -> ${toType}:${toId} failed: ${res.status} ${txt.slice(0, 300)}`);
   }
 }
 
@@ -204,4 +265,11 @@ function numOrNA(n) {
 }
 function strOrNA(s) {
   return s ? String(s) : "n/a";
+}
+function singular(type) {
+  // crude singulariser for types like "notes" -> "note", "deals" -> "deal"
+  if (!type) return "";
+  if (type.endsWith("ies")) return type.slice(0, -3) + "y";
+  if (type.endsWith("s")) return type.slice(0, -1);
+  return type;
 }
