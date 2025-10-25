@@ -163,7 +163,7 @@ app.post("/process-call", async (req, res) => {
 
   try {
     await ensureTmp();
-    const audioPath = path.join(TMP_DIR, `${callId}.mp3`);
+    const audioPath = path.join(TMP_DIR, `${String(callId)}.mp3`);
     console.log(`[bg] Downloading audio to ${audioPath}`);
 
     await downloadToFile(recordingUrl, audioPath, { bearer: zoomToken });
@@ -176,6 +176,14 @@ app.post("/process-call", async (req, res) => {
       segmentSeconds: Number(chunkSeconds) || 120,
       concurrency: Number(concurrency) || 4,
     });
+
+    // ===== Failsafe: skip empty/silent transcripts =====
+    if (!transcript || transcript.trim().length < 50) {
+      console.warn(`[skip] Transcript empty or too short for ${callId}. Skipping analysis.`);
+      // Best-effort cleanup
+      try { await fs.rm(audioPath, { force: true }); } catch {}
+      return; // exit early — no AI cost, no HubSpot updates
+    }
 
     console.log("[bg] Transcription done, fetching HubSpot call…");
     const callInfo = await getHubSpotObject("calls", callId, [
