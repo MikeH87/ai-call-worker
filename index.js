@@ -1,9 +1,10 @@
 // index.js
-// TLPI AI Call Worker v4.0 (modular build)
+// TLPI AI Call Worker v4.1 (modular + parallel Whisper)
 
 import express from "express";
 import { downloadRecording, ensureAudio } from "./ai/transcribe.js";
-import { transcribeFile, aiAnalyse, getCombinedPrompt } from "./ai/analyse.js";
+import { aiAnalyse, getCombinedPrompt } from "./ai/analyse.js";
+import { transcribeAudioParallel } from "./ai/parallelTranscribe.js";
 import { updateHubSpotObject, getHubSpotObject, getAssociations } from "./hubspot/hubspot.js";
 import { createScorecard } from "./hubspot/scorecard.js";
 
@@ -50,10 +51,13 @@ app.post("/process-call", async (req, res) => {
         const src = await downloadRecording(recUrl, callId);
         const mp3 = await ensureAudio(src, callId);
 
-        console.log("[bg] Transcribing...");
-        const transcript = await transcribeFile(mp3);
+        // PARALLEL TRANSCRIPTION (uses robust retries inside transcribeFile)
+        const seg = Number(process.env.WHISPER_SEGMENT_SECONDS ?? 120); // 2 min chunks by default
+        const cc  = Number(process.env.WHISPER_CONCURRENCY ?? 4);       // 4 concurrent uploads by default
+        console.log(`[bg] Transcribing in parallel (segment=${seg}s, concurrency=${cc})…`);
+        const transcript = await transcribeAudioParallel(mp3, callId, { segmentSeconds: seg, concurrency: cc });
 
-        console.log("[bg] Analysing...");
+        console.log("[bg] Analysing…");
         const analysis = await aiAnalyse(transcript, typeLabel);
         console.log("[ai] analysis:", analysis);
 
@@ -115,4 +119,4 @@ app.post("/debug-prompt", (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`AI Call Worker v4.0 modular running on :${PORT}`));
+app.listen(PORT, () => console.log(`AI Call Worker v4.1 modular+parallel running on :${PORT}`));
