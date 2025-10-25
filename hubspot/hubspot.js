@@ -7,7 +7,7 @@ dotenv.config();
 const HUBSPOT_TOKEN = process.env.HUBSPOT_TOKEN || process.env.HUBSPOT_API_KEY;
 const HS_BASE = "https://api.hubapi.com";
 
-// Your custom object (from your dump)
+// Your custom object
 const SCORECARD_OBJECT = process.env.HUBSPOT_SCORECARD_OBJECT || "p49487487_sales_scorecards";
 
 if (!HUBSPOT_TOKEN) {
@@ -73,7 +73,7 @@ export async function updateCall(callId, analysis) {
   const productInterest = mapProductInterest(analysis?.key_details?.products_discussed);
   if (productInterest) props.ai_product_interest = productInterest;
 
-  // Optional extras if present in your prompts/models
+  // Optional extras
   if (analysis?.ai_data_points_captured) props.ai_data_points_captured = toMultiline(analysis.ai_data_points_captured);
   if (analysis?.ai_missing_information)  props.ai_missing_information  = toMultiline(analysis.ai_missing_information);
 
@@ -85,9 +85,8 @@ export async function updateCall(callId, analysis) {
   if (analysis?.ai_escalation_required) props.ai_escalation_required = normaliseEscalation(analysis.ai_escalation_required);
   if (analysis?.ai_escalation_notes) props.ai_escalation_notes = toMultiline(analysis.ai_escalation_notes);
 
-  // Type-specific fields: consultation vs follow-up
+  // Type-specific fields
   if (inferredType === "Initial Consultation") {
-    // map 0–100 likelihood to /10 integer (1–10 min)
     if (typeof analysis?.likelihood_to_close === "number") {
       props.ai_consultation_likelihood_to_close = clamp(Math.max(1, Math.round(analysis.likelihood_to_close / 10)), 1, 10);
     }
@@ -97,10 +96,7 @@ export async function updateCall(callId, analysis) {
     if (Array.isArray(analysis?.next_actions) && analysis.next_actions.length) {
       props.ai_next_steps = analysis.next_actions.join("; ").slice(0, 5000);
     }
-    if (objections.length) {
-      props.ai_key_objections = objections.join("; ").slice(0, 1000);
-    }
-    // ai_consultation_outcome exists but we don’t guess the allowed values list here — leave unset unless you want me to map Positive→Likely, etc.
+    if (objections.length) props.ai_key_objections = objections.join("; ").slice(0, 1000);
   }
 
   if (inferredType === "Follow up call") {
@@ -110,9 +106,7 @@ export async function updateCall(callId, analysis) {
     if (Array.isArray(analysis?.materials_to_send) && analysis.materials_to_send.length) {
       props.ai_follow_up_required_materials = analysis.materials_to_send.join("; ").slice(0, 5000);
     }
-    if (objections.length) {
-      props.ai_follow_up_objections_remaining = objections.join("; ").slice(0, 1000);
-    }
+    if (objections.length) props.ai_follow_up_objections_remaining = objections.join("; ").slice(0, 1000);
     if (Array.isArray(analysis?.next_actions) && analysis.next_actions.length) {
       props.ai_next_steps = analysis.next_actions.join("; ").slice(0, 5000);
     }
@@ -134,13 +128,10 @@ export async function createScorecard(analysis, { callId, contactIds = [], dealI
   const props = {
     activity_type: callType,
     activity_name: activityName,
-    // coaching summary (short, bullet-y)
     sales_scorecard___what_you_can_improve_on: buildCoachingNotes(analysis),
-
-    // performance: map 0..5 “overall” to 1..10 if present; else null
     sales_performance_rating_: toScoreOutOf10OrNull(analysis?.scorecard?.overall),
 
-    // “AI copies” that exist on scorecard per your dump:
+    // AI copies living on scorecard
     ai_next_steps: Array.isArray(analysis?.next_actions) && analysis.next_actions.length
       ? analysis.next_actions.join("; ").slice(0, 5000)
       : undefined,
@@ -151,7 +142,6 @@ export async function createScorecard(analysis, { callId, contactIds = [], dealI
     ai_decision_criteria: analysis?.ai_decision_criteria ? toMultiline(analysis.ai_decision_criteria) : undefined,
   };
 
-  // Consultation-only fields present on your scorecard:
   if (callType === "Initial Consultation" && typeof analysis?.likelihood_to_close === "number") {
     props.ai_consultation_likelihood_to_close = clamp(Math.max(1, Math.round(analysis.likelihood_to_close / 10)), 1, 10);
   }
@@ -163,7 +153,6 @@ export async function createScorecard(analysis, { callId, contactIds = [], dealI
     return { type: SCORECARD_OBJECT, id: null };
   }
 
-  // Associate scorecard ↔ call (primary), contacts, deals
   await associateWithFallback(SCORECARD_OBJECT, scoreId, "calls", callId);
   for (const cId of contactIds) await associateWithFallback(SCORECARD_OBJECT, scoreId, "contacts", cId);
   for (const dId of dealIds) await associateWithFallback(SCORECARD_OBJECT, scoreId, "deals", dId);
@@ -259,8 +248,7 @@ function arrayToBullets(arr, bullet="• ") { const a = ensureArray(arr); return
 function toMultiline(v) { if (Array.isArray(v)) return v.join("\n"); if (v == null) return undefined; return String(v); }
 function toNumberOrNull(v) { if (v == null) return null; const n = Number(v); return Number.isFinite(n) ? n : null; }
 function clamp(n, lo, hi) { return Math.max(lo, Math.min(hi, n)); }
-function toScoreOutOf10OrNull(v) { if (v == null) return null; const n = Number(v); if (!Number.isFinite(n)) return null; // if 0..5, scale up
-  return n <= 5 ? clamp(Math.round(n * 2), 0, 10) : clamp(Math.round(n), 0, 10); }
+function toScoreOutOf10OrNull(v) { if (v == null) return null; const n = Number(v); if (!Number.isFinite(n)) return null; return n <= 5 ? clamp(Math.round(n * 2), 0, 10) : clamp(Math.round(n), 0, 10); }
 
 function normaliseCallType(v) {
   if (!v) return null;
@@ -288,3 +276,26 @@ function normaliseSentiment(v){if(!v)return undefined; const s=String(v).toLower
 function normaliseYesNoUnclear(v){const s=String(v||"").toLowerCase(); if(s.startsWith("y"))return"Yes"; if(s.startsWith("n"))return"No"; return"Unclear";}
 function normaliseEscalation(v){const s=String(v||"").toLowerCase(); if(s.startsWith("y")||s.startsWith("req"))return"Yes"; if(s.startsWith("mon"))return"Monitor"; return"No";}
 function arrToString(a){return Array.isArray(a)?a.join("; "):"n/a";}
+
+/** Build a short coaching summary for scorecard */
+function buildCoachingNotes(analysis) {
+  const good = [];
+  const improve = [];
+
+  // Derive from analysis summary/scorecard
+  const s = ensureArray(analysis?.summary);
+  if (s.length) good.push("Clear summary captured");
+  if (Array.isArray(analysis?.next_actions) && analysis.next_actions.length) good.push("Specific next actions set");
+  if (Array.isArray(analysis?.materials_to_send) && analysis.materials_to_send.length) good.push("Materials promised");
+
+  const overall = toScoreOutOf10OrNull(analysis?.scorecard?.overall);
+  if (overall != null && overall < 6) improve.push("Strengthen discovery depth");
+  if (ensureArray(analysis?.objections).length) improve.push("Tighter objection handling");
+  if (!analysis?.likelihood_to_close || analysis.likelihood_to_close < 60) improve.push("Create crisper close plan");
+
+  const lines = [];
+  if (good.length) lines.push("What went well: " + good.slice(0, 3).join(" • "));
+  if (improve.length) lines.push("Areas to improve: " + improve.slice(0, 3).join(" • "));
+  const out = lines.join("\n");
+  return out.slice(0, 10000);
+}
