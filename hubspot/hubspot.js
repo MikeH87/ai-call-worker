@@ -4,12 +4,12 @@ import fetch from "node-fetch";
 
 dotenv.config();
 
-const HUBSPOT_TOKEN = process.env.HUBSPOT_TOKEN || process.env.HUBSPOT_API_KEY; // Private App Token preferred
+const HUBSPOT_TOKEN = process.env.HUBSPOT_TOKEN || process.env.HUBSPOT_API_KEY; // Private App Token
 const HS_BASE = "https://api.hubapi.com";
 
-// Optional: override custom scorecard object type via env
-const SCORECARD_OBJECT = process.env.HUBSPOT_SCORECARD_OBJECT || "notes";
-// If you *do* have a custom object, set HUBSPOT_SCORECARD_OBJECT to something like "p2_sales_scorecard" (the fully qualified object type).
+// === TLPI custom object (from your schema) ===
+const SCORECARD_OBJECT = process.env.HUBSPOT_SCORECARD_OBJECT || "p49487487_sales_scorecards";
+// If you want to fallback to notes for quick smoke tests, set HUBSPOT_SCORECARD_OBJECT=notes
 
 if (!HUBSPOT_TOKEN) {
   console.warn("[cfg] HUBSPOT_TOKEN missing — HubSpot updates will fail.");
@@ -22,9 +22,9 @@ function hsHeaders() {
   };
 }
 
-/**
- * Generic GET object
- */
+/* ---------------------------
+   GET object + associations
+----------------------------*/
 export async function getHubSpotObject(objectType, id, properties = []) {
   const params = new URLSearchParams();
   if (properties?.length) params.set("properties", properties.join(","));
@@ -37,9 +37,6 @@ export async function getHubSpotObject(objectType, id, properties = []) {
   return await res.json();
 }
 
-/**
- * Associations (read): calls -> contacts/deals
- */
 export async function getAssociations(fromId, toType) {
   const url = `${HS_BASE}/crm/v4/objects/calls/${encodeURIComponent(fromId)}/associations/${encodeURIComponent(toType)}?limit=100`;
   const res = await fetch(url, { headers: hsHeaders() });
@@ -53,88 +50,135 @@ export async function getAssociations(fromId, toType) {
   return ids;
 }
 
-/**
- * Update the Call record — for now ONLY write the summary to hs_call_body
- * (We’ll map custom fields in the next step)
- */
+/* ---------------------------
+   UPDATE CALL (your fields)
+----------------------------*/
 export async function updateCall(callId, analysis) {
-  let summaryStr = "";
-  if (Array.isArray(analysis?.summary)) {
-    summaryStr = analysis.summary
-      .map(s => (typeof s === "string" ? `• ${s}` : ""))
-      .filter(Boolean)
-      .join("\n");
-  } else if (typeof analysis?.summary === "string") {
-    summaryStr = analysis.summary;
+  const props = {};
+
+  // Summary -> hs_call_body (string)
+  const summaryStr = arrayToBullets(analysis?.summary, "• ");
+  if (summaryStr) props.hs_call_body = summaryStr.slice(0, 5000);
+
+  // === AI Fields you provided for the Call object ===
+  // Call type & confidence
+  const inferredType = normaliseCallType(analysis?.call_type); // map to your allowed values
+  if (inferredType) props.ai_inferred_call_type = inferredType;
+
+  // Only set hs_activity_type if we think we’re right (>=75)
+  const conf = toNumberOrNull(analysis?.ai_call_type_confidence);
+  if (conf != null) props.ai_call_type_confidence = clamp(conf, 0, 100);
+  if (inferredType && (props.ai_call_type_confidence ?? 0) >= 75) {
+    props.hs_activity_type = inferredType;
   }
 
-  const properties = {};
-  if (summaryStr) properties.hs_call_body = summaryStr.slice(0, 5000);
+  // Objections bullets & derived "primary"
+  const objections = ensureArray(analysis?.objections);
+  if (objections.length) {
+    props.ai_objections_bullets = objections.join(" • ").slice(0, 5000);
+    props.ai_primary_objection = objections[0].slice(0, 500);
+  }
 
-  await hubspotPatch(`crm/v3/objects/calls/${encodeURIComponent(callId)}`, { properties });
+  // Severity (if present / normalise), else leave unset
+  if (analysis?.ai_objection_severity) {
+    props.ai_objection_severity = normaliseSeverity(analysis.ai_objection_severity);
+  }
+
+  // Product interest (from products_discussed)
+  const productInterest = mapProductInterest(analysis?.key_details?.products_discussed);
+  if (productInterest) props.ai_product_interest = productInterest;
+
+  // Data points captured / Missing info (if your analysis adds these later)
+  if (analysis?.ai_data_points_captured) {
+    props.ai_data_points_captured = toMultiline(analysis.ai_data_points_captured);
+  }
+  if (analysis?.ai_missing_information) {
+    props.ai_missing_information = toMultiline(analysis.ai_missing_information);
+  }
+
+  // Sentiment (derived from outcome if not provided explicitly)
+  const sentiment = normaliseSentiment(analysis?.ai_customer_sentiment || analysis?.outcome);
+  if (sentiment) props.ai_customer_sentiment = sentiment;
+
+  // Complaint / escalation (optional if present)
+  if (analysis?.ai_complaint_detected) {
+    props.ai_complaint_detected = normaliseYesNoUnclear(analysis.ai_complaint_detected);
+  }
+  if (analysis?.ai_escalation_required) {
+    props.ai_escalation_required = normaliseEscalation(analysis.ai_escalation_required);
+  }
+  if (analysis?.ai_escalation_notes) {
+    props.ai_escalation_notes = toMultiline(analysis.ai_escalation_notes);
+  }
+
+  // Likelihood to close (0–100)
+  if (typeof analysis?.likelihood_to_close === "number") {
+    props.tlpi_likelihood_close = clamp(analysis.likelihood_to_close, 0, 100);
+  }
+
+  // Outcome (Positive/Neutral/Negative)
+  if (analysis?.outcome) {
+    props.tlpi_outcome = normaliseSentiment(analysis.outcome); // share same normaliser
+  }
+
+  // Nothing else is strictly required — send what we have
+  if (Object.keys(props).length === 0) return;
+
+  await hubspotPatch(`crm/v3/objects/calls/${encodeURIComponent(callId)}`, { properties: props });
 }
 
-/**
- * Create a "Scorecard" artefact and associate to call + contacts + deals.
- * Default implementation uses a Note if no custom object is configured.
- */
+/* ---------------------------------------------------
+   CREATE/UPDATE SCORECARD (custom object) + associate
+----------------------------------------------------*/
 export async function createScorecard(analysis, { callId, contactIds = [], dealIds = [], ownerId = null } = {}) {
-  let objResponse;
-
   if (SCORECARD_OBJECT === "notes") {
-    // Create a Note with a structured payload in the body
-    const body = [
-      "TLPI Sales Scorecard",
-      "",
-      `Overall: ${numOrNA(analysis?.scorecard?.overall)}/5`,
-      `Problem Fit: ${numOrNA(analysis?.scorecard?.problem_fit)}/5`,
-      `Budget Fit: ${numOrNA(analysis?.scorecard?.budget_fit)}/5`,
-      `Authority: ${numOrNA(analysis?.scorecard?.authority)}/5`,
-      `Urgency: ${numOrNA(analysis?.scorecard?.urgency)}/5`,
-      "",
-      `Likelihood to Close: ${numOrNA(analysis?.likelihood_to_close)}%`,
-      `Outcome: ${strOrNA(analysis?.outcome)}`,
-      "",
-      `Objections: ${arrToString(analysis?.objections)}`,
-      `Next Actions: ${arrToString(analysis?.next_actions)}`,
-      `Materials: ${arrToString(analysis?.materials_to_send)}`,
-    ].join("\n");
-
-    objResponse = await hubspotPost(`crm/v3/objects/notes`, {
-      properties: {
-        hs_note_body: body.slice(0, 10000),
-        hs_timestamp: Date.now(), // REQUIRED for notes
-        hubspot_owner_id: ownerId || undefined,
-      },
-    });
-
-    const noteId = objResponse?.id;
-    // Associate Note ↔ Call/Contacts/Deals (v3 batch create; reliable)
-    await associateV3("notes", noteId, "calls", callId, "note_to_call");
-    for (const cId of contactIds) await associateV3("notes", noteId, "contacts", cId, "note_to_contact");
-    for (const dId of dealIds) await associateV3("notes", noteId, "deals", dId, "note_to_deal");
-    return { type: "note", id: noteId };
+    // Fallback route if you set HUBSPOT_SCORECARD_OBJECT=notes (legacy test mode)
+    return createNoteScorecard(analysis, { callId, contactIds, dealIds, ownerId });
   }
 
-  // Custom object route
-  objResponse = await hubspotPost(`crm/v3/objects/${encodeURIComponent(SCORECARD_OBJECT)}`, {
-    properties: {
-      name: `Scorecard for call ${callId}`,
-      hubspot_owner_id: ownerId || undefined,
-      tlpi_overall: analysis?.scorecard?.overall,
-      tlpi_problem_fit: analysis?.scorecard?.problem_fit,
-      tlpi_budget_fit: analysis?.scorecard?.budget_fit,
-      tlpi_authority: analysis?.scorecard?.authority,
-      tlpi_urgency: analysis?.scorecard?.urgency,
-      tlpi_likelihood_close: analysis?.likelihood_to_close,
-      tlpi_outcome: analysis?.outcome ? String(analysis.outcome) : undefined,
-      tlpi_objections: Array.isArray(analysis?.objections) ? analysis.objections.join("; ") : undefined,
-      tlpi_next_actions: Array.isArray(analysis?.next_actions) ? analysis.next_actions.join("; ") : undefined,
-      tlpi_materials: Array.isArray(analysis?.materials_to_send) ? analysis.materials_to_send.join("; ") : undefined,
-    },
+  // Identity & coaching
+  const callType = normaliseCallType(analysis?.call_type);
+  const activityType = callType ?? "Initial Consultation";
+  const activityName = `${callId} — ${activityType} — ${new Date().toISOString().slice(0,10)}`;
+
+  const scorecardProps = {
+    activity_type: activityType,                         // text
+    activity_name: activityName,                         // text
+    sales_performance_rating_: toIntegerOrNull(analysis?.scorecard?.overall, 10), // 1–10
+    sales_scorecard___what_you_can_improve_on: buildCoachingNotes(analysis),      // long text
+
+    // Scorecard mirrors of Call-level AI fields
+    sc_ai_objections_bullets: arrayToBullets(analysis?.objections, "• "),
+    sc_ai_primary_objection: ensureArray(analysis?.objections)[0] || undefined,
+    sc_ai_objection_severity: analysis?.ai_objection_severity
+      ? normaliseSeverity(analysis.ai_objection_severity)
+      : undefined,
+    sc_ai_product_interest: mapProductInterest(analysis?.key_details?.products_discussed),
+    sc_ai_data_points_captured: analysis?.ai_data_points_captured ? toMultiline(analysis.ai_data_points_captured) : undefined,
+    sc_ai_missing_information: analysis?.ai_missing_information ? toMultiline(analysis.ai_missing_information) : undefined,
+    sc_ai_customer_sentiment: normaliseSentiment(analysis?.ai_customer_sentiment || analysis?.outcome),
+    sc_ai_complaint_detected: analysis?.ai_complaint_detected
+      ? normaliseYesNoUnclear(analysis.ai_complaint_detected)
+      : undefined,
+    sc_ai_escalation_required: analysis?.ai_escalation_required
+      ? normaliseEscalation(analysis.ai_escalation_required)
+      : undefined,
+    sc_ai_escalation_notes: analysis?.ai_escalation_notes ? toMultiline(analysis.ai_escalation_notes) : undefined,
+  };
+
+  // Create the custom object record
+  const created = await hubspotPost(`crm/v3/objects/${encodeURIComponent(SCORECARD_OBJECT)}`, {
+    properties: scorecardProps,
   });
 
-  const scoreId = objResponse?.id;
+  const scoreId = created?.id;
+  if (!scoreId) {
+    console.warn("[HubSpot] Scorecard creation returned no id");
+    return { type: SCORECARD_OBJECT, id: null };
+  }
+
+  // Associate scorecard ↔ Call (primary), Contacts, Deals
+  // Use v4 labels fallback to avoid guessing association type strings
   await associateWithFallback(SCORECARD_OBJECT, scoreId, "calls", callId);
   for (const cId of contactIds) await associateWithFallback(SCORECARD_OBJECT, scoreId, "contacts", cId);
   for (const dId of dealIds) await associateWithFallback(SCORECARD_OBJECT, scoreId, "deals", dId);
@@ -142,8 +186,38 @@ export async function createScorecard(analysis, { callId, contactIds = [], dealI
   return { type: SCORECARD_OBJECT, id: scoreId };
 }
 
-// --- Low level helpers with resilient error handling ---
+/* ---------------------------
+   Legacy Note scorecard (opt)
+----------------------------*/
+async function createNoteScorecard(analysis, { callId, contactIds = [], dealIds = [], ownerId = null } = {}) {
+  const body = [
+    "TLPI Sales Scorecard",
+    "",
+    `Overall: ${numOrNA(analysis?.scorecard?.overall)}/10`,
+    "",
+    `Objections: ${arrToString(analysis?.objections)}`,
+    `Next Actions: ${arrToString(analysis?.next_actions)}`,
+    `Materials: ${arrToString(analysis?.materials_to_send)}`,
+  ].join("\n");
 
+  const objResponse = await hubspotPost(`crm/v3/objects/notes`, {
+    properties: {
+      hs_note_body: body.slice(0, 10000),
+      hs_timestamp: Date.now(),
+      hubspot_owner_id: ownerId || undefined,
+    },
+  });
+
+  const noteId = objResponse?.id;
+  await associateV3("notes", noteId, "calls", callId, "note_to_call");
+  for (const cId of contactIds) await associateV3("notes", noteId, "contacts", cId, "note_to_contact");
+  for (const dId of dealIds) await associateV3("notes", noteId, "deals", dId, "note_to_deal");
+  return { type: "note", id: noteId };
+}
+
+/* ---------------------------
+   Low-level HTTP helpers
+----------------------------*/
 async function hubspotPost(path, body) {
   const url = `${HS_BASE}/${path}`;
   const res = await fetch(url, { method: "POST", headers: hsHeaders(), body: JSON.stringify(body) });
@@ -172,17 +246,15 @@ async function hubspotPatch(path, body) {
   try { return await res.json(); } catch { return null; }
 }
 
-/**
- * v3 batch association create (reliable)
- */
+/* ---------------------------
+   Associations (v3 + v4)
+----------------------------*/
 async function associateV3(fromType, fromId, toType, toId, type) {
   if (!fromId || !toId) return;
-
   const url = `${HS_BASE}/crm/v3/associations/${encodeURIComponent(fromType)}/${encodeURIComponent(toType)}/batch/create`;
   const body = {
     inputs: [{ from: { id: String(fromId) }, to: { id: String(toId) }, type: String(type) }],
   };
-
   const res = await fetch(url, { method: "POST", headers: hsHeaders(), body: JSON.stringify(body) });
   if (!res.ok) {
     const txt = await res.text().catch(() => "");
@@ -191,20 +263,10 @@ async function associateV3(fromType, fromId, toType, toId, type) {
   }
 }
 
-/**
- * v4 fallback using association labels
- */
 async function associateWithFallback(fromType, fromId, toType, toId) {
-  try {
-    const typeGuess = `${singular(fromType)}_to_${singular(toType)}`;
-    await associateV3(fromType, fromId, toType, toId, typeGuess);
-    return;
-  } catch {
-    // continue to v4 fallback
-  }
-
   if (!fromId || !toId) return;
 
+  // Discover available labels (type IDs)
   const labelsUrl = `${HS_BASE}/crm/v4/associations/${encodeURIComponent(fromType)}/${encodeURIComponent(toType)}/labels`;
   const labelsRes = await fetch(labelsUrl, { headers: hsHeaders() });
   if (!labelsRes.ok) {
@@ -219,6 +281,7 @@ async function associateWithFallback(fromType, fromId, toType, toId) {
     return;
   }
 
+  // v4 batch create with discovered typeId
   const url = `${HS_BASE}/crm/v4/associations/${encodeURIComponent(fromType)}/${encodeURIComponent(toType)}/batch/create`;
   const body = {
     inputs: [
@@ -237,19 +300,121 @@ async function associateWithFallback(fromType, fromId, toType, toId) {
   }
 }
 
-// helpers
+/* ---------------------------
+   Value helpers / normalisers
+----------------------------*/
+function ensureArray(v) {
+  if (Array.isArray(v)) return v.filter(Boolean).map(String);
+  if (v == null) return [];
+  return [String(v)].filter(Boolean);
+}
+
+function arrayToBullets(arr, bullet = "• ") {
+  const a = ensureArray(arr);
+  return a.length ? a.map(s => `${bullet}${s}`).join("\n") : "";
+}
+
+function toMultiline(v) {
+  if (Array.isArray(v)) return v.join("\n");
+  if (v == null) return undefined;
+  return String(v);
+}
+
+function toNumberOrNull(v) {
+  if (v == null) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function toIntegerOrNull(v, max = 10) {
+  const n = toNumberOrNull(v);
+  if (n == null) return null;
+  const nn = Math.round(n);
+  if (!Number.isFinite(nn)) return null;
+  return clamp(nn, 0, max);
+}
+
+function clamp(n, lo, hi) {
+  return Math.max(lo, Math.min(hi, n));
+}
+
+function normaliseCallType(v) {
+  if (!v) return null;
+  const s = String(v).toLowerCase();
+  const map = [
+    "qualification call",
+    "initial consultation",
+    "follow up call",
+    "application meeting",
+    "strategy call",
+    "annual review",
+    "existing customer call",
+    "other",
+  ];
+  const found = map.find(m => s.includes(m));
+  if (found) return titleCase(found);
+  // allow close variants
+  if (s.includes("follow") && s.includes("up")) return "Follow up call";
+  if (s.includes("consult")) return "Initial Consultation";
+  if (s.includes("qualif")) return "Qualification call";
+  if (s.includes("applic")) return "Application meeting";
+  if (s.includes("strategy")) return "Strategy call";
+  if (s.includes("review")) return "Annual Review";
+  if (s.includes("existing")) return "Existing customer call";
+  return "Other";
+}
+
+function titleCase(txt) {
+  return txt.replace(/\w\S*/g, w => w[0].toUpperCase() + w.slice(1).toLowerCase());
+}
+
+function normaliseSeverity(v) {
+  const s = String(v || "").toLowerCase();
+  if (s.startsWith("h")) return "High";
+  if (s.startsWith("m")) return "Medium";
+  if (s.startsWith("l")) return "Low";
+  return undefined;
+}
+
+function mapProductInterest(products) {
+  const arr = ensureArray(products).map(p => p.toLowerCase());
+  const hasSSAS = arr.some(p => p.includes("ssas"));
+  const hasFIC = arr.some(p => p.includes("fic"));
+  if (hasSSAS && hasFIC) return "Both";
+  if (hasSSAS) return "SSAS";
+  if (hasFIC) return "FIC";
+  return undefined;
+}
+
+function normaliseSentiment(v) {
+  if (!v) return undefined;
+  const s = String(v).toLowerCase();
+  if (s.includes("pos")) return "Positive";
+  if (s.includes("neu")) return "Neutral";
+  if (s.includes("neg")) return "Negative";
+  // also accept outcome synonyms
+  if (s.includes("win") || s.includes("close")) return "Positive";
+  if (s.includes("lost") || s.includes("no")) return "Negative";
+  return undefined;
+}
+
+function normaliseYesNoUnclear(v) {
+  const s = String(v || "").toLowerCase();
+  if (s.startsWith("y")) return "Yes";
+  if (s.startsWith("n")) return "No";
+  return "Unclear";
+}
+
+function normaliseEscalation(v) {
+  const s = String(v || "").toLowerCase();
+  if (s.startsWith("y") || s.startsWith("req")) return "Yes";
+  if (s.startsWith("mon")) return "Monitor";
+  return "No";
+}
+
 function arrToString(a) {
   return Array.isArray(a) ? a.join("; ") : "n/a";
 }
 function numOrNA(n) {
   return typeof n === "number" ? n : "n/a";
-}
-function strOrNA(s) {
-  return s ? String(s) : "n/a";
-}
-function singular(type) {
-  if (!type) return "";
-  if (type.endsWith("ies")) return type.slice(0, -3) + "y";
-  if (type.endsWith("s")) return type.slice(0, -1);
-  return type;
 }
