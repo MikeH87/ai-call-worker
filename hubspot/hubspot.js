@@ -78,37 +78,39 @@ export async function getAssociations(fromId, toType) {
 export async function updateCall(callId, analysis) {
   const props = {};
 
-  // Resolve type
+  // Resolve type (force to "Initial Consultation" if ambiguous)
   const resolvedType = resolveCallType(analysis?.call_type) || "Initial Consultation";
   if (resolvedType) {
-    props.ai_inferred_call_type = resolvedType;               // text/dropdown (your portal)
-    props.hs_activity_type = resolvedType;                    // built-in type for consistency
+    props.ai_inferred_call_type = resolvedType;               // your custom field
+    props.hs_activity_type = resolvedType;                    // HubSpot built-in type
   }
+
   // Confidence: use explicit if present else 85 when inferred
   const conf = numberOrNull(analysis?.ai_call_type_confidence ?? analysis?.call_type_confidence);
   props.ai_call_type_confidence = conf != null ? clamp(conf, 0, 100) : 85;
 
-  // Consultation outcome (Likely/Monitor/Not proceeding)
-  props.ai_consultation_outcome = mapConsultationOutcome(analysis?.outcome || "Monitor");
+  // Outcome (MUST be one of: Proceed now, Likely, Unclear, Not now, No fit)
+  const outcomeHS = mapConsultationOutcomeHS(analysis?.outcome, analysis?.likelihood_to_close);
+  props.ai_consultation_outcome = outcomeHS;
 
-  // Product interest (FIC/SSAS/Both) from products_discussed
+  // Product interest (FIC/SSAS/Both)
   const productInterest = mapProductInterest(analysis?.key_details?.products_discussed);
   if (productInterest) props.ai_product_interest = productInterest;
 
-  // Decision criteria (from analysis or inferred from summary)
+  // Decision criteria
   props.ai_decision_criteria = toShortList(
     analysis?.ai_decision_criteria,
     inferDecisionCriteriaFromSummary(analysis?.summary || []),
     "Not mentioned."
   );
 
-  // Data points captured (DOB, NI, address, etc.) — write whatever we detected; else explicit fallback
+  // Data points captured (DOB, NI, address, etc.)
   props.ai_data_points_captured = buildDataPointsCaptured(analysis?.key_details) || "No personal data captured.";
 
-  // Missing info (requested but not available)
+  // Missing info
   props.ai_missing_information = toMultiline(analysis?.ai_missing_information) || "None requested or all provided.";
 
-  // Next steps (plain string, not array)
+  // Next steps
   props.ai_next_steps = toShortList(analysis?.next_actions, [], "No next steps captured.");
 
   // Objections
@@ -127,16 +129,16 @@ export async function updateCall(callId, analysis) {
     props.ai_objection_severity = "Low";
   }
 
-  // Materials (what the prospect asked TLPI to send)
+  // Materials requested from TLPI
   props.ai_consultation_required_materials = toShortList(analysis?.materials_to_send, [], "No materials requested.");
 
   // Likeliness to proceed (1–10) + reasoning & “increase likelihood” suggestions
-  const likeScore10 = toOneToTenFromPct(analysis?.likelihood_to_close);
-  props["chat_gpt___likeliness_to_proceed_score"] = likeScore10 ?? 5; // default mid if absent
+  const likeScore10 = toOneToTenFromPct(analysis?.likelihood_to_close) ?? 5;
+  props["chat_gpt___likeliness_to_proceed_score"] = likeScore10;
   props["chat_gpt___score_reasoning"] = buildScoreReasoning(analysis, likeScore10);
   props["chat_gpt___increase_likelihood_of_sale_suggestions"] = buildIncreaseLikelihood(analysis);
 
-  // Summary (HubSpot native summary renderer)
+  // Summary (HubSpot native summary)
   props.hs_call_summary = arrayToBullets(analysis?.summary, "• ") || "No summary generated.";
 
   // Sentiment → client engagement NUMBER (High=3, Neutral=2, Low=1)
@@ -162,14 +164,6 @@ export async function updateCall(callId, analysis) {
 }
 
 /* ============ Create Scorecard & associate ============ */
-/**
- * Creates Sales Scorecard with:
- * - Owner copied from call
- * - 9 x Qual_* fields (0/1)
- * - consult_score_final (1–10)
- * - sales_performance_rating (1–10) + summary
- * - Mirrors from the call (likelihood 1–10, outcome, materials, decision criteria, key objections, next steps)
- */
 export async function createScorecard(analysis, { callId, contactIds = [], dealIds = [], ownerId = null } = {}) {
   // Ensure we know which fields exist on this custom object
   await getKnownPropsSet(SCORECARD_OBJECT);
@@ -192,7 +186,7 @@ export async function createScorecard(analysis, { callId, contactIds = [], dealI
     activity_name: activityName,
     hubspot_owner_id: ownerId || undefined,
 
-    // 9 x Qual_* (only set those that exist)
+    // 9 x Qual_* (0/1)
     ...(has("qual_benefits_linked_to_needs")           ? { qual_benefits_linked_to_needs: Q.benefits_linked_to_needs } : {}),
     ...(has("qual_clear_responses_or_followup")        ? { qual_clear_responses_or_followup: Q.clear_responses_or_followup } : {}),
     ...(has("qual_commitment_requested")               ? { qual_commitment_requested: Q.commitment_requested } : {}),
@@ -214,7 +208,7 @@ export async function createScorecard(analysis, { callId, contactIds = [], dealI
 
     // Mirrors from Call
     ...(has("ai_consultation_likelihood_to_close") ? { ai_consultation_likelihood_to_close: toOneToTenFromPct(analysis?.likelihood_to_close) ?? 5 } : {}),
-    ...(has("ai_consultation_outcome") ? { ai_consultation_outcome: mapConsultationOutcome(analysis?.outcome || "Monitor") } : {}),
+    ...(has("ai_consultation_outcome") ? { ai_consultation_outcome: mapConsultationOutcomeHS(analysis?.outcome, analysis?.likelihood_to_close) } : {}),
     ...(has("ai_consultation_required_materials") ? { ai_consultation_required_materials: toShortList(analysis?.materials_to_send, [], "No materials requested.") } : {}),
     ...(has("ai_decision_criteria") ? { ai_decision_criteria: toShortList(analysis?.ai_decision_criteria, inferDecisionCriteriaFromSummary(analysis?.summary || []), "Not mentioned.") } : {}),
     ...(has("ai_key_objections") ? { ai_key_objections: ensureArray(analysis?.objections).length ? ensureArray(analysis?.objections).join("; ").slice(0, 1000) : "No objections" } : {}),
@@ -333,10 +327,30 @@ function normaliseSentiment(v){ if(!v) return "Neutral"; const s=String(v).toLow
 }
 function engagementNumberFromSentiment(sent){ return sent==="Positive" ? 3 : sent==="Negative" ? 1 : 2; }
 
-function mapConsultationOutcome(outcome){ const s=String(outcome||"").toLowerCase();
-  if (s.includes("positive") || s.includes("proceed") || s.includes("win")) return "Likely";
-  if (s.includes("negative") || s.includes("no")) return "Not proceeding";
-  return "Monitor";
+/** Map analysis outcome/likelihood to HubSpot’s allowed set. */
+function mapConsultationOutcomeHS(outcomeText, likelihoodPct){
+  const allowed = ["Proceed now","Likely","Unclear","Not now","No fit"];
+  const s = String(outcomeText || "").toLowerCase();
+
+  // text hints first
+  if (/\bproceed|signed|go(-|\s*)ahead|commit|purchase|buy|agree/.test(s)) return "Proceed now";
+  if (/\blikely|positive|good chance|favourable|favorable/.test(s)) return "Likely";
+  if (/\bnot now|later|follow[-\s]?up|defer|wait/.test(s)) return "Not now";
+  if (/\bno fit|not proceeding|won'?t proceed|decline|reject/.test(s)) return "No fit";
+  if (/\bunclear|unsure|tbd|unknown/.test(s)) return "Unclear";
+
+  // fall back to likelihood thresholds (pct 0..100)
+  const n = numberOrNull(likelihoodPct);
+  if (n != null) {
+    if (n >= 90) return "Proceed now";
+    if (n >= 60) return "Likely";
+    if (n >= 40) return "Unclear";
+    if (n >= 20) return "Not now";
+    return "No fit";
+  }
+
+  // safest default
+  return "Unclear";
 }
 
 function mapProductInterest(products){
