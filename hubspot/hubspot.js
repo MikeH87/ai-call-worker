@@ -14,6 +14,41 @@ function hsHeaders() {
   return { Authorization: `Bearer ${HUBSPOT_TOKEN}`, "Content-Type": "application/json" };
 }
 
+/* =========================================
+   Property discovery & filtering (memoised)
+   ========================================= */
+const KNOWN_PROPS = new Map(); // objectType -> Set(props)
+
+async function getKnownPropsSet(objectType) {
+  if (KNOWN_PROPS.has(objectType)) return KNOWN_PROPS.get(objectType);
+  try {
+    const url = `${HS_BASE}/crm/v3/properties/${encodeURIComponent(objectType)}?archived=false`;
+    const res = await fetch(url, { headers: hsHeaders() });
+    if (!res.ok) throw new Error(`prop list ${objectType} ${res.status}`);
+    const js = await res.json();
+    const set = new Set((js?.results || []).map(p => p?.name).filter(Boolean));
+    KNOWN_PROPS.set(objectType, set);
+    return set;
+  } catch (e) {
+    console.warn(`[HubSpot] Could not fetch properties for ${objectType}: ${e.message}`);
+    // fallback: empty set (no filtering)
+    const set = new Set();
+    KNOWN_PROPS.set(objectType, set);
+    return set;
+  }
+}
+
+async function filterPropsFor(objectType, props) {
+  const known = await getKnownPropsSet(objectType);
+  if (!known || known.size === 0) return props; // nothing known, don't filter
+  const out = {};
+  for (const [k, v] of Object.entries(props || {})) {
+    if (known.has(k)) out[k] = v;
+    else console.warn(`[filter] dropping unknown ${objectType}.${k}`);
+  }
+  return out;
+}
+
 /* ====================== Reads ====================== */
 export async function getHubSpotObject(objectType, id, properties = []) {
   const params = new URLSearchParams();
@@ -43,7 +78,7 @@ export async function getAssociations(fromId, toType) {
 export async function updateCall(callId, analysis) {
   const props = {};
 
-  // SUMMARY (HubSpot renders this): hs_call_summary
+  // Summary (HubSpot renders this)
   const summaryStr = arrayToBullets(analysis?.summary, "• ") || "No summary generated.";
   props.hs_call_summary = summaryStr.slice(0, 5000);
 
@@ -56,7 +91,7 @@ export async function updateCall(callId, analysis) {
   if (conf != null) props.ai_call_type_confidence = conf;
   if (inferredType && conf >= 75) props.hs_activity_type = inferredType;
 
-  // Objections
+  // Objections & related
   const objections = ensureArray(analysis?.objections);
   if (objections.length) {
     props.ai_objections_bullets = objections.join(" • ").slice(0, 5000);
@@ -64,7 +99,8 @@ export async function updateCall(callId, analysis) {
     props.ai_key_objections = objections.join("; ").slice(0, 1000);
     props.ai_objection_categories = mapObjectionCategories(objections).join("; ") || "Not mentioned.";
     props.ai_objection_severity = analysis?.ai_objection_severity
-      ? normaliseSeverity(analysis.ai_objection_severity) : "Medium";
+      ? normaliseSeverity(analysis.ai_objection_severity)
+      : "Medium";
   } else {
     props.ai_objections_bullets = "No objections mentioned.";
     props.ai_primary_objection = "None.";
@@ -72,7 +108,7 @@ export async function updateCall(callId, analysis) {
     props.ai_objection_categories = "None.";
   }
 
-  // Product interest (dropdown)
+  // Product interest (dropdown only if clear)
   const productInterest = mapProductInterest(analysis?.key_details?.products_discussed);
   if (productInterest) props.ai_product_interest = productInterest;
 
@@ -94,7 +130,7 @@ export async function updateCall(callId, analysis) {
   }
   props.ai_decision_criteria = decisionCriteria.slice(0, 1000);
 
-  // Recommendations
+  // Recommendations / materials
   props.ai_recommendations_provided =
     (Array.isArray(analysis?.materials_to_send) && analysis.materials_to_send.length)
       ? analysis.materials_to_send.join("; ").slice(0, 5000)
@@ -108,7 +144,7 @@ export async function updateCall(callId, analysis) {
   props.ai_escalation_required = normaliseEscalation(analysis?.ai_escalation_required || "No");
   props.ai_escalation_notes = toMultiline(analysis?.ai_escalation_notes) || "No escalation required.";
 
-  // IC specifics
+  // Type-specific (IC / FU)
   if (inferredType === "Initial Consultation") {
     if (typeof analysis?.likelihood_to_close === "number") {
       props.ai_consultation_likelihood_to_close = clamp(Math.max(1, Math.round(analysis.likelihood_to_close / 10)), 1, 10);
@@ -123,7 +159,6 @@ export async function updateCall(callId, analysis) {
         ? analysis.next_actions.join("; ").slice(0, 5000)
         : "No next steps captured.";
   }
-
   if (inferredType === "Follow up call") {
     if (typeof analysis?.likelihood_to_close === "number") {
       props.ai_follow_up_close_likelihood = clamp(Math.max(1, Math.round(analysis.likelihood_to_close / 10)), 1, 10);
@@ -141,7 +176,9 @@ export async function updateCall(callId, analysis) {
         : "No next steps captured.";
   }
 
-  const patchResp = await hubspotPatch(`crm/v3/objects/calls/${encodeURIComponent(callId)}`, { properties: props });
+  // Filter unknown props for calls, then PATCH
+  const safeProps = await filterPropsFor("calls", props);
+  const patchResp = await hubspotPatch(`crm/v3/objects/calls/${encodeURIComponent(callId)}`, { properties: safeProps });
 
   // DEBUG echo
   try {
@@ -166,81 +203,107 @@ export async function createScorecard(analysis, { callId, contactIds = [], dealI
   const callType = normaliseCallType(analysis?.call_type) || "Initial Consultation";
   const activityName = `${callId} — ${callType} — ${new Date().toISOString().slice(0, 10)}`;
 
-  // ---- ingest consult metrics from analysis.consult_eval ----
+  // ---- consult metrics from analysis.consult_eval
   const consult = analysis?.consult_eval || {};
   // rubric items 0/0.5/1
   const R = {
-    consult_intro: consult.intro,
-    consult_rapport_open: consult.rapport_open,
-    consult_open_question: consult.open_question,
-    consult_needs_pain_uncovered: consult.needs_pain_uncovered,
-    consult_services_explained_clearly: consult.services_explained_clearly,
-    consult_benefits_linked_to_needs: consult.benefits_linked_to_needs,
-    consult_active_listening: consult.active_listening,
-    consult_clear_responses_or_followup: consult.clear_responses_or_followup,
-    consult_commitment_requested: consult.commitment_requested,
-    consult_next_steps_confirmed: consult.next_steps_confirmed,
+    intro: consult.intro,
+    rapport_open: consult.rapport_open,
+    open_question: consult.open_question,
+    needs_pain_uncovered: consult.needs_pain_uncovered,
+    services_explained_clearly: consult.services_explained_clearly,
+    benefits_linked_to_needs: consult.benefits_linked_to_needs,
+    active_listening: consult.active_listening,
+    clear_responses_or_followup: consult.clear_responses_or_followup,
+    commitment_requested: consult.commitment_requested,
+    next_steps_confirmed: consult.next_steps_confirmed,
   };
   // operational items 0 or 10 (normalise to 0..1)
   const Oraw = {
-    consult_specific_tax_estimate_given: consult.specific_tax_estimate_given, // 0 or 10
-    consult_fees_tax_deductible_explained: consult.fees_tax_deductible_explained, // 0 or 10
-    consult_next_step_specific_date_time: consult.next_step_specific_date_time, // 0 or 10
-    consult_interactive_throughout: consult.interactive_throughout, // 0 or 10
-    consult_quantified_value_roi: consult.quantified_value_roi, // 0 or 10
+    specific_tax_estimate_given: consult.specific_tax_estimate_given, // 0 or 10
+    fees_tax_deductible_explained: consult.fees_tax_deductible_explained, // 0 or 10
+    next_step_specific_date_time: consult.next_step_specific_date_time, // 0 or 10
+    interactive_throughout: consult.interactive_throughout, // 0 or 10
+    quantified_value_roi: consult.quantified_value_roi, // 0 or 10
   };
-  const O = Object.fromEntries(Object.entries(Oraw).map(([k,v]) => [k, normaliseZeroTen(v)]));
 
-  // write-through props (only when provided)
+  // Build Scorecard properties object
   const props = {
     activity_type: callType,
     activity_name: activityName,
     hubspot_owner_id: ownerId || undefined,
 
-    // coaching + rating
+    // 1–10 (string): prompt-driven overall rating
+    sales_performance_rating: String(clamp(Math.round(toNumberOrNull(analysis?.sales_performance_rating) ?? 0), 1, 10)),
+
+    // Coaching summary (fallback if missing)
     sales_scorecard___what_you_can_improve_on:
       (analysis?.sales_performance_summary && String(analysis.sales_performance_summary).slice(0, 9000))
       || buildCoachingNotes(analysis),
-    // 1–10 (string+number): write both variants
-    sales_performance_rating: String(clamp(Math.round(toNumberOrNull(analysis?.sales_performance_rating) ?? 0), 1, 10)),
+
+    // Mirrors
+    ai_next_steps: Array.isArray(analysis?.next_actions) && analysis.next_actions.length
+      ? analysis.next_actions.join("; ").slice(0, 5000)
+      : "No next steps captured.",
+    ai_key_objections: ensureArray(analysis?.objections).length
+      ? ensureArray(analysis?.objections).join("; ").slice(0, 1000)
+      : "None.",
+    ai_consultation_required_materials: Array.isArray(analysis?.materials_to_send) && analysis.materials_to_send.length
+      ? analysis.materials_to_send.join("; ").slice(0, 5000)
+      : "No materials required.",
+    ai_decision_criteria: (() => {
+      const dc = toMultiline(analysis?.ai_decision_criteria);
+      if (dc) return dc.slice(0, 1000);
+      const crit = inferDecisionCriteriaFromSummary(analysis?.summary || []);
+      return (crit.length ? crit.join("; ") : "Not mentioned.").slice(0, 1000);
+    })(),
   };
 
-  // copy consult metrics onto scorecard if present
-  for (const [prop, val] of Object.entries(R)) {
-    const n = toScore01(val);
-    if (n != null) props[prop] = n;
-  }
-  for (const [prop, val] of Object.entries(O)) {
-    const n = toScore01(val);
-    if (n != null) props[prop] = n === 1 ? 10 : 0; // keep 0 or 10 in CRM as requested
-  }
-
-  // compute 0–100 weighted score → sales_performance_rating_
-  const weighted = computeWeightedScore(R, O);
+  // Compute 0..100 weighted score for sales_performance_rating_
+  const weighted = computeWeightedScore(R, Oraw);
   if (weighted != null) props.sales_performance_rating_ = weighted;
 
-  // mirrors
-  props.ai_next_steps = Array.isArray(analysis?.next_actions) && analysis.next_actions.length
-    ? analysis.next_actions.join("; ").slice(0, 5000)
-    : "No next steps captured.";
-  props.ai_key_objections = ensureArray(analysis?.objections).length
-    ? ensureArray(analysis?.objections).join("; ").slice(0, 1000)
-    : "None.";
-  props.ai_consultation_required_materials = Array.isArray(analysis?.materials_to_send) && analysis.materials_to_send.length
-    ? analysis.materials_to_send.join("; ").slice(0, 5000)
-    : "No materials required.";
-  props.ai_decision_criteria = (() => {
-    const dc = toMultiline(analysis?.ai_decision_criteria);
-    if (dc) return dc.slice(0, 1000);
-    const crit = inferDecisionCriteriaFromSummary(analysis?.summary || []);
-    return (crit.length ? crit.join("; ") : "Not mentioned.").slice(0, 1000);
-  })();
+  // ---- Map rubric items to your existing Scorecard fields (pick first that exists)
+  const scoreType = SCORECARD_OBJECT; // custom type
+  const mapAndSet = async (candidates, value01) => {
+    const set = await getKnownPropsSet(scoreType);
+    const target = candidates.find(n => set.has(n));
+    if (target != null && value01 != null) props[target] = value01;
+  };
 
-  if (callType === "Initial Consultation" && typeof analysis?.likelihood_to_close === "number") {
-    props.ai_consultation_likelihood_to_close = clamp(Math.max(1, Math.round(analysis.likelihood_to_close / 10)), 1, 10);
+  // Values already 0/0.5/1 for R; for Op items convert 0|10 -> 0|1 then store back as 0 or 10 (as requested)
+  const to01 = v => (Number(v) === 1 || Number(v) === 0.5 || Number(v) === 0) ? Number(v) : null;
+  const toZeroTen = v => Number(v) === 10 ? 10 : 0;
+
+  // Rubric (try consult_* first, then reasonable fallbacks)
+  await mapAndSet(["consult_intro"], to01(R.intro));
+  await mapAndSet(["consult_rapport_open"], to01(R.rapport_open));
+  await mapAndSet(["consult_open_question","qual_open_question","consult_no_assumptions_evidence_gathered"], to01(R.open_question));
+  await mapAndSet(["consult_needs_pain_uncovered"], to01(R.needs_pain_uncovered));
+  await mapAndSet(["consult_services_explained_clearly","consult_purpose_clearly_stated","qual_services_explained_clearly"], to01(R.services_explained_clearly));
+  await mapAndSet(["consult_benefits_linked_to_needs","consult_interactive_throughout","qual_benefits_linked_to_needs"], to01(R.benefits_linked_to_needs));
+  await mapAndSet(["consult_active_listening","qual_active_listening","consult_interactive_throughout"], to01(R.active_listening));
+  await mapAndSet(["consult_clear_responses_or_followup","qual_clear_responses_or_followup"], to01(R.clear_responses_or_followup));
+  await mapAndSet(["consult_commitment_requested","qual_commitment_requested","consult_customer_agreed_to_set_up"], to01(R.commitment_requested));
+  await mapAndSet(["consult_next_steps_confirmed","qual_next_steps_confirmed","consult_next_contact_within_5_days"], to01(R.next_steps_confirmed));
+
+  // Operational (0 or 10 on record)
+  const O10 = {
+    consult_specific_tax_estimate_given: toZeroTen(Oraw.specific_tax_estimate_given),
+    consult_fees_tax_deductible_explained: toZeroTen(Oraw.fees_tax_deductible_explained),
+    consult_next_step_specific_date_time: toZeroTen(Oraw.next_step_specific_date_time),
+    consult_interactive_throughout: toZeroTen(Oraw.interactive_throughout),
+    consult_quantified_value_roi: toZeroTen(Oraw.quantified_value_roi),
+  };
+  for (const [prop, val] of Object.entries(O10)) {
+    await mapAndSet([prop], Number.isFinite(val) ? (val === 10 ? 1 : 0) : null); // store 0/1 if your fields are 0/1; if your fields are 0/10, change to val directly
+    // If your fields are explicitly 0 or 10 (as per your note), do this instead:
+    if (KNOWN_PROPS.get(scoreType)?.has(prop)) props[prop] = val; // overrides with 0/10
   }
 
-  const created = await hubspotPost(`crm/v3/objects/${encodeURIComponent(SCORECARD_OBJECT)}`, { properties: props });
+  // Filter unknown scorecard props, then POST
+  const safeProps = await filterPropsFor(SCORECARD_OBJECT, props);
+  const created = await hubspotPost(`crm/v3/objects/${encodeURIComponent(SCORECARD_OBJECT)}`, { properties: safeProps });
   const scoreId = created?.id;
   if (!scoreId) {
     console.warn("[HubSpot] Scorecard creation returned no id");
@@ -359,8 +422,6 @@ function arrayToBullets(arr, bullet="• ") { const a = ensureArray(arr); return
 function toMultiline(v) { if (Array.isArray(v)) return v.join("\n"); if (v == null) return undefined; return String(v); }
 function toNumberOrNull(v) { if (v == null) return null; const n = Number(v); return Number.isFinite(n) ? n : null; }
 function clamp(n, lo, hi) { return Math.max(lo, Math.min(hi, n)); }
-function toScore01(v) { if (v === true) return 1; if (v === false) return 0; const n = Number(v); if (!Number.isFinite(n)) return null; if (n === 0 || n === 0.5 || n === 1) return n; return null; }
-function normaliseZeroTen(v){ const n = Number(v); if (!Number.isFinite(n)) return null; if (n===0) return 0; if (n===10) return 1; return null; }
 function toScoreOutOf10OrNull(v) { if (v == null) return null; const n = Number(v); if (!Number.isFinite(n)) return null; return n <= 5 ? clamp(Math.round(n * 2), 0, 10) : clamp(Math.round(n), 0, 10); }
 
 function normaliseCallType(v) {
@@ -392,6 +453,19 @@ function normaliseSentiment(v){ if(!v) return undefined; const s=String(v).toLow
   return "Neutral";
 }
 function sentimentToEngagement(sent){ return sent==="Positive"?"High":sent==="Neutral"?"Medium":"Low"; }
+
+function normaliseYesNoUnclear(v){
+  const s = String(v || "").toLowerCase();
+  if (s.startsWith("y")) return "Yes";
+  if (s.startsWith("n")) return "No";
+  return "Unclear";
+}
+function normaliseEscalation(v){
+  const s = String(v || "").toLowerCase();
+  if (s.startsWith("y")) return "Yes";
+  if (s.startsWith("m")) return "Monitor";
+  return "No";
+}
 function normaliseSeverity(v){const s=String(v||"").toLowerCase(); if(s.startsWith("h"))return"High"; if(s.startsWith("m"))return"Medium"; if(s.startsWith("l"))return"Low"; return undefined;}
 
 function mapProductInterest(products){ const arr=ensureArray(products).map(p=>p.toLowerCase());
@@ -425,32 +499,40 @@ function inferDecisionCriteriaFromSummary(summaryArr){
   return Array.from(new Set(crit));
 }
 
-function computeWeightedScore(R, O){
-  // weights as agreed (sum = 100)
+function computeWeightedScore(R, O10){
+  // weights sum to 100
   const W = {
-    consult_intro:4, consult_rapport_open:4, consult_open_question:8,
-    consult_needs_pain_uncovered:10, consult_services_explained_clearly:8,
-    consult_benefits_linked_to_needs:10, consult_active_listening:8,
-    consult_clear_responses_or_followup:8, consult_commitment_requested:12,
-    consult_next_steps_confirmed:12,
-    consult_specific_tax_estimate_given:4, consult_fees_tax_deductible_explained:4,
-    consult_next_step_specific_date_time:4, consult_interactive_throughout:4,
-    consult_quantified_value_roi:4,
+    intro:4, rapport_open:4, open_question:8,
+    needs_pain_uncovered:10, services_explained_clearly:8,
+    benefits_linked_to_needs:10, active_listening:8,
+    clear_responses_or_followup:8, commitment_requested:12,
+    next_steps_confirmed:12,
+    specific_tax_estimate_given:4, fees_tax_deductible_explained:4,
+    next_step_specific_date_time:4, interactive_throughout:4, quantified_value_roi:4,
   };
-
   let total = 0;
 
-  for (const [prop, w] of Object.entries(W)) {
-    if (prop in R) {
-      const s = toScore01(R[prop]); // 0/0.5/1
-      if (s != null) total += s * w;
-    } else if (prop in O) {
-      const s = toScore01(O[prop]); // 0/1 after normalisation
-      if (s != null) total += s * w;
+  // rubric (0/0.5/1)
+  for (const [k,w] of Object.entries(W)) {
+    if (k in R) {
+      const n = Number(R[k]);
+      if (n===0 || n===0.5 || n===1) total += n * w;
     }
   }
-  // clamp to 0..100 (integer)
+  // ops (0 or 10 → 0 or 1)
+  for (const [k,w] of Object.entries(W)) {
+    if (k in O10) {
+      const n = Number(O10[k]) === 10 ? 1 : 0;
+      total += n * w;
+    }
+  }
   return Math.max(0, Math.min(100, Math.round(total)));
+}
+
+function buildCoachingNotes(analysis) {
+  const positives = ensureArray(analysis?.summary).slice(0, 3).map(s => `✓ ${s}`).join("\n") || "No positives captured.";
+  const improvements = ensureArray(analysis?.next_actions).slice(0, 3).map(s => `• ${s}`).join("\n") || "No improvement items captured.";
+  return [`What went well:\n${positives}`, `\nAreas to improve:\n${improvements}`].join("\n").slice(0, 9000);
 }
 
 function arrToString(a){return Array.isArray(a)?a.join("; "):"n/a";}
