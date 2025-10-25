@@ -19,6 +19,8 @@ import {
 
 dotenv.config();
 const app = express();
+
+// Accept standard JSON; raise limit defensively
 app.use(bodyParser.json({ limit: "20mb" }));
 
 // --- Utils ---
@@ -45,20 +47,118 @@ app.get("/", (req, res) => {
   res.send("AI Call Worker v4.x modular running ✅");
 });
 
+app.get("/health", (req, res) => {
+  res.status(200).send({ ok: true, now: Date.now() });
+});
+
+/**
+ * Try to extract {callId, recordingUrl, zoomToken, chunkSeconds, concurrency} from various body shapes
+ * Supports:
+ *  - { callId, recordingUrl, zoomToken, ... }
+ *  - { id/objectId/engagementId, recording_url/zoomRecordingUrl }
+ *  - [ { objectId, ... }, ... ]  // HubSpot webhook array
+ *  - { object: { id } }
+ */
+function deriveBasics(body) {
+  if (!body) return {};
+  let callId =
+    body.callId ||
+    body.id ||
+    body.objectId ||
+    body.engagementId ||
+    body?.object?.id;
+
+  // If body is an array (HubSpot webhook)
+  if (!callId && Array.isArray(body) && body.length > 0) {
+    callId =
+      body[0].callId ||
+      body[0].id ||
+      body[0].objectId ||
+      body[0].engagementId ||
+      body[0]?.object?.id;
+  }
+
+  let recordingUrl =
+    body.recordingUrl ||
+    body.recording_url ||
+    body.zoomRecordingUrl ||
+    body?.object?.recordingUrl;
+
+  if (!recordingUrl && Array.isArray(body) && body.length > 0) {
+    recordingUrl =
+      body[0].recordingUrl ||
+      body[0].recording_url ||
+      body[0].zoomRecordingUrl ||
+      body[0]?.object?.recordingUrl;
+  }
+
+  const zoomToken = body.zoomToken || process.env.ZOOM_TOKEN || null;
+  const chunkSeconds = Number(body.chunkSeconds) || undefined;
+  const concurrency = Number(body.concurrency) || undefined;
+
+  return { callId, recordingUrl, zoomToken, chunkSeconds, concurrency };
+}
+
+/**
+ * Fallback: if we have callId but not recordingUrl, try to fetch it from HubSpot
+ * Checks common property names on the Call.
+ */
+async function fetchRecordingUrlFromHubSpot(callId) {
+  try {
+    const propsToTry = [
+      "hs_call_recording_url",
+      "hs_call_recording",
+      "recording_url",
+      "zoom_recording_url",
+    ];
+    const call = await getHubSpotObject("calls", callId, propsToTry);
+    const p = call?.properties || {};
+    for (const k of propsToTry) {
+      if (p[k]) return p[k];
+    }
+  } catch (e) {
+    console.warn("[warn] Could not fetch recording URL from HubSpot:", e.message);
+  }
+  return null;
+}
+
 /**
  * POST /process-call
- * Body: { callId, recordingUrl, zoomToken? }  // zoomToken optional if env ZOOM_TOKEN set
+ * Body (any of the supported shapes above)
  * Optional: { chunkSeconds, concurrency }
  */
 app.post("/process-call", async (req, res) => {
   const startedAt = Date.now();
-  const { callId, recordingUrl, zoomToken, chunkSeconds, concurrency } = req.body || {};
+  let { callId, recordingUrl, zoomToken, chunkSeconds, concurrency } = deriveBasics(req.body);
 
-  if (!callId || !recordingUrl) {
-    return res.status(400).send({ ok: false, error: "callId and recordingUrl are required" });
+  // If callId/recordingUrl missing, try to auto-derive from HubSpot
+  if (!callId && Array.isArray(req.body) && req.body.length > 0) {
+    // HubSpot webhook often posts an array: use the objectId as callId
+    callId = req.body[0].objectId || req.body[0].id || req.body[0]?.object?.id;
   }
 
-  // Respond early so the Zoom/HubSpot webhook isn't held open
+  if (callId && !recordingUrl) {
+    recordingUrl = await fetchRecordingUrlFromHubSpot(callId);
+  }
+
+  if (!callId || !recordingUrl) {
+    // Log body keys (safe): helps debugging payload shape
+    const keys = Array.isArray(req.body)
+      ? ["[array payload]", ...Object.keys(req.body[0] || {})]
+      : Object.keys(req.body || {});
+    console.warn("[payload] Missing fields. Seen keys:", keys);
+
+    return res
+      .status(400)
+      .send({
+        ok: false,
+        error: "callId and recordingUrl are required",
+        hint: "Accepts { callId, recordingUrl } OR HubSpot webhook array with objectId. If no recordingUrl posted, we try to fetch hs_call_recording_url from HubSpot.",
+        seenKeys: keys,
+      });
+  }
+
+  // Respond early so webhook isn’t held open
   res.status(200).send({ ok: true, callId });
 
   try {
@@ -66,12 +166,12 @@ app.post("/process-call", async (req, res) => {
     const audioPath = path.join(TMP_DIR, `${callId}.mp3`);
     console.log(`[bg] Downloading audio to ${audioPath}`);
 
-    // Prefer explicit token from webhook, else env
-    const bearer = zoomToken || process.env.ZOOM_TOKEN || "";
-    await downloadToFile(recordingUrl, audioPath, { bearer });
+    await downloadToFile(recordingUrl, audioPath, { bearer: zoomToken });
 
-    console.log("[bg] Transcribing in parallel…",
-      `(segment=${chunkSeconds || 120}s, concurrency=${concurrency || 4})`);
+    console.log(
+      "[bg] Transcribing in parallel…",
+      `(segment=${chunkSeconds || 120}s, concurrency=${concurrency || 4})`
+    );
     const transcript = await transcribeAudioParallel(audioPath, callId, {
       segmentSeconds: Number(chunkSeconds) || 120,
       concurrency: Number(concurrency) || 4,
@@ -106,11 +206,23 @@ app.post("/process-call", async (req, res) => {
     }
 
     // best-effort cleanup
-    try { await fs.rm(audioPath, { force: true }); } catch {}
-    console.log(`✅ Done ${callId} in ${Math.round((Date.now() - startedAt)/1000)}s`);
+    try {
+      await fs.rm(audioPath, { force: true });
+    } catch {}
+    console.log(`✅ Done ${callId} in ${Math.round((Date.now() - startedAt) / 1000)}s`);
   } catch (err) {
     console.error("❌ Background error:", err);
   }
+});
+
+/**
+ * Convenience endpoint: post the raw HubSpot webhook payload here.
+ * We’ll auto-derive callId and recordingUrl (via HubSpot if needed) and then process.
+ */
+app.post("/hubspot-calls-webhook", async (req, res) => {
+  // Just forward the body to /process-call logic.
+  // Some HubSpot setups prefer a separate path—this keeps your existing integrations clean.
+  return app._router.handle(req, res, () => {}, "/process-call");
 });
 
 /**
