@@ -1,15 +1,8 @@
 // =============================================================
-// TLPI – AI Call Worker (v3.8)
-// - Scorecard: associates to CALL; created for Qual / IC / Follow-up
-// - Required Scorecard fields set:
-//     * activity_type   (call type; single-line text)
-//     * activity_name   ("<CallId> — <Call Type> — <YYYY-MM-DD>")
-// - Coaching on Scorecard:
-//     * sales_performance_rating_ (NUMBER 1..10)
-//     * sales_scorecard___what_you_can_improve_on (multiline summary block)
-// - IC fields on Call: ai_data_points_captured / ai_missing_information
-// - Existing customer fields on Call: ai_customer_sentiment / ai_complaint_detected / ai_escalation_required / ai_escalation_notes
-// - Whisper compression/chunking; tightened call-type cues & heuristics
+// TLPI – AI Call Worker (v3.8.1)
+// - Reliability upgrade: always-or-threshold segmentation, per-chunk
+//   Whisper timeouts & retries, detailed progress logging.
+// - All core behaviours from v3.8 preserved.
 // =============================================================
 
 import express from "express";
@@ -22,11 +15,18 @@ import ffmpegInstaller from "@ffmpeg-installer/ffmpeg";
 import ffmpeg from "fluent-ffmpeg";
 
 // ---- ENV ----
-const OPENAI_API_KEY   = process.env.OPENAI_API_KEY;
-const HUBSPOT_TOKEN    = process.env.HUBSPOT_TOKEN;
-const ZOOM_BEARER_TOKEN = process.env.ZOOM_BEARER_TOKEN || process.env.ZOOM_ACCESS_TOKEN;
-const GRACE_MS = Number(process.env.GRACE_MS ?? 0); // 0 during testing
+const OPENAI_API_KEY     = process.env.OPENAI_API_KEY;
+const HUBSPOT_TOKEN      = process.env.HUBSPOT_TOKEN;
+const ZOOM_BEARER_TOKEN  = process.env.ZOOM_BEARER_TOKEN || process.env.ZOOM_ACCESS_TOKEN;
+const GRACE_MS           = Number(process.env.GRACE_MS ?? 0); // 0 during testing
 const SCORECARD_BY_METRICS = String(process.env.SCORECARD_BY_METRICS ?? "true").toLowerCase() === "true";
+
+// New reliability envs (optional)
+const ALWAYS_SEGMENT       = String(process.env.ALWAYS_SEGMENT ?? "true").toLowerCase() === "true";
+const WHISPER_TIMEOUT_MS   = Number(process.env.WHISPER_TIMEOUT_MS ?? 300000); // 5 min per chunk
+const WHISPER_MAX_RETRIES  = Number(process.env.WHISPER_MAX_RETRIES ?? 3);
+const SEGMENT_SECONDS      = Number(process.env.SEGMENT_SECONDS ?? 600); // 10 minutes
+const FORCE_SEGMENT_SIZE_MB= Number(process.env.FORCE_SEGMENT_SIZE_MB ?? 12); // segment if >12MB even if ALWAYS_SEGMENT=false
 
 // ---- Call property keys (confirmed in your portal) ----
 const IC_DATA_POINTS_KEY = "ai_data_points_captured";
@@ -55,6 +55,8 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const fileSizeBytes = (p) => { try { return fs.statSync(p).size; } catch { return 0; } };
 const tmpPath = (name) => path.join(TMP_DIR, name);
 const isZoomUrl = (u) => /\.zoom\.us\//i.test(String(u || ""));
+
+function nowIso() { return new Date().toISOString(); }
 
 async function fetchWithRetry(url, opts = {}, retries = 3) {
   let last = null;
@@ -110,7 +112,7 @@ function transcodeToSpeechMp3(inPath, outPath) {
   });
 }
 
-function segmentAudio(inPath, outPattern, seconds = 600) {
+function segmentAudio(inPath, outPattern, seconds = SEGMENT_SECONDS) {
   return new Promise((resolve, reject) => {
     ffmpeg(inPath)
       .outputOptions(["-f", "segment", "-segment_time", String(seconds), "-reset_timestamps", "1"])
@@ -127,46 +129,103 @@ function segmentAudio(inPath, outPattern, seconds = 600) {
 }
 
 async function ensureWhisperFriendlyAudio(srcPath, callId) {
-  const firstMp3 = tmpPath(`${callId}.mp3`);
-  await transcodeToSpeechMp3(srcPath, firstMp3);
-  const size = fileSizeBytes(firstMp3);
-  if (size <= MAX_WHISPER_BYTES) return { mode: "single", files: [firstMp3] };
-  console.log(`[prep] compressed file too large (${(size/1048576).toFixed(1)} MB). Segmenting…`);
+  const mp3Path = tmpPath(`${callId}.mp3`);
+  await transcodeToSpeechMp3(srcPath, mp3Path);
+  const size = fileSizeBytes(mp3Path);
+  const sizeMb = (size / 1048576).toFixed(2);
+  console.log(`[prep] compressed MP3 size=${sizeMb} MB at ${nowIso()}`);
+
+  // Decide segmentation strategy
+  const mustSegmentBySize = size > FORCE_SEGMENT_SIZE_MB * 1024 * 1024;
+  if (ALWAYS_SEGMENT || mustSegmentBySize) {
+    console.log(`[prep] segmenting audio (ALWAYS_SEGMENT=${ALWAYS_SEGMENT}, size>${FORCE_SEGMENT_SIZE_MB}MB? ${mustSegmentBySize})…`);
+    const pattern = tmpPath(`${callId}_part_%03d.mp3`);
+    const parts = await segmentAudio(mp3Path, pattern, SEGMENT_SECONDS);
+    console.log(`[prep] created ${parts.length} chunk(s).`);
+    return { mode: "multi", files: parts };
+  }
+
+  // If not forced to segment and <= 25MB, still single-file unless too big for Whisper API
+  if (size <= MAX_WHISPER_BYTES) {
+    console.log(`[prep] using single file (<=25MB & segmentation not forced).`);
+    return { mode: "single", files: [mp3Path] };
+  }
+
+  console.log(`[prep] single file >25MB, segmenting to meet Whisper limit…`);
   const pattern = tmpPath(`${callId}_part_%03d.mp3`);
-  const parts = await segmentAudio(firstMp3, pattern, 600);
+  const parts = await segmentAudio(mp3Path, pattern, SEGMENT_SECONDS);
+  console.log(`[prep] created ${parts.length} chunk(s) due to 25MB limit.`);
   return { mode: "multi", files: parts };
 }
 
 // -------------------------------------------------------------
-// Transcription
+// Transcription with timeout & retries
 // -------------------------------------------------------------
 async function transcribeFileWithOpenAI(filePath) {
-  const form = new FormData();
-  form.append("file", fs.createReadStream(filePath));
-  form.append("model", "whisper-1");
-  const r = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
-    body: form,
-  });
-  if (!r.ok) throw new Error(`OpenAI transcription failed: ${r.status} ${await r.text()}`);
-  const j = await r.json();
-  return j.text || "";
+  const controller = new AbortController();
+  const to = setTimeout(() => controller.abort(), WHISPER_TIMEOUT_MS);
+
+  try {
+    const form = new FormData();
+    form.append("file", fs.createReadStream(filePath));
+    form.append("model", "whisper-1");
+
+    const r = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
+      body: form,
+      signal: controller.signal,
+    });
+    if (!r.ok) throw new Error(`OpenAI transcription failed: ${r.status} ${await r.text()}`);
+    const j = await r.json();
+    return j.text || "";
+  } finally {
+    clearTimeout(to);
+  }
+}
+
+async function transcribeWithRetries(filePath, label) {
+  let attempt = 0;
+  let wait = 1000;
+  for (;;) {
+    attempt += 1;
+    const start = Date.now();
+    console.log(`[whisper] ${label} attempt ${attempt} started at ${nowIso()}`);
+    try {
+      const text = await transcribeFileWithOpenAI(filePath);
+      const dur = Math.round((Date.now() - start) / 1000);
+      console.log(`[whisper] ${label} finished in ${dur}s`);
+      return text;
+    } catch (e) {
+      const dur = Math.round((Date.now() - start) / 1000);
+      console.warn(`[whisper] ${label} failed in ${dur}s: ${e.message}`);
+      if (attempt >= WHISPER_MAX_RETRIES) throw e;
+      console.log(`[whisper] backing off ${wait}ms before retry…`);
+      await sleep(wait);
+      wait = Math.min(wait * 2, 8000);
+    }
+  }
 }
 
 async function transcribeAudioSmart(srcPath, callId) {
   console.log("[bg] Preparing audio for Whisper…");
   const prep = await ensureWhisperFriendlyAudio(srcPath, callId);
+
   if (prep.mode === "single") {
-    console.log("[bg] Transcribing single compressed file…");
-    return await transcribeFileWithOpenAI(prep.files[0]);
+    const sizeMb = (fileSizeBytes(prep.files[0]) / 1048576).toFixed(2);
+    console.log(`[bg] Transcribing single compressed file (size=${sizeMb} MB)…`);
+    return await transcribeWithRetries(prep.files[0], "single");
   }
-  console.log(`[bg] Transcribing ${prep.files.length} chunks…`);
+
+  console.log(`[bg] Transcribing ${prep.files.length} chunk(s)…`);
   const pieces = [];
   for (let i = 0; i < prep.files.length; i++) {
-    console.log(`[bg] Chunk ${i + 1}/${prep.files.length}`);
-    pieces.push(await transcribeFileWithOpenAI(prep.files[i]));
+    const f = prep.files[i];
+    const sizeMb = (fileSizeBytes(f) / 1048576).toFixed(2);
+    console.log(`[whisper] chunk ${i + 1}/${prep.files.length} (size=${sizeMb} MB)`);
+    pieces.push(await transcribeWithRetries(f, `chunk ${i + 1}/${prep.files.length}`));
   }
+  console.log("[whisper] all chunks transcribed; stitching…");
   return pieces.join("\n");
 }
 
@@ -321,7 +380,7 @@ async function resolveCallTypeWithGrace(callId, transcript, recordingUrl, graceM
 }
 
 // -------------------------------------------------------------
-// Sales performance coaching (to be saved on Scorecard)
+// Sales performance coaching (unchanged core logic)
 // -------------------------------------------------------------
 function enforceSSAS(text) {
   if (typeof text !== "string") return "";
@@ -370,7 +429,7 @@ ${enforceSSAS(transcript)}
   const text = (j?.choices?.[0]?.message?.content || "").trim();
   const m = text.match(/\b(10|[1-9])\b/);
   const score = m ? Math.max(1, Math.min(10, parseInt(m[1], 10))) : 5;
-  return score; // NUMBER (works with numeric HS property)
+  return score;
 }
 
 async function summariseSalesPerformance(transcript) {
@@ -748,23 +807,35 @@ app.post("/process-call", async (req, res) => {
 
     setImmediate(async () => {
       try {
+        const overallStart = Date.now();
+
         // 1) Audio -> Transcript
+        const dlStart = Date.now();
         const srcPath = await downloadRecording(recordingUrl, callId);
+        console.log(`[timing] download done in ${Math.round((Date.now()-dlStart)/1000)}s`);
+
+        const trStart = Date.now();
         const transcript = await transcribeAudioSmart(srcPath, callId);
+        console.log(`[timing] transcription total ${Math.round((Date.now()-trStart)/1000)}s`);
 
         // 2) Call type (with grace + heuristic reconcile)
+        const typeStart = Date.now();
         const effectiveType = await resolveCallTypeWithGrace(callId, transcript, recordingUrl, GRACE_MS);
-        console.log("[type] effectiveType:", effectiveType);
+        console.log(`[type] effectiveType: ${effectiveType} (in ${Math.round((Date.now()-typeStart)/1000)}s)`);
 
         // 3) Analysis (+ ensure metrics if missing)
+        const anStart = Date.now();
         let analysis = await analyseCall(effectiveType, transcript);
         analysis = await ensureMetricsIfNeeded(effectiveType, transcript, analysis);
+        console.log(`[timing] analysis total ${Math.round((Date.now()-anStart)/1000)}s`);
 
         // 4) Sales coaching (to be saved on Scorecard)
+        const coachStart = Date.now();
         const [salesPerfScore, salesPerfSummary] = await Promise.all([
           scoreSalesPerformance(transcript),          // NUMBER 1..10
           summariseSalesPerformance(transcript),      // string
         ]);
+        console.log(`[timing] coaching total ${Math.round((Date.now()-coachStart)/1000)}s`);
 
         // 5) Call-level updates (common + type-specific)
         const objections = analysis.objections || {};
@@ -774,7 +845,6 @@ app.post("/process-call", async (req, res) => {
           ai_objection_severity: normaliseSeverity(objections.severity),
         };
 
-        // Existing customer call → CALL fields
         if (effectiveType === "Existing customer call") {
           callUpdates.ai_customer_sentiment  = normaliseSentiment(analysis.customer_sentiment);
           callUpdates.ai_complaint_detected  = normaliseYesNoUnclear(analysis.complaint_detected);
@@ -782,7 +852,6 @@ app.post("/process-call", async (req, res) => {
           callUpdates.ai_escalation_notes    = analysis.escalation_notes || "";
         }
 
-        // Initial Consultation → capture data points & missing info using your CALL keys
         if (effectiveType === "Initial Consultation") {
           if (Array.isArray(analysis.product_interest) && analysis.product_interest.length) {
             const v = analysis.product_interest.includes("Both") ? "Both" : analysis.product_interest[0];
@@ -888,7 +957,7 @@ app.post("/process-call", async (req, res) => {
           console.log(`[scorecard] not created (type=${effectiveType}, metrics present? qual=${!!analysis.qual_metrics}, consult=${!!analysis.consult_metrics}, follow=${!!analysis.followup_metrics})`);
         }
 
-        console.log(`✅ [bg] Done ${callId}`);
+        console.log(`✅ [bg] Done ${callId} in ${Math.round((Date.now()-overallStart)/1000)}s`);
       } catch (e) {
         console.error("❗ [bg] Error", e);
       }
