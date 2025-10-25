@@ -1,7 +1,10 @@
 // =============================================================
-// TLPI – AI Call Worker (v3.8.4)
-// - Aligns metric property names to portal schema created by your bootstrap script
-// - Parallel Whisper + iterative scorecard prune (from 3.8.3)
+// TLPI – AI Call Worker (v3.9.0)
+// - Numeric writes for scorecard metrics (fixes "all zeros/blank")
+// - Owner carry-over: Call → Scorecard (hubspot_owner_id)
+// - Associations: Scorecard → Call (always), and → Contact/Deal if types exist
+// - Parallel Whisper + prune-and-retry remain
+// - Aligned to your portal's metric names (consult_*, qual_*)
 // =============================================================
 
 import express from "express";
@@ -28,16 +31,20 @@ const TRANSCRIBE_CONCURRENCY = Math.max(1, Number(process.env.TRANSCRIBE_CONCURR
 const WHISPER_TIMEOUT_MS     = Number(process.env.WHISPER_TIMEOUT_MS ?? 300000);
 const WHISPER_MAX_RETRIES    = Number(process.env.WHISPER_MAX_RETRIES ?? 2);
 
+// Debug
+const DEBUG_METRICS_LOG      = String(process.env.DEBUG_METRICS_LOG ?? "1").toLowerCase() === "1";
+
 // ---- Call property keys ----
 const IC_DATA_POINTS_KEY   = "ai_data_points_captured";
 const IC_MISSING_INFO_KEY  = "ai_missing_information";
 
 // ---- Sales Scorecard keys ----
 const SCORECARD_TYPE           = "p49487487_sales_scorecards";
-const SCORECARD_NAME_KEY       = "activity_name"; // optional: will be pruned if not present
+const SCORECARD_NAME_KEY       = "activity_name"; // optional: will be pruned if missing
 const SCORECARD_TYPE_KEY       = "activity_type";
 const SCORECARD_RATING_KEY     = "sales_performance_rating_";
 const SCORECARD_SUMMARY_KEY    = "sales_scorecard___what_you_can_improve_on";
+const SCORECARD_OWNER_KEY      = "hubspot_owner_id"; // standard owner property (will prune if absent)
 
 // ---- Constants ----
 const MAX_WHISPER_BYTES = 25 * 1024 * 1024;
@@ -264,7 +271,7 @@ const CALL_TYPE_LABELS = [
   "Strategy call","Annual Review","Existing customer call","Other",
 ];
 
-async function fetchCallProps(callId, props = ["hs_activity_type"]) {
+async function fetchCallProps(callId, props = ["hs_activity_type","hs_owner_id"]) {
   const params = new URLSearchParams({ properties: props.join(",") });
   const r = await fetch(
     `https://api.hubapi.com/crm/v3/objects/calls/${encodeURIComponent(callId)}?${params}`,
@@ -305,7 +312,7 @@ Return ONLY JSON: {"label":"<one>","confidence":<0-100>}.`;
 }
 
 async function resolveCallTypeWithGrace(callId, transcript, recordingUrl, graceMs = GRACE_MS) {
-  const first = await fetchCallProps(callId, ["hs_activity_type"]);
+  const first = await fetchCallProps(callId, ["hs_activity_type","hs_owner_id"]);
   if (first?.hs_activity_type) {
     console.log(`[type] using hs_activity_type immediately: ${first.hs_activity_type}`);
     return first.hs_activity_type;
@@ -313,7 +320,7 @@ async function resolveCallTypeWithGrace(callId, transcript, recordingUrl, graceM
   if (graceMs > 0) {
     console.log(`[type] hs_activity_type blank — waiting ${graceMs / 1000}s`);
     await sleep(graceMs);
-    const second = await fetchCallProps(callId, ["hs_activity_type"]);
+    const second = await fetchCallProps(callId, ["hs_activity_type","hs_owner_id"]);
     if (second?.hs_activity_type) {
       console.log(`[type] rep filled hs_activity_type during grace: ${second.hs_activity_type}`);
       return second.hs_activity_type;
@@ -383,7 +390,7 @@ async function summariseSalesPerformance(transcript) {
   const system = 'You are TLPI’s transcript analysis bot. Always spell "SSAS".';
   const prompt = `What went well:\n- …\n\nAreas to improve:\n- …\n\nTranscript:\n${enforceSSAS(transcript)}`;
   const r = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST", headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
+    method: "POST", headers: { Authorization: `Bearer ${OPENAI_API_KEY}", "Content-Type": "application/json" },
     body: JSON.stringify({ model: "gpt-4o-mini", temperature: 0.2, messages: [{ role: "system", content: system }, { role: "user", content: prompt }] }),
   });
   const j = await r.json();
@@ -438,7 +445,7 @@ const normaliseYesNoUnclear = (v) => ({ yes:"Yes", no:"No", unclear:"Unclear" }[
 const normaliseEscalation = (v) => ({ yes:"Yes", no:"No", monitor:"Monitor" }[String(v||"").trim().toLowerCase()] || "");
 
 // -------------------------------------------------------------
-// HubSpot helpers (Call updates + Scorecard creation & association)
+// HubSpot helpers
 // -------------------------------------------------------------
 async function updateHubSpotCall(callId, properties) {
   const url = `https://api.hubapi.com/crm/v3/objects/calls/${encodeURIComponent(callId)}`;
@@ -503,24 +510,79 @@ async function findAssocType(from, to) {
   return null;
 }
 
-async function createSalesScorecardCallFirst(fields, { callId, effectiveType, callTimestampMs } = {}) {
+async function getAssociatedIds(fromType, fromId, toType) {
+  const url = `https://api.hubapi.com/crm/v4/objects/${encodeURIComponent(fromType)}/${encodeURIComponent(fromId)}/associations/${encodeURIComponent(toType)}`;
+  const r = await fetch(url + `?limit=100`, { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` } });
+  if (!r.ok) return [];
+  const j = await r.json();
+  const out = [];
+  for (const group of j?.results || []) {
+    for (const to of group?.to ?? []) out.push(String(to.id));
+  }
+  return Array.from(new Set(out));
+}
+
+// Create Scorecard → associate to CALL (always), and → CONTACT/DEAL (if possible)
+async function createSalesScorecardCallFirst(fields, { callId, effectiveType, callTimestampMs, callOwnerId } = {}) {
   const activityName = `${callId} — ${effectiveType} — ${ymd(callTimestampMs || Date.now())}`;
 
   let props = {
     [SCORECARD_TYPE_KEY]: effectiveType,
-    [SCORECARD_NAME_KEY]: activityName, // will be pruned if not present in portal
+    [SCORECARD_NAME_KEY]: activityName,                 // pruned if missing
+    [SCORECARD_OWNER_KEY]: callOwnerId || undefined,    // pruned if missing on object
     ...fields,
   };
 
-  const baseBody = {};
-  const assoc = await findAssocType(SCORECARD_TYPE, "calls");
-  if (callId && assoc) {
-    baseBody.associations = [{
+  // Build associations
+  const assocBlocks = [];
+  const callAssoc = await findAssocType(SCORECARD_TYPE, "calls");
+  if (callId && callAssoc) {
+    assocBlocks.push({
       to: { id: String(callId) },
-      types: [{ associationCategory: assoc.category, associationTypeId: assoc.typeId }],
-    }];
+      types: [{ associationCategory: callAssoc.category, associationTypeId: callAssoc.typeId }],
+    });
   } else if (callId) {
-    console.warn(`[assoc] no scorecard→call association type; creating scorecard without call link`);
+    console.warn(`[assoc] no scorecard→call association type; continuing without call link`);
+  }
+
+  // Optional: associate to first Contact and first Deal (if association types exist)
+  let contactIds = [];
+  let dealIds = [];
+  try { contactIds = await getAssociatedIds("calls", callId, "contacts"); } catch {}
+  try { dealIds    = await getAssociatedIds("calls", callId, "deals"); } catch {}
+
+  if (contactIds.length) {
+    const t = await findAssocType(SCORECARD_TYPE, "contacts");
+    if (t) {
+      assocBlocks.push({
+        to: { id: contactIds[0] },
+        types: [{ associationCategory: t.category, associationTypeId: t.typeId }],
+      });
+    } else {
+      console.warn(`[assoc] no scorecard→contacts association type; skipping`);
+    }
+  }
+
+  if (dealIds.length) {
+    const t = await findAssocType(SCORECARD_TYPE, "deals");
+    if (t) {
+      assocBlocks.push({
+        to: { id: dealIds[0] },
+        types: [{ associationCategory: t.category, associationTypeId: t.typeId }],
+      });
+    } else {
+      console.warn(`[assoc] no scorecard→deals association type; skipping`);
+    }
+  }
+
+  const baseBody = {};
+  if (assocBlocks.length) baseBody.associations = assocBlocks;
+
+  if (DEBUG_METRICS_LOG) {
+    const keys = Object.keys(fields);
+    const sample = keys.slice(0, 6).map(k => `${k}=${fields[k]}`).join(", ");
+    console.log(`[scorecard] preparing to create with ${keys.length} metric/coaching fields. sample: ${sample}`);
+    console.log(`[scorecard] assoc targets -> call:${callId} contact:${contactIds[0]||"-"} deal:${dealIds[0]||"-"}`);
   }
 
   async function post(propsObj) {
@@ -531,6 +593,7 @@ async function createSalesScorecardCallFirst(fields, { callId, effectiveType, ca
     });
   }
 
+  // Retry with prune-on-unknown
   for (let pass = 1; pass <= 3; pass++) {
     const r = await post(props);
     if (r.ok) {
@@ -552,7 +615,7 @@ async function createSalesScorecardCallFirst(fields, { callId, effectiveType, ca
       }
     }
     if (pass === 3) {
-      console.warn(`[scorecard] final fallback: attempting minimal properties only`);
+      console.warn(`[scorecard] final fallback: attempting minimal coaching only`);
       props = {
         [SCORECARD_TYPE_KEY]: effectiveType,
         [SCORECARD_RATING_KEY]: fields[SCORECARD_RATING_KEY],
@@ -565,46 +628,56 @@ async function createSalesScorecardCallFirst(fields, { callId, effectiveType, ca
 }
 
 // -------------------------------------------------------------
-// Mapping helpers: analysis -> your portal property names
+// Mapping helpers: analysis -> your portal property names (NUMBERS)
 // -------------------------------------------------------------
+const num = (v) => {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return 0;
+  // clamp to {0,0.5,1} where applicable (defensive)
+  if (n >= 0.99) return 1;
+  if (n >= 0.49 && n < 0.99) return 0.5;
+  if (n <= 0.01) return 0;
+  return Number(n.toFixed(1));
+};
+
 function mapQualMetricsToPortal(m) {
   return {
-    qual_intro:                         String(m.q1_need_clearly_stated ?? 0),
-    qual_rapport:                       String(m.q2_budget_discussed ?? 0),
-    qual_open_question:                 String(m.q3_decision_maker_present ?? 0),
-    qual_relevant_pain_identified:      String(m.q4_authority_confirmed ?? 0),
-    qual_services_explained_clearly:    String(m.q5_timeline_identified ?? 0),
-    qual_benefits_linked_to_needs:      String(m.q6_pain_depth_understood ?? 0),
-    qual_active_listening:              String(m.q7_current_solution_understood ?? 0),
-    qual_clear_responses_or_followup:   String(m.q8_competition_identified ?? 0),
-    qual_next_steps_confirmed:          String(m.q9_next_step_clearly_agreed ?? 0),
-    qual_commitment_requested:          String(m.q10_fit_assessed ?? 0),
+    // Note: these names follow your portal’s fields.
+    qual_intro:                         num(m.q1_need_clearly_stated),
+    qual_rapport:                       num(m.q2_budget_discussed),
+    qual_open_question:                 num(m.q3_decision_maker_present),
+    qual_relevant_pain_identified:      num(m.q4_authority_confirmed),
+    qual_services_explained_clearly:    num(m.q5_timeline_identified),
+    qual_benefits_linked_to_needs:      num(m.q6_pain_depth_understood),
+    qual_active_listening:              num(m.q7_current_solution_understood),
+    qual_clear_responses_or_followup:   num(m.q8_competition_identified),
+    qual_next_steps_confirmed:          num(m.q9_next_step_clearly_agreed),
+    qual_commitment_requested:          num(m.q10_fit_assessed),
   };
 }
 
 function mapConsultMetricsToPortal(c) {
-  const s = (v) => String(v ?? 0);
   return {
-    consult_rapport_open:                 s(c.c1_goal_alignment),
-    consult_purpose_clearly_stated:       s(c.c2_current_state_captured),
-    consult_confirm_reason_for_zoom:      s(c.c3_risk_tolerance_explored),
-    consult_demo_tax_saving:              s(c.c4_tax_context_understood),
-    consult_specific_tax_estimate_given:  s(c.c5_pension_context_understood),
-    consult_no_assumptions_evidence_gathered: s(c.c6_cashflow_model_discussed),
-    consult_needs_pain_uncovered:         s(c.c7_ssas_fic_fit_discussed),
-    consult_quantified_value_roi:         s(c.c8_fees_explained),
-    consult_fees_tax_deductible_explained:s(c.c9_regulatory_disclosures_made),
-    consult_fees_annualised:              s(c.c10_key_risks_explained),
-    consult_fee_phrasing_three_seven_five:s(c.c11_questions_addressed),
-    consult_closing_question_asked:       s(c.c12_next_steps_agreed),
-    consult_collected_dob_nin_when_agreed:s(c.c13_materials_promised),
-    consult_overcame_objection_and_closed:s(c.c14_decision_criteria_logged),
-    consult_customer_agreed_to_set_up:    s(c.c15_objections_summarised),
-    consult_next_step_specific_date_time: s(c.c16_stakeholders_identified),
-    consult_next_contact_within_5_days:   s(c.c17_urgency_established),
-    consult_strong_buying_signals_detected:s(c.c18_buyer_journey_stage),
-    consult_prospect_asked_next_steps:    s(c.c19_application_readiness),
-    consult_interactive_throughout:       s(c.c20_close_plan_started),
+    consult_rapport_open:                    num(c.c1_goal_alignment),
+    consult_purpose_clearly_stated:          num(c.c2_current_state_captured),
+    consult_confirm_reason_for_zoom:         num(c.c3_risk_tolerance_explored),
+    consult_demo_tax_saving:                 num(c.c4_tax_context_understood),
+    consult_specific_tax_estimate_given:     num(c.c5_pension_context_understood),
+    consult_no_assumptions_evidence_gathered:num(c.c6_cashflow_model_discussed),
+    consult_needs_pain_uncovered:            num(c.c7_ssas_fic_fit_discussed),
+    consult_quantified_value_roi:            num(c.c8_fees_explained),
+    consult_fees_tax_deductible_explained:   num(c.c9_regulatory_disclosures_made),
+    consult_fees_annualised:                 num(c.c10_key_risks_explained),
+    consult_fee_phrasing_three_seven_five:   num(c.c11_questions_addressed),
+    consult_closing_question_asked:          num(c.c12_next_steps_agreed),
+    consult_collected_dob_nin_when_agreed:   num(c.c13_materials_promised),
+    consult_overcame_objection_and_closed:   num(c.c14_decision_criteria_logged),
+    consult_customer_agreed_to_set_up:       num(c.c15_objections_summarised),
+    consult_next_step_specific_date_time:    num(c.c16_stakeholders_identified),
+    consult_next_contact_within_5_days:      num(c.c17_urgency_established),
+    consult_strong_buying_signals_detected:  num(c.c18_buyer_journey_stage),
+    consult_prospect_asked_next_steps:       num(c.c19_application_readiness),
+    consult_interactive_throughout:          num(c.c20_close_plan_started),
   };
 }
 
@@ -638,10 +711,14 @@ app.post("/process-call", async (req, res) => {
         const transcript = await transcribeAudioSmart(srcPath, callId);
         console.log(`[timing] transcription total ${Math.round((Date.now()-trStart)/1000)}s`);
 
-        // 2) Call type
+        // 2) Call type + get call owner
         const typeStart = Date.now();
-        const effectiveType = await resolveCallTypeWithGrace(callId, transcript, recordingUrl, GRACE_MS);
-        console.log(`[type] effectiveType: ${effectiveType} (in ${Math.round((Date.now()-typeStart)/1000)}s)`);
+        const callProps = await fetchCallProps(callId, ["hs_activity_type","hs_owner_id"]);
+        const callOwnerId = callProps?.hs_owner_id || undefined;
+        const effectiveType = callProps?.hs_activity_type
+          ? callProps.hs_activity_type
+          : await resolveCallTypeWithGrace(callId, transcript, recordingUrl, GRACE_MS);
+        console.log(`[type] effectiveType: ${effectiveType} (in ${Math.round((Date.now()-typeStart)/1000)}s)  owner=${callOwnerId||"-"}`);
 
         // 3) Analysis (+ ensure metrics if missing)
         const anStart = Date.now();
@@ -692,7 +769,7 @@ app.post("/process-call", async (req, res) => {
         const createFollow  = (effectiveType === "Follow up call")        || (SCORECARD_BY_METRICS && analysis.followup_metrics);
 
         const coaching = {
-          [SCORECARD_RATING_KEY]: salesPerfScore,
+          [SCORECARD_RATING_KEY]: Number.isFinite(salesPerfScore) ? salesPerfScore : 5,
           [SCORECARD_SUMMARY_KEY]: salesPerfSummary,
         };
 
@@ -700,39 +777,60 @@ app.post("/process-call", async (req, res) => {
           const m = analysis.qual_metrics || {};
           const fields = {
             ...coaching,
-            ...mapQualMetricsToPortal(m),          // <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-            qual_score_final: String(analysis.qual_score_final ?? 0),
+            ...mapQualMetricsToPortal(m),
+            qual_score_final: Number.isFinite(analysis.qual_score_final) ? Math.max(0, Math.min(10, Math.round(analysis.qual_score_final))) : 0,
           };
-          try { await createSalesScorecardCallFirst(fields, { callId, effectiveType, callTimestampMs }); }
-          catch (e) { console.error(`[scorecard] creation failed (Qualification) but continuing: ${e.message}`); }
+          if (DEBUG_METRICS_LOG) {
+            const nz = Object.entries(fields).filter(([k,v]) => typeof v === "number" ? v !== 0 : !!v).length;
+            console.log(`[scorecard][qual] non-zero/non-empty fields: ${nz}/${Object.keys(fields).length}`);
+          }
+          try {
+            await createSalesScorecardCallFirst(fields, { callId, effectiveType, callTimestampMs, callOwnerId });
+          } catch (e) {
+            console.error(`[scorecard] creation failed (Qualification) but continuing: ${e.message}`);
+          }
         } else if (createConsult && analysis.consult_metrics) {
           const c = analysis.consult_metrics || {};
           const fields = {
             ...coaching,
-            ...mapConsultMetricsToPortal(c),       // <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-            consult_score_final: String(analysis.consult_score_final ?? 0),
+            ...mapConsultMetricsToPortal(c),
+            consult_score_final: Number.isFinite(analysis.consult_score_final) ? Math.max(0, Math.min(10, Math.round(analysis.consult_score_final))) : 0,
           };
-          try { await createSalesScorecardCallFirst(fields, { callId, effectiveType, callTimestampMs }); }
-          catch (e) { console.error(`[scorecard] creation failed (Initial Consultation) but continuing: ${e.message}`); }
+          if (DEBUG_METRICS_LOG) {
+            const nz = Object.entries(fields).filter(([k,v]) => typeof v === "number" ? v !== 0 : !!v).length;
+            console.log(`[scorecard][consult] non-zero/non-empty fields: ${nz}/${Object.keys(fields).length}`);
+          }
+          try {
+            await createSalesScorecardCallFirst(fields, { callId, effectiveType, callTimestampMs, callOwnerId });
+          } catch (e) {
+            console.error(`[scorecard] creation failed (Initial Consultation) but continuing: ${e.message}`);
+          }
         } else if (createFollow && analysis.followup_metrics) {
           const f = analysis.followup_metrics || {};
           const fields = {
             ...coaching,
-            // NOTE: your portal currently lacks follow-up metric fields; prune loop will handle.
-            followup_metrics_f1_recap_clear:                 String(f.f1_recap_clear ?? 0),
-            followup_metrics_f2_objections_addressed:        String(f.f2_objections_addressed ?? 0),
-            followup_metrics_f3_materials_reviewed:          String(f.f3_materials_reviewed ?? 0),
-            followup_metrics_f4_new_info_collected:          String(f.f4_new_info_collected ?? 0),
-            followup_metrics_f5_decision_progressed:         String(f.f5_decision_progressed ?? 0),
-            followup_metrics_f6_relationship_strengthened:   String(f.f6_relationship_strengthened ?? 0),
-            followup_metrics_f7_next_steps_agreed:           String(f.f7_next_steps_agreed ?? 0),
-            followup_metrics_f8_close_likelihood_discussed:  String(f.f8_close_likelihood_discussed ?? 0),
-            followup_metrics_f9_timeframe_reconfirmed:       String(f.f9_timeframe_reconfirmed ?? 0),
-            followup_metrics_f10_overall_call_effectiveness: String(f.f10_overall_call_effectiveness ?? 0),
-            followup_score_final: String(analysis.followup_score_final ?? 0),
+            // If your portal later adds follow-up fields, they'll be written numerically:
+            followup_metrics_f1_recap_clear:                 num(f.f1_recap_clear),
+            followup_metrics_f2_objections_addressed:        num(f.f2_objections_addressed),
+            followup_metrics_f3_materials_reviewed:          num(f.f3_materials_reviewed),
+            followup_metrics_f4_new_info_collected:          num(f.f4_new_info_collected),
+            followup_metrics_f5_decision_progressed:         num(f.f5_decision_progressed),
+            followup_metrics_f6_relationship_strengthened:   num(f.f6_relationship_strengthened),
+            followup_metrics_f7_next_steps_agreed:           num(f.f7_next_steps_agreed),
+            followup_metrics_f8_close_likelihood_discussed:  num(f.f8_close_likelihood_discussed),
+            followup_metrics_f9_timeframe_reconfirmed:       num(f.f9_timeframe_reconfirmed),
+            followup_metrics_f10_overall_call_effectiveness: num(f.f10_overall_call_effectiveness),
+            followup_score_final: Number.isFinite(analysis.followup_score_final) ? Math.max(0, Math.min(10, Math.round(analysis.followup_score_final))) : 0,
           };
-          try { await createSalesScorecardCallFirst(fields, { callId, effectiveType, callTimestampMs }); }
-          catch (e) { console.error(`[scorecard] creation failed (Follow up) but continuing: ${e.message}`); }
+          if (DEBUG_METRICS_LOG) {
+            const nz = Object.entries(fields).filter(([k,v]) => typeof v === "number" ? v !== 0 : !!v).length;
+            console.log(`[scorecard][follow] non-zero/non-empty fields: ${nz}/${Object.keys(fields).length}`);
+          }
+          try {
+            await createSalesScorecardCallFirst(fields, { callId, effectiveType, callTimestampMs, callOwnerId });
+          } catch (e) {
+            console.error(`[scorecard] creation failed (Follow up) but continuing: ${e.message}`);
+          }
         } else {
           console.log(`[scorecard] not created (type=${effectiveType}, metrics present? qual=${!!analysis.qual_metrics}, consult=${!!analysis.consult_metrics}, follow=${!!analysis.followup_metrics})`);
         }
@@ -748,7 +846,7 @@ app.post("/process-call", async (req, res) => {
   }
 });
 
-// Keep 404s quiet
+// Health
 app.get("/", (_req, res) => res.status(200).send("OK"));
 
 const PORT = process.env.PORT || 10000;
