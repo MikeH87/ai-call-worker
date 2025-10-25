@@ -1,25 +1,39 @@
 // =============================================================
-// TLPI – AI Call Worker  (v2.1)  [fix: fetchWithRetry res undefined]
+// TLPI – AI Call Worker  (v2.2)
+// - Fix 413 by compressing audio and chunking if needed
+// - Keeps call-type grace + inference, analysis skeleton, HS updates
 // =============================================================
 
 import express from "express";
 import fetch from "node-fetch";
 import fs from "fs";
 import path from "path";
+import os from "os";
+import { spawn } from "child_process";
 import FormData from "form-data";
+import ffmpegInstaller from "@ffmpeg-installer/ffmpeg";
+import ffmpeg from "fluent-ffmpeg";
 
 // ---- ENV ----
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const HUBSPOT_TOKEN = process.env.HUBSPOT_TOKEN;
 const ZOOM_BEARER_TOKEN = process.env.ZOOM_BEARER_TOKEN || process.env.ZOOM_ACCESS_TOKEN; // optional
 
+// ---- Constants ----
+const MAX_WHISPER_BYTES = 25 * 1024 * 1024; // 25 MB hard limit
+const TMP_DIR = os.tmpdir();
+
+ffmpeg.setFfmpegPath(ffmpegInstaller.path);
+
 const app = express();
 app.use(express.json({ limit: "50mb" }));
 
 // -------------------------------------------------------------
-// Helpers
+// Utils
 // -------------------------------------------------------------
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function fileSizeBytes(p) { try { return fs.statSync(p).size; } catch { return 0; } }
+function tmpPath(name) { return path.join(TMP_DIR, name); }
 
 async function fetchWithRetry(url, opts = {}, retries = 3) {
   let lastResp = null;
@@ -37,11 +51,9 @@ async function fetchWithRetry(url, opts = {}, retries = 3) {
 
 function authHeadersFor(url) {
   const headers = {};
-  // HubSpot protected URLs
   if (/\.hubspot\.com/i.test(url) && HUBSPOT_TOKEN) {
     headers.Authorization = `Bearer ${HUBSPOT_TOKEN}`;
   }
-  // Zoom protected URLs (if you have a token)
   if (/\.zoom\.us/i.test(url) && ZOOM_BEARER_TOKEN) {
     headers.Authorization = `Bearer ${ZOOM_BEARER_TOKEN}`;
   }
@@ -49,20 +61,93 @@ function authHeadersFor(url) {
 }
 
 // -------------------------------------------------------------
-// Download & Transcribe
+// Download & Prepare Audio (compress + chunk if needed)
 // -------------------------------------------------------------
 async function downloadRecording(recordingUrl, callId) {
   console.log(`[bg] Downloading recording: ${recordingUrl}`);
   const r = await fetchWithRetry(recordingUrl, { headers: authHeadersFor(recordingUrl) }, 3);
   const buf = Buffer.from(await r.arrayBuffer());
-  const ext = ".mp3"; // Whisper accepts many formats; keep it simple
-  const filePath = path.join("/tmp", `${callId}${ext}`);
-  fs.writeFileSync(filePath, buf);
-  return filePath;
+  const srcPath = tmpPath(`${callId}_src`);
+  fs.writeFileSync(srcPath, buf);
+  return srcPath;
 }
 
-async function transcribeAudio(filePath) {
-  console.log("[bg] Transcribing...");
+function transcodeToSpeechMp3(inPath, outPath) {
+  // Mono, 16kHz, ~24 kbps CBR MP3 (good enough for speech; tiny)
+  return new Promise((resolve, reject) => {
+    ffmpeg(inPath)
+      .audioCodec("libmp3lame")
+      .audioChannels(1)
+      .audioFrequency(16000)
+      .audioBitrate("24k")
+      .format("mp3")
+      .output(outPath)
+      .on("end", () => resolve(outPath))
+      .on("error", reject)
+      .run();
+  });
+}
+
+function segmentAudio(inPath, outPattern, seconds = 600 /* 10 min */) {
+  // Split by duration to keep each part small
+  return new Promise((resolve, reject) => {
+    const outFiles = [];
+    ffmpeg(inPath)
+      .outputOptions([
+        "-f", "segment",
+        "-segment_time", String(seconds),
+        "-reset_timestamps", "1",
+      ])
+      .output(outPattern)
+      .on("start", (cmd) => console.log("[ffmpeg] segment cmd:", cmd))
+      .on("error", reject)
+      .on("end", () => {
+        // Enumerate produced files
+        const dir = path.dirname(outPattern);
+        const base = path.basename(outPattern).replace("%03d", "");
+        const all = fs.readdirSync(dir)
+          .filter(f => f.startsWith(base))
+          .map(f => path.join(dir, f))
+          .sort();
+        resolve(all);
+      })
+      .run();
+  });
+}
+
+async function ensureWhisperFriendlyAudio(srcPath, callId) {
+  // 1) If already under limit and readable by Whisper (we’ll force mp3 anyway)
+  const initialOut = tmpPath(`${callId}.mp3`);
+  await transcodeToSpeechMp3(srcPath, initialOut);
+  let size = fileSizeBytes(initialOut);
+  if (size <= MAX_WHISPER_BYTES) {
+    return { mode: "single", files: [initialOut] };
+  }
+
+  console.log(`[prep] compressed file still too large (${(size/1024/1024).toFixed(1)} MB). Segmenting...`);
+
+  // 2) Segment into 10-minute chunks after compression
+  const pattern = tmpPath(`${callId}_part_%03d.mp3`);
+  const parts = await segmentAudio(initialOut, pattern, 600);
+  // Optional: if any part > limit (very rare with our settings), re-compress tighter
+  const safeParts = [];
+  for (const p of parts) {
+    const s = fileSizeBytes(p);
+    if (s > MAX_WHISPER_BYTES) {
+      const tighter = tmpPath(`${path.basename(p, ".mp3")}_tight.mp3`);
+      await transcodeToSpeechMp3(p, tighter); // same settings; if it remains too big, duration is the cause
+      safeParts.push(tighter);
+    } else {
+      safeParts.push(p);
+    }
+  }
+  return { mode: "multi", files: safeParts };
+}
+
+// -------------------------------------------------------------
+// Transcription
+// -------------------------------------------------------------
+async function transcribeFileWithOpenAI(filePath) {
   const form = new FormData();
   form.append("file", fs.createReadStream(filePath));
   form.append("model", "whisper-1");
@@ -71,9 +156,31 @@ async function transcribeAudio(filePath) {
     headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
     body: form,
   });
-  if (!r.ok) throw new Error(`OpenAI transcription failed: ${r.status} ${await r.text()}`);
+  if (!r.ok) {
+    const t = await r.text();
+    throw new Error(`OpenAI transcription failed: ${r.status} ${t}`);
+  }
   const j = await r.json();
   return j.text || "";
+}
+
+async function transcribeAudioSmart(srcPath, callId) {
+  console.log("[bg] Preparing audio for Whisper…");
+  const prep = await ensureWhisperFriendlyAudio(srcPath, callId);
+
+  if (prep.mode === "single") {
+    console.log("[bg] Transcribing single compressed file…");
+    return await transcribeFileWithOpenAI(prep.files[0]);
+  }
+
+  console.log(`[bg] Transcribing ${prep.files.length} chunks…`);
+  let all = [];
+  for (let i = 0; i < prep.files.length; i++) {
+    console.log(`[bg] Chunk ${i + 1}/${prep.files.length}`);
+    const text = await transcribeFileWithOpenAI(prep.files[i]);
+    all.push(text);
+  }
+  return all.join("\n");
 }
 
 // -------------------------------------------------------------
@@ -103,7 +210,7 @@ async function fetchCallProps(callId, props = ["hs_activity_type"]) {
 
 async function classifyCallTypeFromTranscript(transcript) {
   const system =
-    "Classify the following call into ONE label. Return ONLY JSON {\"label\":\"<one>\",\"confidence\":<0-100>}.\n" +
+    "Classify the call into ONE label. Return ONLY JSON {\"label\":\"<one>\",\"confidence\":<0-100>}.\n" +
     "Valid labels: " + CALL_TYPE_LABELS.join(", ");
   const r = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
@@ -158,7 +265,6 @@ async function resolveCallTypeWithGrace(callId, transcript, graceMs = 120000) {
     }),
   });
 
-  // optional: promote to built-in if confident
   if (confidence >= 75) {
     console.log("[type] high confidence — setting hs_activity_type");
     await fetch(`https://api.hubapi.com/crm/v3/objects/calls/${encodeURIComponent(callId)}`, {
@@ -172,27 +278,19 @@ async function resolveCallTypeWithGrace(callId, transcript, graceMs = 120000) {
 }
 
 // -------------------------------------------------------------
-// Analysis (skeleton – produces JSON; we’ll expand per type later)
+// Analysis (skeleton – expand later)
 // -------------------------------------------------------------
 async function analyseCall(typeLabel, transcript) {
   const system = "You are TLPI’s call analysis bot. Output JSON only.";
   const brief = {
-    "Qualification call":
-      "Analyse discovery performance, objections, short suggestions.",
-    "Initial Consultation":
-      "Analyse consultation delivery, product interest, application data when present, objections.",
-    "Follow up call":
-      "Analyse follow-up status, remaining objections, likelihood to close, next steps.",
-    "Application meeting":
-      "List key data captured, missing information, and next steps.",
-    "Strategy call":
-      "Summarise strategy focus areas, recommendations, and engagement level.",
-    "Annual Review":
-      "Summarise satisfaction, achievements, and improvement areas.",
-    "Existing customer call":
-      "Detect sentiment, complaints, escalation need, and notes.",
-    Other:
-      "Generic summary and objections.",
+    "Qualification call": "Analyse discovery performance, objections, short suggestions.",
+    "Initial Consultation": "Analyse consultation delivery, product interest, application data when present, objections.",
+    "Follow up call": "Analyse follow-up status, remaining objections, likelihood to close, next steps.",
+    "Application meeting": "List key data captured, missing information, and next steps.",
+    "Strategy call": "Summarise strategy focus areas, recommendations, and engagement level.",
+    "Annual Review": "Summarise satisfaction, achievements, and improvement areas.",
+    "Existing customer call": "Detect sentiment, complaints, escalation need, and notes.",
+    Other: "Generic summary and objections.",
   }[typeLabel] || "Generic summary and objections.";
 
   const user =
@@ -264,33 +362,29 @@ app.post("/process-call", async (req, res) => {
     // respond fast
     res.status(200).send("Processing");
 
-    // background work
+    // background
     setImmediate(async () => {
       try {
-        const filePath = await downloadRecording(recordingUrl, callId);
-        const transcript = await transcribeAudio(filePath);
+        const srcPath = await downloadRecording(recordingUrl, callId);
+        const transcript = await transcribeAudioSmart(srcPath, callId);
 
         const effectiveType = await resolveCallTypeWithGrace(callId, transcript, 120000);
         console.log("[type] effectiveType:", effectiveType);
 
         const analysis = await analyseCall(effectiveType, transcript);
 
-        // Map common objection fields (defensive defaults)
+        // Map common objection fields
         const objections = analysis.objections || {};
         const updates = {
           ai_objections_bullets: (objections.bullets || []).join(" • "),
-          ai_objection_categories: (objections.categories || [])[0] || undefined, // HS accepts multi-select as comma/array via API; we keep single for now
           ai_primary_objection: objections.primary || "",
           ai_objection_severity: objections.severity || "",
         };
 
-        // Initial Consultation extras (example)
+        // Initial Consultation extras (support capturing application info present in that meeting)
         if (effectiveType === "Initial Consultation") {
           if (Array.isArray(analysis.product_interest) && analysis.product_interest.length) {
-            // You configured this as a dropdown; if Both appears, set "Both", else SSAS or FIC if single.
-            const v = analysis.product_interest.includes("Both")
-              ? "Both"
-              : analysis.product_interest[0];
+            const v = analysis.product_interest.includes("Both") ? "Both" : analysis.product_interest[0];
             updates.ai_product_interest = v || "";
           }
           if (Array.isArray(analysis.application_data_points) && analysis.application_data_points.length) {
