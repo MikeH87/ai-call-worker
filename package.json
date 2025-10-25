@@ -1,7 +1,6 @@
 {
   "name": "ai-call-worker",
-  "version": "4.0.1",
-  "description": "TLPI AI Call Worker (HubSpot + OpenAI) — modular",
+  "version": "4.1.0",
   "type": "module",
   "main": "index.js",
   "engines": {

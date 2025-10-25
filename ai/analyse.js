@@ -1,105 +1,81 @@
 // ai/analyse.js
-// Core analysis + transcription logic for AI Call Worker
-// ------------------------------------------------------
-// Handles transcription via OpenAI Whisper with robust retry & timeout logic
-// Then returns structured text for downstream analysis in HubSpot flow.
-
+import dotenv from "dotenv";
 import fs from "fs";
 import FormData from "form-data";
+import fetch from "node-fetch";
+import { getCombinedPrompt } from "./getCombinedPrompt.js";
 
-const TRANSCRIBE_MODEL = process.env.WHISPER_MODEL || "whisper-1";
+dotenv.config();
 
-export function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+if (!OPENAI_API_KEY) {
+  console.warn("[cfg] OPENAI_API_KEY missing — transcription/analysis will fail.");
 }
 
-function authHeaders() {
-  return {
-    Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-  };
-}
+const OPENAI_BASE = process.env.OPENAI_BASE || "https://api.openai.com/v1";
+const TRANSCRIPTION_MODEL = process.env.WHISPER_MODEL || "whisper-1";
+const ANALYSIS_MODEL = process.env.ANALYSIS_MODEL || "gpt-4o-mini";
 
 /**
- * Transcribe a local audio file using OpenAI Whisper.
- * Automatically retries on transient network or 429/5xx errors.
- * Each attempt has a 300-second timeout to handle slow uploads.
+ * Transcribe a single audio file with Whisper.
+ * @param {string} audioPath
+ * @returns {Promise<string>} transcript text
  */
-export async function transcribeFile(filePath) {
-  const maxAttempts = 5;
-  let attempt = 0;
+export async function transcribeFile(audioPath) {
+  const form = new FormData();
+  form.append("model", TRANSCRIPTION_MODEL);
+  form.append("response_format", "text");
+  form.append("file", fs.createReadStream(audioPath));
 
-  while (true) {
-    attempt += 1;
+  const res = await fetch(`${OPENAI_BASE}/audio/transcriptions`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
+    body: form,
+  });
 
-    const form = new FormData();
-    form.append("file", fs.createReadStream(filePath));
-    form.append("model", TRANSCRIBE_MODEL);
-
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 300000); // 300s per attempt
-
-    try {
-      console.log(`[whisper] attempt ${attempt}/${maxAttempts} using model=${TRANSCRIBE_MODEL}…`);
-
-      const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-        method: "POST",
-        headers: authHeaders(),
-        body: form,
-        signal: controller.signal,
-      });
-
-      clearTimeout(timeout);
-
-      if (res.ok) {
-        const json = await res.json();
-        return json.text || "";
-      }
-
-      const text = await res.text();
-      const is429 = res.status === 429;
-      const is5xx = res.status >= 500;
-      const insufficientQuota = is429 && /insufficient_quota/i.test(text);
-      const rateLimited = is429 && !insufficientQuota;
-
-      console.warn(`[whisper] HTTP ${res.status} on attempt ${attempt}: ${text.slice(0, 300)}${text.length > 300 ? "…" : ""}`);
-
-      if (insufficientQuota) {
-        throw new Error(`Whisper failed permanently: ${res.status} ${text}`);
-      }
-
-      if ((rateLimited || is5xx) && attempt < maxAttempts) {
-        const backoff = Math.round(800 * Math.pow(2, attempt - 1) * (0.8 + Math.random() * 0.4));
-        console.log(`[whisper] retrying after ${backoff}ms…`);
-        await sleep(backoff);
-        continue;
-      }
-
-      throw new Error(`Whisper failed permanently: ${res.status} ${text}`);
-    } catch (err) {
-      clearTimeout(timeout);
-      const isAbort = err.name === "AbortError";
-      const isNetwork = /network|fetch|socket|timeout|abort/i.test(String(err));
-
-      if ((isAbort || isNetwork) && attempt < maxAttempts) {
-        const backoff = Math.round(800 * Math.pow(2, attempt - 1) * (0.8 + Math.random() * 0.4));
-        console.warn(`[whisper] network/timeout on attempt ${attempt}: ${err.message}. Retrying in ${backoff}ms…`);
-        await sleep(backoff);
-        continue;
-      }
-
-      throw err;
-    }
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Whisper failed ${res.status} ${res.statusText} — ${text?.slice(0, 300)}`);
   }
+  return await res.text();
 }
 
 /**
- * Perform structured AI analysis on transcript text.
- * (Your downstream logic can call this after transcribeFile.)
+ * Analyse the transcript using TLPI prompts.
+ * Returns a structured object for HubSpot update + scorecard.
  */
-export async function analyseTranscript(callType, transcript) {
-  return {
-    callType,
-    transcript,
-    // Placeholder for now – replaced with AI analysis logic in your pipeline
-  };
+export async function analyseTranscript(callTypeLabel, transcript) {
+  const systemAndUser = await getCombinedPrompt(callTypeLabel, transcript);
+
+  const res = await fetch(`${OPENAI_BASE}/chat/completions`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: ANALYSIS_MODEL,
+      temperature: 0.2,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: systemAndUser.system },
+        { role: "user", content: systemAndUser.user },
+      ],
+    }),
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Analysis failed ${res.status} ${res.statusText} — ${text?.slice(0, 400)}`);
+  }
+
+  const json = await res.json();
+  const raw = json?.choices?.[0]?.message?.content || "{}";
+
+  try {
+    return JSON.parse(raw);
+  } catch {
+    // if model returns non-JSON, fallback to plain object with a field
+    return { notes: raw, parsing_error: true };
+  }
 }

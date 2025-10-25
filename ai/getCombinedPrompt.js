@@ -1,71 +1,87 @@
 // ai/getCombinedPrompt.js
-// Purpose: Build the final analysis prompt by combining the shared company context
-// (prompts/company-info.md) with the call-type specific prompt (one of the 4 files).
-//
-// Used by: the /debug-prompt endpoint and (optionally) analysis flows that need a
-// fully-assembled prompt.
-// Updates: This function does NOT write to HubSpot itself; it only returns text.
-//
-// Files referenced:
-//   prompts/company-info.md
-//   prompts/qualification.md
-//   prompts/initial-consultation.md
-//   prompts/follow-up.md
-//   prompts/application-meeting.md
-//
-// If you update context about TLPI, products (SSAS/FIC), definitions of call types,
-// or rubric details—edit the markdown files in /prompts (not this code).
-
 import fs from "fs/promises";
 import path from "path";
 
-/** Read a file safely; if it doesn't exist, return empty string */
-async function readIfExists(absPath) {
+// Map HubSpot/Call labels to prompt files
+const CALL_TYPE_TO_FILE = {
+  "Qualification Call": "qualification.md",
+  "Initial Consultation": "initial-consultation.md",
+  "Follow-up Call": "follow-up.md",
+  "Application Meeting": "application-meeting.md",
+  // Fallbacks
+  Qualification: "qualification.md",
+  "Initial Consultation Call": "initial-consultation.md",
+  "Follow Up": "follow-up.md",
+};
+
+const PROMPTS_DIR = path.join(process.cwd(), "prompts");
+
+async function safeRead(file) {
   try {
-    return await fs.readFile(absPath, "utf8");
+    return await fs.readFile(file, "utf8");
   } catch {
     return "";
   }
 }
 
-/** Map HubSpot call-type label to a prompt file name */
-function promptFileForType(callType) {
-  const t = String(callType || "").toLowerCase();
-  if (t.includes("qualification")) return "qualification.md";
-  if (t.includes("initial")) return "initial-consultation.md";
-  if (t.includes("follow")) return "follow-up.md";
-  if (t.includes("application")) return "application-meeting.md";
-  // Fallback to initial consultation prompt if unknown (safest for sales)
-  return "initial-consultation.md";
+function normaliseType(label = "") {
+  const keys = Object.keys(CALL_TYPE_TO_FILE);
+  for (const k of keys) {
+    if (label.toLowerCase().includes(k.toLowerCase())) return CALL_TYPE_TO_FILE[k];
+  }
+  return null;
 }
 
-/**
- * Return a combined prompt string:
- *   [Company info/context]
- *   ---
- *   [Call-type specific instructions]
- *   ---
- *   [Transcript injected at the end]
- */
-export async function getCombinedPrompt(callType, transcript) {
-  const cwd = process.cwd();
+export async function getCombinedPrompt(callTypeLabel = "Unknown", transcript = "") {
+  const company = await safeRead(path.join(PROMPTS_DIR, "company-info.md"));
+  const typeFile =
+    normaliseType(callTypeLabel) || "qualification.md"; // default sensible baseline
 
-  const companyInfoPath = path.resolve(cwd, "prompts", "company-info.md");
-  const typeFile = promptFileForType(callType);
-  const typePath = path.resolve(cwd, "prompts", typeFile);
+  const callTypeMd = await safeRead(path.join(PROMPTS_DIR, typeFile));
 
-  const companyInfo = (await readIfExists(companyInfoPath)).trim();
-  const typeBlock = (await readIfExists(typePath)).trim();
+  const system = [
+    "You are TLPI’s AI Call Analyst.",
+    "Analyse sales calls for SSAS Pensions and Family Investment Companies (FIC).",
+    "Output MUST be compact JSON only — no extra prose.",
+    "Be conservative and evidence-based; if unsure, mark fields as null and include 'uncertainty_reason'.",
+  ].join(" ");
 
-  const header = companyInfo
-    ? `# Company & Product Context\n${companyInfo}\n`
-    : `# Company & Product Context\n(No company-info.md found — please add prompts/company-info.md)\n`;
+  const user = `
+# COMPANY CONTEXT
+${company || "_(company-info.md missing — using defaults)_"}
 
-  const typeSection = typeBlock
-    ? `# Call-Type Instructions (${callType || "Unknown"})\n${typeBlock}\n`
-    : `# Call-Type Instructions (${callType || "Unknown"})\n(No ${typeFile} found — please add prompts/${typeFile})\n`;
+# CALL TYPE CONTEXT
+(${callTypeLabel})
+${callTypeMd || "_(call-type file missing — using generic guidance)_"}
 
-  const transcriptSection = `# Transcript\n${transcript || "(No transcript provided)"}\n`;
+# OUTPUT SHAPE (STRICT)
+Return JSON with:
+{
+  "call_type": "<detected>",
+  "summary": "<3-6 bullet sentences>",
+  "likelihood_to_close": 0..100,
+  "outcome": "Positive|Negative|Neutral",
+  "objections": ["..."],
+  "next_actions": ["..."],
+  "materials_to_send": ["..."],
+  "key_details": {
+     "client_name": "<if known>",
+     "company_name": "<if known>",
+     "products_discussed": ["SSAS","FIC", "..."],
+     "timeline": "<eg within 7 days>"
+  },
+  "scorecard": {
+     "problem_fit": 0..5,
+     "budget_fit": 0..5,
+     "authority": 0..5,
+     "urgency": 0..5,
+     "overall": 0..5
+  }
+}
 
-  return `${header}\n---\n${typeSection}\n---\n${transcriptSection}`;
+# TRANSCRIPT
+${transcript}
+`.trim();
+
+  return { system, user };
 }
