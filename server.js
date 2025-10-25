@@ -1,8 +1,7 @@
 // =============================================================
-// TLPI – AI Call Worker  (v2.3)
-// - Testing mode: grace wait disabled (configurable via GRACE_MS)
-// - Normalise ai_objection_severity to [Low, Medium, High]
-// - Keeps: compression/chunking, type inference, analysis stub, HS updates
+// TLPI – AI Call Worker  (v2.4)
+// - Existing customer call mapping -> sentiment/complaint/escalation fields
+// - Keeps: compression/chunking, type inference, GRACE_MS, severity normaliser
 // =============================================================
 
 import express from "express";
@@ -17,12 +16,11 @@ import ffmpeg from "fluent-ffmpeg";
 // ---- ENV ----
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const HUBSPOT_TOKEN = process.env.HUBSPOT_TOKEN;
-const ZOOM_BEARER_TOKEN = process.env.ZOOM_BEARER_TOKEN || process.env.ZOOM_ACCESS_TOKEN; // optional
-// Testing: no grace by default; set GRACE_MS=120000 later to re-enable the 2-min wait
-const GRACE_MS = Number(process.env.GRACE_MS ?? 0);
+const ZOOM_BEARER_TOKEN = process.env.ZOOM_BEARER_TOKEN || process.env.ZOOM_ACCESS_TOKEN;
+const GRACE_MS = Number(process.env.GRACE_MS ?? 0); // 0 during testing
 
 // ---- Constants ----
-const MAX_WHISPER_BYTES = 25 * 1024 * 1024; // 25 MB limit
+const MAX_WHISPER_BYTES = 25 * 1024 * 1024; // 25 MB
 const TMP_DIR = os.tmpdir();
 
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
@@ -254,22 +252,11 @@ async function resolveCallTypeWithGrace(callId, transcript, graceMs = GRACE_MS) 
 }
 
 // -------------------------------------------------------------
-// Analysis (skeleton – expand later)
+// Analysis (now emits existing-customer keys when relevant)
 // -------------------------------------------------------------
 async function analyseCall(typeLabel, transcript) {
   const system = "You are TLPI’s call analysis bot. Output JSON only.";
-  const brief = {
-    "Qualification call": "Analyse discovery performance, objections, short suggestions.",
-    "Initial Consultation": "Analyse consultation delivery, product interest, application data when present, objections.",
-    "Follow up call": "Analyse follow-up status, remaining objections, likelihood to close, next steps.",
-    "Application meeting": "List key data captured, missing information, and next steps.",
-    "Strategy call": "Summarise strategy focus areas, recommendations, and engagement level.",
-    "Annual Review": "Summarise satisfaction, achievements, and improvement areas.",
-    "Existing customer call": "Detect sentiment, complaints, escalation need, and notes.",
-    Other: "Generic summary and objections.",
-  }[typeLabel] || "Generic summary and objections.";
-
-  const user =
+  const commonBrief =
     `Call Type: ${typeLabel}\n\nTranscript:\n${transcript}\n\n` +
     `Return JSON with keys where applicable:
 {
@@ -287,6 +274,19 @@ async function analyseCall(typeLabel, transcript) {
   }
 }`;
 
+  let extra = "";
+  if (typeLabel === "Existing customer call") {
+    // Ask explicitly for the four keys we need
+    extra =
+      `\nAdditionally, include these keys (omit if not supported by evidence):\n` +
+      `{\n` +
+      `  "customer_sentiment": "positive|neutral|negative",\n` +
+      `  "complaint_detected": "yes|no|unclear",\n` +
+      `  "escalation_required": "yes|no|monitor",\n` +
+      `  "escalation_notes": "<short text>"\n` +
+      `}\n`;
+  }
+
   const r = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
@@ -294,7 +294,10 @@ async function analyseCall(typeLabel, transcript) {
       model: "gpt-4o-mini",
       temperature: 0.2,
       response_format: { type: "json_object" },
-      messages: [{ role: "system", content: system }, { role: "user", content: `${brief}\n\n${user}` }],
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: commonBrief + extra },
+      ],
     }),
   });
   const j = await r.json();
@@ -306,7 +309,7 @@ async function analyseCall(typeLabel, transcript) {
 }
 
 // -------------------------------------------------------------
-// HubSpot updates
+// HubSpot updates + normalisers
 // -------------------------------------------------------------
 function normaliseSeverity(v) {
   if (!v) return "";
@@ -315,6 +318,30 @@ function normaliseSeverity(v) {
   if (s === "medium") return "Medium";
   if (s === "high") return "High";
   return ""; // avoid INVALID_OPTION
+}
+function normaliseSentiment(v) {
+  if (!v) return "";
+  const s = String(v).trim().toLowerCase();
+  if (s === "positive") return "Positive";
+  if (s === "neutral") return "Neutral";
+  if (s === "negative") return "Negative";
+  return "";
+}
+function normaliseYesNoUnclear(v) {
+  if (!v) return "";
+  const s = String(v).trim().toLowerCase();
+  if (s === "yes") return "Yes";
+  if (s === "no") return "No";
+  if (s === "unclear") return "Unclear";
+  return "";
+}
+function normaliseEscalation(v) {
+  if (!v) return "";
+  const s = String(v).trim().toLowerCase();
+  if (s === "yes") return "Yes";
+  if (s === "no") return "No";
+  if (s === "monitor") return "Monitor";
+  return "";
 }
 
 async function updateHubSpotCall(callId, properties) {
@@ -358,7 +385,7 @@ app.post("/process-call", async (req, res) => {
 
         const analysis = await analyseCall(effectiveType, transcript);
 
-        // Map common objection fields
+        // Common objection fields
         const objections = analysis.objections || {};
         const updates = {
           ai_objections_bullets: (objections.bullets || []).join(" • "),
@@ -366,7 +393,15 @@ app.post("/process-call", async (req, res) => {
           ai_objection_severity: normaliseSeverity(objections.severity),
         };
 
-        // Initial Consultation extras (also capture app info if present in this meeting)
+        // Existing customer call: map the four fields
+        if (effectiveType === "Existing customer call") {
+          updates.ai_existing_customer_sentiment = normaliseSentiment(analysis.customer_sentiment);
+          updates.ai_existing_complaint_detected = normaliseYesNoUnclear(analysis.complaint_detected);
+          updates.ai_existing_escalation_required = normaliseEscalation(analysis.escalation_required);
+          updates.ai_existing_escalation_notes = analysis.escalation_notes || "";
+        }
+
+        // Initial Consultation: capture application info if present
         if (effectiveType === "Initial Consultation") {
           if (Array.isArray(analysis.product_interest) && analysis.product_interest.length) {
             const v = analysis.product_interest.includes("Both") ? "Both" : analysis.product_interest[0];
