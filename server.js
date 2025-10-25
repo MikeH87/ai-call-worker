@@ -1,445 +1,262 @@
-// server.js (ESM, Node 20+)
-// HubSpot webhook -> download recording (HubSpot or Zoom) -> Zoom-only transcode to Opus (with timeout+fallback) -> Whisper -> GPT -> update 5 fields
-// Features: fast 200 OK, background processing, idempotency, retry logic, Zoom auth, conditional transcoding, transcode timeout+fallback, input format logging.
+// =============================================================
+// TLPI – AI Call Worker  (v2.0)
+// =============================================================
 
 import express from "express";
-import { spawn } from "child_process";
-import ffmpegPath from "ffmpeg-static";
+import fetch from "node-fetch";
+import fs from "fs";
+import { fileURLToPath } from "url";
+import path from "path";
+import FormData from "form-data";
 
-// ====== Config ======
-const PORT = process.env.PORT || 3000;
+// ---- ENV ----
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const HUBSPOT_TOKEN = process.env.HUBSPOT_TOKEN;
 
-// Optional Zoom auth (use ONE if your Zoom links aren’t public)
-const ZOOM_ACCESS_TOKEN = process.env.ZOOM_ACCESS_TOKEN;   // appended as ?access_token=...
-const ZOOM_BEARER_TOKEN = process.env.ZOOM_BEARER_TOKEN;   // Authorization: Bearer ...
+const app = express();
+app.use(express.json({ limit: "50mb" }));
 
-if (!OPENAI_API_KEY) console.warn("[BOOT] Missing OPENAI_API_KEY");
-if (!HUBSPOT_TOKEN) console.warn("[BOOT] Missing HUBSPOT_TOKEN");
+// ---- Helpers ----
+async function fetchWithRetry(url, opts, retries = 3) {
+  for (let i = 0; i < retries; i++) {
+    const res = await fetch(url, opts);
+    if (res.ok) return res;
+    console.warn(`[retry] attempt ${i + 1}/${retries} — waiting`);
+    await new Promise(r => setTimeout(r, Math.pow(2, i) * 700));
+  }
+  throw new Error(`HTTP ${res.status} ${await res.text()}`);
+}
 
-// Target HubSpot fields
-const TARGET_PROPS = [
-  "chat_gpt___likeliness_to_proceed_score",
-  "chat_gpt___score_reasoning",
-  "chat_gpt___increase_likelihood_of_sale_suggestions",
-  "chat_gpt___sales_performance",
-  "sales_performance_summary",
+async function downloadRecording(recordingUrl, callId) {
+  console.log(`[bg] Downloading recording: ${recordingUrl}`);
+  const r = await fetchWithRetry(recordingUrl, {
+    headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` },
+  });
+  if (!r.ok) throw new Error(`Download failed: ${r.status}`);
+  const buf = Buffer.from(await r.arrayBuffer());
+  const tmp = path.join("/tmp", `${callId}.mp3`);
+  fs.writeFileSync(tmp, buf);
+  return tmp;
+}
+
+// ---- Transcription ----
+async function transcribeAudio(filePath) {
+  console.log("[bg] Transcribing...");
+  const form = new FormData();
+  form.append("file", fs.createReadStream(filePath));
+  form.append("model", "whisper-1");
+  const r = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
+    body: form,
+  });
+  if (!r.ok) throw new Error(`OpenAI transcription failed: ${r.status}`);
+  const j = await r.json();
+  return j.text;
+}
+
+// =============================================================
+// ---- CALL TYPE INFERENCE + GRACE ----
+// =============================================================
+
+const CALL_TYPE_LABELS = [
+  "Qualification call",
+  "Initial Consultation",
+  "Follow up call",
+  "Application meeting",
+  "Strategy call",
+  "Annual Review",
+  "Existing customer call",
+  "Other",
 ];
 
-// Prevent concurrent duplicates
-const processingNow = new Set();
-
-// ====== Helper: fetch with retry ======
-async function fetchWithRetry(makeRequest, { retries = 3, baseDelayMs = 600 } = {}) {
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    try {
-      const resp = await makeRequest();
-      if (resp.ok) return resp;
-
-      const retriable = resp.status === 429 || (resp.status >= 500 && resp.status < 600);
-      if (!retriable || attempt === retries) {
-        let text = "";
-        try { text = await resp.text(); } catch {}
-        throw new Error(`HTTP ${resp.status} ${text}`);
-      }
-    } catch (err) {
-      if (attempt === retries) throw err;
-    }
-    const delay = baseDelayMs * Math.pow(2, attempt) + Math.floor(Math.random() * 250);
-    console.log(`[retry] attempt ${attempt + 1}/${retries} — waiting ${delay}ms`);
-    await new Promise((r) => setTimeout(r, delay));
-  }
-  throw new Error("fetchWithRetry exhausted");
+async function fetchCallProps(callId, props = ["hs_activity_type"]) {
+  const params = new URLSearchParams({ properties: props.join(",") });
+  const r = await fetch(
+    `https://api.hubapi.com/crm/v3/objects/calls/${callId}?${params}`,
+    { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` } }
+  );
+  if (!r.ok) return {};
+  return (await r.json()).properties || {};
 }
 
-// ====== Express app ======
-const app = express();
-app.use(express.json({ limit: "25mb" }));
-app.get("/", (_req, res) => res.status(200).send("AI Call Worker up"));
-
-// ====== Webhook ======
-app.post("/process-call", async (req, res) => {
-  const body = req.body || {};
-  const props = body.properties || {};
-  const valueOf = (c) => (c && typeof c === "object" && "value" in c ? c.value : c);
-  const firstDefined = (...arr) => arr.find((v) => v != null && v !== "");
-
-  const rawRecordingUrl = firstDefined(body.recordingUrl, props.hs_call_recording_url);
-  const rawCallId = firstDefined(body.callId, props.hs_object_id, body.objectId);
-
-  const recordingUrl = String(valueOf(rawRecordingUrl) || "").trim();
-  const callId = String(valueOf(rawCallId) || "").trim();
-  console.log("resolved recordingUrl:", recordingUrl);
-  console.log("resolved callId:", callId);
-
-  // 200 immediately to stop HubSpot retries
-  res.status(200).json({ ok: true, accepted: Boolean(recordingUrl && callId) });
-  if (!recordingUrl || !callId) return;
-
-  if (processingNow.has(callId)) {
-    console.log(`[bg] Call ${callId} already in-flight`);
-    return;
-  }
-  processingNow.add(callId);
-
-  setImmediate(async () => {
-    try {
-      if (await isAlreadyProcessed(callId)) {
-        console.log(`[bg] Call ${callId} already processed`);
-        return;
-      }
-
-      const url = normaliseRecordingUrl(recordingUrl, callId);
-      console.log("[bg] Downloading recording:", url);
-      const audioOriginal = await downloadRecording(url);
-      const sizeMB = (audioOriginal.length / (1024 * 1024)).toFixed(2);
-      const magic = sniffMagic(audioOriginal);
-      const guessedMime = guessMimeFromUrl(url) || magic.mime || "application/octet-stream";
-      console.log(`[bg] Downloaded ${sizeMB} MB, detected=${magic.short || "unknown"} mime=${guessedMime}`);
-
-      // Conditional: Zoom => transcode to Opus; HubSpot => use as-is
-      const zoom = isZoomUrl(url);
-      let audioForWhisper = audioOriginal;
-      let whisperFilename = `call_${callId}${zoom ? ".ogg" : magic.ext || ".mp3"}`;
-      let whisperMime = zoom ? "audio/ogg" : guessedMime;
-
-      if (zoom) {
-        console.log("[bg] Transcoding (Zoom) to Opus 24kbps mono 16kHz (3 min timeout)...");
-        try {
-          audioForWhisper = await transcodeToOpus(audioOriginal, { timeoutMs: 180000 });
-          whisperFilename = `call_${callId}.ogg`;
-          whisperMime = "audio/ogg";
-          console.log("[bg] Transcode complete:", (audioForWhisper.length / (1024 * 1024)).toFixed(2), "MB");
-        } catch (e) {
-          console.warn("[bg] Transcode failed or timed out — falling back to original audio. Reason:", e.message);
-          audioForWhisper = audioOriginal; // fallback
-          whisperFilename = `call_${callId}${magic.ext || ".bin"}`;
-          whisperMime = guessedMime || "application/octet-stream";
-        }
-      } else {
-        console.log("[bg] Skipping transcoding for HubSpot recording");
-      }
-
-      console.log("[bg] Transcribing...");
-      const transcript = await transcribeAudioWithOpenAI(audioForWhisper, whisperFilename, whisperMime);
-
-      console.log("[bg] Analysing...");
-      const outputs = await analyseTranscriptWithOpenAI(transcript);
-
-      console.log("[bg] Uploading to HubSpot...");
-      await updateHubSpotCall(callId, outputs);
-
-      console.log("✅ [bg] Done", callId);
-    } catch (err) {
-      console.error("❗ [bg] Error", callId, err);
-    } finally {
-      processingNow.delete(callId);
-    }
+async function classifyCallTypeFromTranscript(transcript) {
+  const sys =
+    "Classify this call transcript into one of these labels ONLY:\n" +
+    CALL_TYPE_LABELS.join(", ") +
+    "\nReturn JSON {\"label\":\"<one>\",\"confidence\":<0-100>}";
+  const r = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "gpt-4o-mini",
+      temperature: 0,
+      response_format: { type: "json_object" },
+      messages: [{ role: "system", content: sys }, { role: "user", content: transcript }],
+    }),
   });
-});
-
-// ====== Core helpers ======
-function normaliseRecordingUrl(url, callId) {
-  // HubSpot auth retriever -> ensure /engagement/{id}
+  const j = await r.json();
   try {
-    const u = new URL(url);
-    if (u.hostname.endsWith("hubspot.com") && u.pathname.includes("/getAuthRecording/") && !u.pathname.includes("/engagement/")) {
-      if (!u.pathname.endsWith("/")) u.pathname += "/";
-      u.pathname += `engagement/${callId}`;
-      return u.toString();
-    }
-  } catch {}
-  return url;
-}
-
-function isZoomUrl(url) {
-  try { return new URL(url).hostname.includes("zoom.us"); } catch { return false; }
-}
-
-function withZoomAuth(url) {
-  // Prefer ?access_token=... if provided
-  try {
-    const u = new URL(url);
-    if (ZOOM_ACCESS_TOKEN && !u.searchParams.has("access_token")) {
-      u.searchParams.set("access_token", ZOOM_ACCESS_TOKEN);
-    }
-    return u.toString();
+    const o = JSON.parse(j?.choices?.[0]?.message?.content || "{}");
+    const label = CALL_TYPE_LABELS.includes(o.label) ? o.label : "Other";
+    const confidence = Number(o.confidence || 0);
+    return { typeLabel: label, confidence };
   } catch {
-    return url;
+    return { typeLabel: "Other", confidence: 0 };
   }
 }
 
-function guessMimeFromUrl(url) {
-  try {
-    const { pathname } = new URL(url);
-    if (pathname.endsWith(".mp3")) return "audio/mpeg";
-    if (pathname.endsWith(".m4a")) return "audio/mp4";
-    if (pathname.endsWith(".wav")) return "audio/wav";
-    if (pathname.endsWith(".aac")) return "audio/aac";
-    if (pathname.endsWith(".ogg") || pathname.endsWith(".opus")) return "audio/ogg";
-    if (pathname.endsWith(".mp4") || pathname.endsWith(".mkv") || pathname.endsWith(".mov")) return "video/mp4";
-  } catch {}
-  return null;
-}
+async function resolveCallTypeWithGrace(callId, transcript, graceMs = 120000) {
+  const first = await fetchCallProps(callId, ["hs_activity_type"]);
+  if (first.hs_activity_type) return first.hs_activity_type;
 
-// quick-and-cheerful magic sniff (best-effort)
-function sniffMagic(buf) {
-  const head = buf.subarray(0, 16);
-  const asHex = [...head].map((b) => b.toString(16).padStart(2, "0")).join("");
-  const asStr = new TextDecoder().decode(head);
+  console.log(`[type] hs_activity_type blank — waiting ${graceMs / 1000}s`);
+  await new Promise(r => setTimeout(r, graceMs));
 
-  if (asStr.startsWith("OggS")) return { short: "ogg", mime: "audio/ogg", ext: ".ogg" };
-  if (asStr.startsWith("ID3") || asHex.startsWith("fffb") || asHex.startsWith("fff3") || asHex.startsWith("fff2"))
-    return { short: "mp3", mime: "audio/mpeg", ext: ".mp3" };
-  if (asStr.includes("ftyp")) return { short: "mp4/m4a", mime: "audio/mp4", ext: ".m4a" };
-  if (asStr.startsWith("RIFF")) return { short: "wav", mime: "audio/wav", ext: ".wav" };
-  return { short: "unknown", mime: null, ext: "" };
-}
+  const second = await fetchCallProps(callId, ["hs_activity_type"]);
+  if (second.hs_activity_type) return second.hs_activity_type;
 
-async function downloadRecording(url) {
-  const u = new URL(url);
-  let headers = {};
+  console.log("[type] inferring type...");
+  const { typeLabel, confidence } = await classifyCallTypeFromTranscript(transcript);
+  console.log(`[type] inferred=${typeLabel} conf=${confidence}`);
 
-  if (u.hostname.endsWith("hubspot.com")) {
-    headers = { Authorization: `Bearer ${HUBSPOT_TOKEN}` };
-  } else if (isZoomUrl(url)) {
-    url = withZoomAuth(url);
-    if (ZOOM_BEARER_TOKEN) headers = { Authorization: `Bearer ${ZOOM_BEARER_TOKEN}` };
-  }
-
-  const resp = await fetchWithRetry(() => fetch(url, { headers }));
-  const arrayBuf = await resp.arrayBuffer();
-  return Buffer.from(arrayBuf);
-}
-
-// ====== Transcoding: Buffer -> Opus OGG (24 kbps, mono, 16 kHz) with timeout ======
-async function transcodeToOpus(inputBuffer, { timeoutMs = 180000 } = {}) {
-  if (!ffmpegPath) throw new Error("ffmpeg not available (ffmpeg-static missing)");
-  return new Promise((resolve, reject) => {
-    const args = [
-      "-hide_banner", "-loglevel", "error",
-      "-i", "pipe:0",
-      "-vn",          // no video
-      "-ac", "1",     // mono
-      "-ar", "16000", // 16 kHz
-      "-c:a", "libopus",
-      "-b:a", "24k",  // 24 kbps
-      "-f", "ogg",
-      "pipe:1",
-    ];
-    const ff = spawn(ffmpegPath, args, { stdio: ["pipe", "pipe", "pipe"] });
-    const chunks = [];
-    let errData = "";
-    const timer = setTimeout(() => {
-      errData += `\n[timeout] exceeded ${timeoutMs}ms — killing ffmpeg`;
-      try { ff.kill("SIGKILL"); } catch {}
-    }, timeoutMs);
-
-    ff.stdout.on("data", (d) => chunks.push(d));
-    ff.stderr.on("data", (d) => (errData += d.toString()));
-    ff.on("close", (code) => {
-      clearTimeout(timer);
-      if (code === 0) return resolve(Buffer.concat(chunks));
-      reject(new Error(`ffmpeg failed code ${code}: ${errData.slice(0, 2000)}`)); // cap stderr in logs
-    });
-
-    ff.stdin.on("error", (e) => {
-      clearTimeout(timer);
-      reject(e);
-    });
-    ff.stdin.end(inputBuffer);
+  // write inference
+  await fetch(`https://api.hubapi.com/crm/v3/objects/calls/${callId}`, {
+    method: "PATCH",
+    headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      properties: {
+        ai_inferred_call_type: typeLabel,
+        ai_call_type_confidence: String(confidence),
+      },
+    }),
   });
-}
 
-// ====== Whisper transcription (OpenAI) ======
-async function transcribeAudioWithOpenAI(buffer, filename, mimeType = "audio/mpeg") {
-  const form = new FormData();
-  const blob = new Blob([buffer], { type: mimeType });
-  form.append("file", blob, filename);
-  form.append("model", "whisper-1");
-  form.append("response_format", "text");
-
-  const resp = await fetchWithRetry(() =>
-    fetch("https://api.openai.com/v1/audio/transcriptions", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
-      body: form,
-    })
-  );
-  return await resp.text();
-}
-
-// ====== GPT analysis (your approved prompts) ======
-async function analyseTranscriptWithOpenAI(transcript) {
-  const enforceSSAS = (t) => String(t || "").replace(/\bsaas\b/gi, "SSAS");
-
-  const PROMPT_SALES_PERF_SUMMARY =
-    'You are evaluating a sales call transcript against this scorecard:\n\n' +
-    'Opening & Rapport\n' +
-    '1. Clear, professional intro?\n' +
-    '2. Early rapport/trust attempt?\n\n' +
-    'Discovery & Qualification\n' +
-    '3. Open-ended question to understand needs?\n' +
-    '4. Identified pain/opportunity re: corp/business tax/inheritance tax or loaning money to prospect’s business?\n\n' +
-    'Value Positioning\n' +
-    '5. Explained firm’s services clearly and simply?\n' +
-    '6. Connected benefits to client’s specific needs?\n\n' +
-    'Handling Concerns\n' +
-    '7. Active listening and acknowledged concerns/questions?\n' +
-    '8. Clear, confident responses (follow-up if needed)?\n\n' +
-    'Closing & Next Steps\n' +
-    '9. Asked for a commitment (next meeting/docs/proposal)?\n' +
-    '10. Confirmed clear next steps\n\n' +
-    'Return a short plain text summary in bullet points.\n\n' +
-    'Rules:\n' +
-    '- Maximum of 4 bullets total.\n' +
-    '- Prioritise "Areas to improve" if more important.\n' +
-    '- Each bullet ≤10 words.\n' +
-    '- Use this exact format (plain text, no JSON, no arrays):\n\n' +
-    'What went well:\n' +
-    '- [bullet(s)]\n\n' +
-    'Areas to improve:\n' +
-    '- [bullet(s)]\n';
-
-  const PROMPT_SALES_PERF_RATING =
-    'EVALUATE THE CONSULTANT USING THIS DETERMINISTIC RUBRIC:\n\n' +
-    'For each of the 10 criteria below, assign:\n' +
-    '- 1 = clearly met (explicit evidence in transcript)\n' +
-    '- 0.5 = partially met (some evidence but incomplete)\n' +
-    '- 0 = not met / absent / ambiguous\n\n' +
-    'Criteria (same order):\n' +
-    '1) Clear, professional intro\n' +
-    '2) Early rapport/trust attempt\n' +
-    '3) At least one open-ended question for needs\n' +
-    '4) Pain/opportunity relevant to corp/business tax/IHT/funding identified\n' +
-    '5) Services explained clearly, simply\n' +
-    '6) Benefits connected to client’s specific needs\n' +
-    '7) Active listening & acknowledgment of concerns\n' +
-    '8) Clear, confident responses (or committed follow-up)\n' +
-    '9) Asked for a commitment (next meeting/docs/proposal)\n' +
-    '10) Confirmed clear next steps\n\n' +
-    'SCORE = sum of the 10 items (0..10 in 0.5 increments), then round to nearest integer (0.5 rounds up). If final <1, output 1.\n\n' +
-    'Output ONLY the integer 1..10 (no words).\n';
-
-  const PROMPT_LIKELIHOOD_SCORE =
-    'EVALUATE LIKELIHOOD TO PROCEED USING THIS DETERMINISTIC RUBRIC (0..10):\n\n' +
-    'Signals and weights:\n' +
-    'A) Explicit interest in TLPI services (0..3)\n' +
-    'B) Pain/urgency/motivation (0..3)\n' +
-    'C) Engagement/detail & responsiveness (0..2)\n' +
-    'D) Next-step commitment (0..2)\n\n' +
-    'SCORE = A+B+C+D. Clamp to 1..10 (if 0, output 1). Output ONLY the integer (no words).\n' +
-    'Consider only transcript evidence.\n';
-
-  const PROMPT_SCORE_REASONING =
-    'Apply the same likelihood rubric you just used and explain WHY the chosen score fits the transcript.\n\n' +
-    'Output RULES:\n' +
-    '- 3–5 short bullets (≤12 words each)\n' +
-    '- Mention both positive and negative signals where relevant\n' +
-    '- Each bullet must reference concrete transcript evidence (no generic language)\n';
-
-  const PROMPT_SUGGESTIONS =
-    'Provide transcript-specific suggestions to increase conversion at the Zoom stage.\n\n' +
-    'STRICT RULES:\n' +
-    '- EXACTLY 3 bullets\n' +
-    '- Each bullet ≤12 words\n' +
-    '- Start with an imperative verb (e.g., "Quantify", "Confirm", "Show", "Send", "Prepare")\n' +
-    '- Tie each bullet to specific statements/concerns in the transcript\n' +
-    '- No generic coaching unless explicitly indicated by transcript\n' +
-    '- Plain text bullets only (no sub-bullets, no numbering)\n';
-
-  const systemMsg =
-    'You are TLPI’s transcript analysis bot. Follow rubrics exactly. ' +
-    'Use the following glossary strictly: "SSAS" refers to Small Self-Administered Scheme. ' +
-    'Never write "saas" (software as a service). Always use "SSAS". ' +
-    'Return ONLY valid JSON. No extra text.';
-
-  const userMsg =
-    'You will analyze ONE transcript and produce FIVE outputs as if each prompt were run separately.\n' +
-    'Base everything ONLY on the transcript. Keep outputs concise. Follow the rubrics exactly for consistent scoring.\n' +
-    'Glossary: Always use "SSAS" (Small Self-Administered Scheme); never "saas".\n\n' +
-    'Transcript:\n' + enforceSSAS(transcript) + '\n\n' +
-    'Return ONLY valid JSON with EXACT keys:\n' +
-    '{\n' +
-    '  "likeliness_to_proceed_score": <integer 1-10>,\n' +
-    '  "score_reasoning": ["<bullet>", "<bullet>", "<bullet>"],\n' +
-    '  "increase_likelihood_of_sale_suggestions": ["<bullet>", "<bullet>", "<bullet>"],\n' +
-    '  "sales_performance": <integer 1-10>,\n' +
-    '  "sales_performance_summary": "<plain text with \'What went well\' and \'Areas to improve\' bullets; no JSON>"\n' +
-    '}\n\n' +
-    '- likeliness_to_proceed_score:\n' + PROMPT_LIKELIHOOD_SCORE + '\n\n' +
-    '- score_reasoning:\n' + PROMPT_SCORE_REASONING + '\n\n' +
-    '- increase_likelihood_of_sale_suggestions:\n' + PROMPT_SUGGESTIONS + '\n\n' +
-    '- sales_performance:\n' + PROMPT_SALES_PERF_RATING + '\n\n' +
-    '- sales_performance_summary:\n' + PROMPT_SALES_PERF_SUMMARY + '\n\n' +
-    'Rules:\n' +
-    '- "likeliness_to_proceed_score" and "sales_performance" MUST be integers 1..10 (no words).\n' +
-    '- "score_reasoning" MUST be 3–5 short bullets (list/array).\n' +
-    '- "increase_likelihood_of_sale_suggestions" MUST be EXACTLY 3 bullets (list/array).\n' +
-    '- "sales_performance_summary" MUST be plain text in the specified format (no JSON).\n' +
-    '- Do not invent details; use only transcript evidence.\n';
-
-  const resp = await fetchWithRetry(() =>
-    fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: "gpt-4o-mini",
-        response_format: { type: "json_object" },
-        temperature: 0.1,
-        messages: [{ role: "system", content: systemMsg }, { role: "user", content: userMsg }],
-      }),
-    })
-  );
-
-  const data = await resp.json();
-  const content = data?.choices?.[0]?.message?.content || "{}";
-
-  let out; try { out = JSON.parse(content); } catch { out = {}; }
-  const clean = (x) => String(x || "").trim();
-  const toBullets = (v) => Array.isArray(v) ? v.join(" • ") : clean(v);
-
-  return {
-    chat_gpt___likeliness_to_proceed_score: clean(out.likeliness_to_proceed_score || 5),
-    chat_gpt___score_reasoning: toBullets(out.score_reasoning),
-    chat_gpt___increase_likelihood_of_sale_suggestions: toBullets(out.increase_likelihood_of_sale_suggestions),
-    chat_gpt___sales_performance: clean(out.sales_performance || 5),
-    sales_performance_summary: clean(out.sales_performance_summary),
-  };
-}
-
-async function updateHubSpotCall(callId, propertiesMap) {
-  const url = `https://api.hubapi.com/crm/v3/objects/calls/${encodeURIComponent(callId)}`;
-  await fetchWithRetry(() =>
-    fetch(url, {
+  if (confidence >= 75) {
+    console.log("[type] promoting to hs_activity_type");
+    await fetch(`https://api.hubapi.com/crm/v3/objects/calls/${callId}`, {
       method: "PATCH",
       headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ properties: propertiesMap }),
-    })
-  );
+      body: JSON.stringify({ properties: { hs_activity_type: typeLabel } }),
+    });
+  }
+
+  return typeLabel;
 }
 
-async function isAlreadyProcessed(callId) {
+// =============================================================
+// ---- ANALYSIS LOGIC ----
+// =============================================================
+
+async function analyseCall(typeLabel, transcript) {
+  const system =
+    "You are TLPI’s call analysis bot. Follow rubrics strictly. Output JSON only.";
+
+  const basePrompts = {
+    "Qualification call": "Analyse sales discovery performance and output the 10 qualification metrics, 1–10 score, reasoning, objections, and suggestions.",
+    "Initial Consultation": "Analyse consultation delivery, tax discussion clarity, application data capture, objections, and closing behaviour.",
+    "Follow up call": "Analyse follow-up performance, remaining objections, likelihood to close, and next-step quality.",
+    "Application meeting": "List key client data captured, missing information, and next steps.",
+    "Strategy call": "Summarise focus areas, recommendations, and engagement level.",
+    "Annual Review": "Summarise satisfaction level, achievements, and improvement areas.",
+    "Existing customer call": "Detect sentiment, complaints, escalation need, and notes.",
+    Other: "General call summary and sentiment.",
+  };
+
+  const user =
+    `Call Type: ${typeLabel}\n\nTranscript:\n${transcript}\n\nReturn strict JSON.` +
+    "Do not output explanations.";
+
+  const r = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "gpt-4o-mini",
+      temperature: 0.2,
+      response_format: { type: "json_object" },
+      messages: [{ role: "system", content: system }, { role: "user", content: basePrompts[typeLabel] + "\n" + user }],
+    }),
+  });
+
+  const j = await r.json();
   try {
-    const params = new URLSearchParams({ properties: TARGET_PROPS.join(",") });
-    const resp = await fetch(`https://api.hubapi.com/crm/v3/objects/calls/${callId}?${params}`, {
-      headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` },
-    });
-    if (!resp.ok) return false;
-    const json = await resp.json();
-    const p = json?.properties || {};
-    return TARGET_PROPS.some((k) => {
-      const v = p[k];
-      return v != null && String(v).trim() !== "";
-    });
+    return JSON.parse(j?.choices?.[0]?.message?.content || "{}");
   } catch {
-    return false;
+    return {};
   }
 }
 
-// ====== Small text helper ======
-function enforceSSAS(text) { return String(text || "").replace(/\bsaas\b/gi, "SSAS"); }
+// ---- HubSpot patch ----
+async function updateHubSpotCall(callId, properties) {
+  const url = `https://api.hubapi.com/crm/v3/objects/calls/${callId}`;
+  const r = await fetch(url, {
+    method: "PATCH",
+    headers: {
+      Authorization: `Bearer ${HUBSPOT_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ properties }),
+  });
+  if (!r.ok) throw new Error(`HubSpot update failed: ${r.status} ${await r.text()}`);
+}
 
-// ====== Start ======
+// =============================================================
+// ---- MAIN ENDPOINT ----
+// =============================================================
+
+app.post("/process-call", async (req, res) => {
+  try {
+    const props = req.body?.properties || {};
+    const callId = props.hs_object_id?.value || props.hs_object_id || req.body.objectId;
+    const recordingUrl = props.hs_call_recording_url?.value || props.hs_call_recording_url;
+    if (!recordingUrl || !callId) return res.status(400).send("Missing recordingUrl or callId");
+
+    console.log("resolved recordingUrl:", recordingUrl);
+    console.log("resolved callId:", callId);
+
+    // Background process
+    setImmediate(async () => {
+      try {
+        const filePath = await downloadRecording(recordingUrl, callId);
+        const transcript = await transcribeAudio(filePath);
+        const typeLabel = await resolveCallTypeWithGrace(callId, transcript);
+        const analysis = await analyseCall(typeLabel, transcript);
+
+        // Merge common fields + specific ones
+        const updates = {
+          ai_objections_bullets: (analysis.objections || []).join(" • "),
+          ai_primary_objection: analysis.primary_objection || "",
+          ai_objection_severity: analysis.objection_severity || "",
+        };
+
+        // Example per-type handling
+        if (typeLabel === "Qualification call" && analysis.metrics) {
+          // push to scorecard example fields
+          await updateHubSpotCall(callId, updates);
+          // future: create Sales Scorecard record with metrics
+        } else {
+          await updateHubSpotCall(callId, updates);
+        }
+
+        console.log(`✅ [bg] Done ${callId}`);
+      } catch (err) {
+        console.error(`❗ [bg] Error ${err}`);
+      }
+    });
+
+    res.status(200).send("Processing");
+  } catch (err) {
+    console.error("Error in /process-call:", err);
+    res.status(500).send("Internal error");
+  }
+});
+
+// ---- start ----
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`AI Call Worker listening on :${PORT}`));
