@@ -7,7 +7,7 @@ dotenv.config();
 const HUBSPOT_TOKEN = process.env.HUBSPOT_TOKEN || process.env.HUBSPOT_API_KEY;
 const HS_BASE = "https://api.hubapi.com";
 
-// Your custom object
+// Custom Scorecard object
 const SCORECARD_OBJECT = process.env.HUBSPOT_SCORECARD_OBJECT || "p49487487_sales_scorecards";
 
 if (!HUBSPOT_TOKEN) console.warn("[cfg] HUBSPOT_TOKEN missing — HubSpot updates will fail.");
@@ -45,11 +45,11 @@ export async function getAssociations(fromId, toType) {
 export async function updateCall(callId, analysis) {
   const props = {};
 
-  // Body summary (default if empty)
+  // SUMMARY: use hs_call_summary (this is what HubSpot renders on the call)
   const summaryStr = arrayToBullets(analysis?.summary, "• ") || "No summary generated.";
-  props.hs_call_body = summaryStr.slice(0, 5000);
+  props.hs_call_summary = summaryStr.slice(0, 5000);
 
-  // Inferred call type + confidence (default confidence if inferred)
+  // Inferred call type + confidence
   const inferredType = normaliseCallType(analysis?.call_type);
   if (inferredType) props.ai_inferred_call_type = inferredType;
 
@@ -58,7 +58,7 @@ export async function updateCall(callId, analysis) {
   if (conf != null) props.ai_call_type_confidence = conf;
   if (inferredType && conf >= 75) props.hs_activity_type = inferredType;
 
-  // Objections (text fields get defaults; dropdown severity only when we have objections)
+  // Objections (text fields defaulted so nothing looks blank)
   const objections = ensureArray(analysis?.objections);
   if (objections.length) {
     props.ai_objections_bullets = objections.join(" • ").slice(0, 5000);
@@ -67,21 +67,20 @@ export async function updateCall(callId, analysis) {
     props.ai_objection_categories = mapObjectionCategories(objections).join("; ") || "Not mentioned.";
     props.ai_objection_severity = analysis?.ai_objection_severity
       ? normaliseSeverity(analysis.ai_objection_severity)
-      : "Medium"; // safe default when objections exist
+      : "Medium"; // default when objections exist
   } else {
-    // Defaults when no objections
     props.ai_objections_bullets = "No objections mentioned.";
     props.ai_primary_objection = "None.";
     props.ai_key_objections = "None.";
     props.ai_objection_categories = "None.";
-    // Do NOT set severity to avoid guessing a dropdown value when none exist
+    // don't set severity if there are none
   }
 
-  // Product interest (dropdown — only set if unambiguous)
+  // Product interest (dropdown only if clear)
   const productInterest = mapProductInterest(analysis?.key_details?.products_discussed);
   if (productInterest) props.ai_product_interest = productInterest;
 
-  // Data points captured (derive or default)
+  // Data points captured (or default)
   const kd = analysis?.key_details || {};
   const dp = [];
   if (kd.client_name) dp.push(`Client: ${kd.client_name}`);
@@ -90,10 +89,8 @@ export async function updateCall(callId, analysis) {
   if (kd.timeline) dp.push(`Timeline: ${kd.timeline}`);
   props.ai_data_points_captured = (dp.length ? dp.join("\n") : "Not mentioned.");
 
-  // Missing information (text default)
+  // Missing info & decision criteria (derive or default)
   props.ai_missing_information = toMultiline(analysis?.ai_missing_information) || "Not mentioned.";
-
-  // Decision criteria (derive or default)
   let decisionCriteria = toMultiline(analysis?.ai_decision_criteria);
   if (!decisionCriteria) {
     const crit = inferDecisionCriteriaFromSummary(analysis?.summary || []);
@@ -101,23 +98,22 @@ export async function updateCall(callId, analysis) {
   }
   props.ai_decision_criteria = decisionCriteria.slice(0, 1000);
 
-  // Recommendations provided (from materials or default)
+  // Recommendations provided
   if (Array.isArray(analysis?.materials_to_send) && analysis.materials_to_send.length) {
     props.ai_recommendations_provided = analysis.materials_to_send.join("; ").slice(0, 5000);
   } else {
     props.ai_recommendations_provided = "None promised.";
   }
 
-  // Sentiment / engagement / complaint / escalation (dropdowns: set only safe values)
+  // Sentiment/engagement/complaint/escalation (safe defaults)
   const sentiment = normaliseSentiment(analysis?.ai_customer_sentiment || analysis?.outcome) || "Neutral";
   props.ai_customer_sentiment = sentiment;
   props.ai_client_engagement_level = sentimentToEngagement(sentiment);
-
   props.ai_complaint_detected = normaliseYesNoUnclear(analysis?.ai_complaint_detected || "No");
   props.ai_escalation_required = normaliseEscalation(analysis?.ai_escalation_required || "No");
   props.ai_escalation_notes = toMultiline(analysis?.ai_escalation_notes) || "No escalation required.";
 
-  // Type-specific fields
+  // Type-specific
   if (inferredType === "Initial Consultation") {
     if (typeof analysis?.likelihood_to_close === "number") {
       props.ai_consultation_likelihood_to_close = clamp(Math.max(1, Math.round(analysis.likelihood_to_close / 10)), 1, 10);
@@ -139,24 +135,33 @@ export async function updateCall(callId, analysis) {
     if (typeof analysis?.likelihood_to_close === "number") {
       props.ai_follow_up_close_likelihood = clamp(Math.max(1, Math.round(analysis.likelihood_to_close / 10)), 1, 10);
     }
-    if (Array.isArray(analysis?.materials_to_send) && analysis.materials_to_send.length) {
-      props.ai_follow_up_required_materials = analysis.materials_to_send.join("; ").slice(0, 5000);
-    } else {
-      props.ai_follow_up_required_materials = "No materials required.";
-    }
-    if (objections.length) {
-      props.ai_follow_up_objections_remaining = objections.join("; ").slice(0, 1000);
-    } else {
-      props.ai_follow_up_objections_remaining = "No objections remaining.";
-    }
-    if (Array.isArray(analysis?.next_actions) && analysis.next_actions.length) {
-      props.ai_next_steps = analysis.next_actions.join("; ").slice(0, 5000);
-    } else {
-      props.ai_next_steps = "No next steps captured.";
-    }
+    props.ai_follow_up_required_materials = (Array.isArray(analysis?.materials_to_send) && analysis.materials_to_send.length)
+      ? analysis.materials_to_send.join("; ").slice(0, 5000)
+      : "No materials required.";
+    props.ai_follow_up_objections_remaining = objections.length
+      ? objections.join("; ").slice(0, 1000)
+      : "No objections remaining.";
+    props.ai_next_steps = (Array.isArray(analysis?.next_actions) && analysis.next_actions.length)
+      ? analysis.next_actions.join("; ").slice(0, 5000)
+      : "No next steps captured.";
   }
 
-  await hubspotPatch(`crm/v3/objects/calls/${encodeURIComponent(callId)}`, { properties: props });
+  const patchResp = await hubspotPatch(`crm/v3/objects/calls/${encodeURIComponent(callId)}`, { properties: props });
+
+  // DEBUG: read back the key fields so we know they saved
+  try {
+    const echo = await getHubSpotObject("calls", callId, ["ai_inferred_call_type","ai_call_type_confidence","hs_activity_type","hs_call_summary"]);
+    console.log("[debug] Call after update:", {
+      hs_call_summary: echo?.properties?.hs_call_summary,
+      ai_inferred_call_type: echo?.properties?.ai_inferred_call_type,
+      ai_call_type_confidence: echo?.properties?.ai_call_type_confidence,
+      hs_activity_type: echo?.properties?.hs_activity_type,
+    });
+  } catch (e) {
+    console.warn("[debug] Could not re-read call:", e.message);
+  }
+
+  return patchResp;
 }
 
 /* ============ Create Scorecard & associate ============ */
@@ -169,8 +174,14 @@ export async function createScorecard(analysis, { callId, contactIds = [], dealI
   const props = {
     activity_type: callType,
     activity_name: activityName,
-    sales_scorecard___what_you_can_improve_on: buildCoachingNotes(analysis),
-    sales_performance_rating_: toScoreOutOf10OrNull(analysis?.scorecard?.overall),
+    hubspot_owner_id: ownerId || undefined, // copy owner to scorecard
+    // coaching + rating (use model output if present; else fallbacks)
+    sales_scorecard___what_you_can_improve_on:
+      (analysis?.sales_performance_summary && String(analysis.sales_performance_summary).slice(0, 9000))
+      || buildCoachingNotes(analysis),
+    sales_performance_rating_:
+      (toNumberOrNull(analysis?.sales_performance_rating)) ??
+      toScoreOutOf10OrNull(analysis?.scorecard?.overall),
 
     // Mirrors (with safe defaults)
     ai_next_steps: Array.isArray(analysis?.next_actions) && analysis.next_actions.length
@@ -190,9 +201,15 @@ export async function createScorecard(analysis, { callId, contactIds = [], dealI
     })(),
   };
 
+  // Initial Consultation: optional likelihood mapping
   if (callType === "Initial Consultation" && typeof analysis?.likelihood_to_close === "number") {
     props.ai_consultation_likelihood_to_close = clamp(Math.max(1, Math.round(analysis.likelihood_to_close / 10)), 1, 10);
   }
+
+  // NOTE: Your Scorecard currently exposes fields like:
+  //   consult_purpose_clearly_stated, consult_needs_pain_uncovered, consult_specific_tax_estimate_given, ...
+  // These are different from the c1..c20 names I expected.
+  // I will ONLY populate these once you confirm the exact mapping (see Step 3 below).
 
   const created = await hubspotPost(`crm/v3/objects/${encodeURIComponent(SCORECARD_OBJECT)}`, { properties: props });
   const scoreId = created?.id;
@@ -355,6 +372,8 @@ function mapConsultationOutcome(outcome){ const s=String(outcome||"").toLowerCas
   if (s.includes("negative") || s.includes("lost") || s.includes("no")) return "Not proceeding";
   return "Monitor";
 }
+
+function normaliseSeverity(v){const s=String(v||"").toLowerCase(); if(s.startsWith("h"))return"High"; if(s.startsWith("m"))return"Medium"; if(s.startsWith("l"))return"Low"; return undefined;}
 
 function mapObjectionCategories(objs){ const cats=new Set();
   const text=ensureArray(objs).join(" ").toLowerCase();
