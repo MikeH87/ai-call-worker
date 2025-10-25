@@ -1,123 +1,90 @@
 // index.js
-// TLPI AI Call Worker v4.1 (modular + parallel Whisper)
+// Main entry point for AI Call Worker
+// Modular structure with clean imports for analysis, transcription, and HubSpot sync
 
 import express from "express";
-import { downloadRecording, ensureAudio } from "./ai/transcribe.js";
-import { analyseTranscript, transcribeFile } from "./ai/analyse.js";
-import { getCombinedPrompt } from "./ai/getCombinedPrompt.js";
+import bodyParser from "body-parser";
+import dotenv from "dotenv";
+
+import { transcribeFile, analyseTranscript } from "./ai/analyse.js";
 import { transcribeAudioParallel } from "./ai/parallelTranscribe.js";
-import { updateHubSpotObject, getHubSpotObject, getAssociations } from "./hubspot/hubspot.js";
-import { createScorecard } from "./hubspot/scorecard.js";
+import { getCombinedPrompt } from "./ai/getCombinedPrompt.js";
 
+import { createScorecard, updateCall, getHubSpotObject, getAssociations } from "./hubspot/hubspot.js";
+
+dotenv.config();
 const app = express();
-app.use(express.json({ limit: "50mb" }));
+app.use(bodyParser.json());
 
-const PORT = process.env.PORT || 10000;
+app.get("/", (req, res) => {
+  res.send("AI Call Worker v4.x modular running ✅");
+});
 
-// Small helper: yyyy-mm-dd
-function ymd(d) {
-  const dt = new Date(d);
-  const p = (n) => String(n).padStart(2, "0");
-  return `${dt.getFullYear()}-${p(dt.getMonth() + 1)}-${p(dt.getDate())}`;
-}
-
-// Normalise HubSpot dropdown capitalisation
-const normaliseOutcome = (v) => {
-  const map = {
-    "proceed now": "Proceed now",
-    "likely": "Likely",
-    "unclear": "Unclear",
-    "not now": "Not now",
-    "no fit": "No fit",
-  };
-  return map[(v || "").trim().toLowerCase()] || "";
-};
-
+/**
+ * Core webhook endpoint from HubSpot
+ * Triggered when a new call recording is available
+ */
 app.post("/process-call", async (req, res) => {
   try {
-    const b = req.body || {};
-    const props = b.properties || {};
-    const callId = props.hs_object_id?.value || props.hs_object_id || b.objectId;
-    const recUrl = props.hs_call_recording_url?.value || props.hs_call_recording_url;
-    const ts = Number(props.hs_timestamp?.value || props.hs_timestamp || Date.now());
-    const typeLabel = props.hs_activity_type?.value || props.hs_activity_type || "Initial Consultation";
+    const { callId, recordingUrl } = req.body;
+    console.log(`[bg] Downloading: ${recordingUrl}`);
 
-    if (!callId || !recUrl) return res.status(400).send("Missing data");
-    res.status(200).send("Processing");
+    res.status(200).send({ ok: true, callId });
 
-    // Background work
-    setImmediate(async () => {
-      try {
-        console.log(`[bg] Downloading: ${recUrl}`);
-        const src = await downloadRecording(recUrl, callId);
-        const mp3 = await ensureAudio(src, callId);
+    // === 1. Transcribe ===
+    console.log("[bg] Transcribing in parallel (segment=120s, concurrency=4)…");
+    const transcript = await transcribeAudioParallel(
+      "./tmp/audio.mp3",
+      callId
+    );
 
-        // PARALLEL TRANSCRIPTION (uses robust retries inside transcribeFile)
-        const seg = Number(process.env.WHISPER_SEGMENT_SECONDS ?? 120); // 2 min chunks by default
-        const cc  = Number(process.env.WHISPER_CONCURRENCY ?? 4);       // 4 concurrent uploads by default
-        console.log(`[bg] Transcribing in parallel (segment=${seg}s, concurrency=${cc})…`);
-        const transcript = await transcribeAudioParallel(mp3, callId, { segmentSeconds: seg, concurrency: cc });
+    // === 2. Analyse ===
+    console.log("[bg] Transcription done, analysing...");
+    const callInfo = await getHubSpotObject("calls", callId, [
+      "hubspot_owner_id",
+      "hs_activity_type",
+    ]);
+    const typeLabel = callInfo?.properties?.hs_activity_type || "Unknown";
 
-        console.log("[bg] Analysing…");
-        const analysis = await aiAnalyse(transcript, typeLabel);
-        console.log("[ai] analysis:", analysis);
+    const analysis = await analyseTranscript(typeLabel, transcript);
+    console.log("[ai] analysis:", analysis);
 
-        // Write back to the Call (Initial Consultation layer fields included)
-        const callUpdates = {
-          ai_consultation_outcome: normaliseOutcome(analysis.ai_consultation_outcome),
-          ai_decision_criteria: analysis.ai_decision_criteria || "",
-          ai_key_objections: analysis.ai_key_objections || "",
-          ai_consultation_likelihood_to_close: String(analysis.ai_consultation_likelihood_to_close || 0),
-          ai_next_steps: analysis.ai_next_steps || "",
-          ai_consultation_required_materials: analysis.ai_consultation_required_materials || "",
-          ai_product_interest: analysis.ai_product_interest || "",
-          ai_data_points_captured: (analysis.ai_data_points_captured || []).join(" • "),
-          ai_missing_information: (analysis.ai_missing_information || []).join(" • "),
-        };
-        await updateHubSpotObject("calls", callId, callUpdates);
+    // === 3. Fetch associations ===
+    const ownerId = callInfo?.properties?.hubspot_owner_id;
+    const contactIds = await getAssociations(callId, "contacts");
+    const dealIds = await getAssociations(callId, "deals");
+    console.log("[assoc]", { callId, contactIds, dealIds, ownerId });
 
-        // Get owner + associations
-        const callInfo = await getHubSpotObject("calls", callId, ["hubspot_owner_id"]);
-        const ownerId = callInfo?.properties?.hubspot_owner_id;
-        const contactIds = await getAssociations(callId, "contacts");
-        const dealIds = await getAssociations(callId, "deals");
-        console.log("[assoc]", { callId, contactIds, dealIds, ownerId });
+    // === 4. Update HubSpot objects ===
+    try {
+      await updateCall(callId, analysis);
+    } catch (err) {
+      console.warn("[warn] updateCall failed:", err.message);
+    }
 
-        // Create the Sales Scorecard (mirror same fields)
-        await createScorecard(callUpdates, {
-          callId,
-          contactIds,
-          dealIds,
-          ownerId,
-          typeLabel,
-          timestamp: ts,
-        });
+    try {
+      await createScorecard(analysis, { callId, contactIds, dealIds, ownerId });
+    } catch (err) {
+      console.warn("[warn] createScorecard failed:", err);
+    }
 
-        console.log(`✅ Done ${callId}`);
-      } catch (err) {
-        console.error("❌ Background error:", err);
-      }
-    });
+    console.log(`✅ Done ${callId}`);
   } catch (err) {
-    console.error("❌ Main error:", err);
-    res.status(500).send("Internal error");
+    console.error("❌ Background error:", err);
   }
 });
 
-// ----------------------------------------------------
-// DEBUG: See the exact combined prompt (no OpenAI call)
-// ----------------------------------------------------
-app.post("/debug-prompt", (req, res) => {
-  try {
-    const { callType = "Initial Consultation", transcript = "(sample transcript here)" } = req.body || {};
-    const prompt = getCombinedPrompt(callType, transcript);
-    console.log("[debug-prompt]", { callType });
-    console.log("----- COMBINED PROMPT START -----\n" + prompt + "\n----- COMBINED PROMPT END -----");
-    res.status(200).json({ callType, prompt });
-  } catch (e) {
-    console.error("debug-prompt error:", e);
-    res.status(500).json({ error: e.message });
-  }
+/**
+ * Debug endpoint to test prompts locally
+ */
+app.post("/debug-prompt", async (req, res) => {
+  const { callType, transcript } = req.body;
+  const prompt = await getCombinedPrompt(callType, transcript);
+  res.send({ callType, prompt });
 });
 
-app.listen(PORT, () => console.log(`AI Call Worker v4.1 modular+parallel running on :${PORT}`));
+// === Start server ===
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => {
+  console.log(`AI Call Worker listening on :${PORT}`);
+});
