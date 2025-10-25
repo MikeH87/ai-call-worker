@@ -7,18 +7,16 @@ dotenv.config();
 const HUBSPOT_TOKEN = process.env.HUBSPOT_TOKEN || process.env.HUBSPOT_API_KEY;
 const HS_BASE = "https://api.hubapi.com";
 
-// Your custom object (from your dump)
+// Your custom object
 const SCORECARD_OBJECT = process.env.HUBSPOT_SCORECARD_OBJECT || "p49487487_sales_scorecards";
 
-if (!HUBSPOT_TOKEN) {
-  console.warn("[cfg] HUBSPOT_TOKEN missing — HubSpot updates will fail.");
-}
+if (!HUBSPOT_TOKEN) console.warn("[cfg] HUBSPOT_TOKEN missing — HubSpot updates will fail.");
 
 function hsHeaders() {
   return { Authorization: `Bearer ${HUBSPOT_TOKEN}`, "Content-Type": "application/json" };
 }
 
-/* ========== Reads ========== */
+/* ====================== Reads ====================== */
 export async function getHubSpotObject(objectType, id, properties = []) {
   const params = new URLSearchParams();
   if (properties?.length) params.set("properties", properties.join(","));
@@ -43,64 +41,98 @@ export async function getAssociations(fromId, toType) {
   return js?.results?.map(r => r?.toObjectId).filter(Boolean) || [];
 }
 
-/* ========== Update Call (maps to your listed ai_* fields) ========== */
+/* =================== Update Call =================== */
 export async function updateCall(callId, analysis) {
   const props = {};
 
-  // Summary to body
-  const summaryStr = arrayToBullets(analysis?.summary, "• ");
-  if (summaryStr) props.hs_call_body = summaryStr.slice(0, 5000);
+  // Body summary (default if empty)
+  const summaryStr = arrayToBullets(analysis?.summary, "• ") || "No summary generated.";
+  props.hs_call_body = summaryStr.slice(0, 5000);
 
-  // Inferred call type + confidence
+  // Inferred call type + confidence (default confidence if inferred)
   const inferredType = normaliseCallType(analysis?.call_type);
   if (inferredType) props.ai_inferred_call_type = inferredType;
 
-  const conf = toNumberOrNull(analysis?.ai_call_type_confidence ?? analysis?.call_type_confidence);
-  if (conf != null) props.ai_call_type_confidence = clamp(conf, 0, 100);
-  if (inferredType && (props.ai_call_type_confidence ?? 0) >= 75) {
-    props.hs_activity_type = inferredType;
-  }
+  const explicitConf = toNumberOrNull(analysis?.ai_call_type_confidence ?? analysis?.call_type_confidence);
+  const conf = explicitConf != null ? clamp(explicitConf, 0, 100) : (inferredType ? 85 : null);
+  if (conf != null) props.ai_call_type_confidence = conf;
+  if (inferredType && conf >= 75) props.hs_activity_type = inferredType;
 
-  // Objections
+  // Objections (text fields get defaults; dropdown severity only when we have objections)
   const objections = ensureArray(analysis?.objections);
   if (objections.length) {
     props.ai_objections_bullets = objections.join(" • ").slice(0, 5000);
     props.ai_primary_objection = objections[0].slice(0, 500);
+    props.ai_key_objections = objections.join("; ").slice(0, 1000);
+    props.ai_objection_categories = mapObjectionCategories(objections).join("; ") || "Not mentioned.";
+    props.ai_objection_severity = analysis?.ai_objection_severity
+      ? normaliseSeverity(analysis.ai_objection_severity)
+      : "Medium"; // safe default when objections exist
+  } else {
+    // Defaults when no objections
+    props.ai_objections_bullets = "No objections mentioned.";
+    props.ai_primary_objection = "None.";
+    props.ai_key_objections = "None.";
+    props.ai_objection_categories = "None.";
+    // Do NOT set severity to avoid guessing a dropdown value when none exist
   }
-  if (analysis?.ai_objection_severity) props.ai_objection_severity = normaliseSeverity(analysis.ai_objection_severity);
 
-  // Product Interest from products_discussed
+  // Product interest (dropdown — only set if unambiguous)
   const productInterest = mapProductInterest(analysis?.key_details?.products_discussed);
   if (productInterest) props.ai_product_interest = productInterest;
 
-  // Optional extras if present in your prompts/models
-  if (analysis?.ai_data_points_captured) props.ai_data_points_captured = toMultiline(analysis.ai_data_points_captured);
-  if (analysis?.ai_missing_information)  props.ai_missing_information  = toMultiline(analysis.ai_missing_information);
+  // Data points captured (derive or default)
+  const kd = analysis?.key_details || {};
+  const dp = [];
+  if (kd.client_name) dp.push(`Client: ${kd.client_name}`);
+  if (kd.company_name) dp.push(`Company: ${kd.company_name}`);
+  if (Array.isArray(kd.products_discussed) && kd.products_discussed.length) dp.push(`Products: ${kd.products_discussed.join(", ")}`);
+  if (kd.timeline) dp.push(`Timeline: ${kd.timeline}`);
+  props.ai_data_points_captured = (dp.length ? dp.join("\n") : "Not mentioned.");
 
-  // Sentiment / complaint / escalation if present or derivable
-  const sentiment = normaliseSentiment(analysis?.ai_customer_sentiment || analysis?.outcome);
-  if (sentiment) props.ai_customer_sentiment = sentiment;
+  // Missing information (text default)
+  props.ai_missing_information = toMultiline(analysis?.ai_missing_information) || "Not mentioned.";
 
-  if (analysis?.ai_complaint_detected) props.ai_complaint_detected = normaliseYesNoUnclear(analysis.ai_complaint_detected);
-  if (analysis?.ai_escalation_required) props.ai_escalation_required = normaliseEscalation(analysis.ai_escalation_required);
-  if (analysis?.ai_escalation_notes) props.ai_escalation_notes = toMultiline(analysis.ai_escalation_notes);
+  // Decision criteria (derive or default)
+  let decisionCriteria = toMultiline(analysis?.ai_decision_criteria);
+  if (!decisionCriteria) {
+    const crit = inferDecisionCriteriaFromSummary(analysis?.summary || []);
+    decisionCriteria = crit.length ? crit.join("; ") : "Not mentioned.";
+  }
+  props.ai_decision_criteria = decisionCriteria.slice(0, 1000);
 
-  // Type-specific fields: consultation vs follow-up
+  // Recommendations provided (from materials or default)
+  if (Array.isArray(analysis?.materials_to_send) && analysis.materials_to_send.length) {
+    props.ai_recommendations_provided = analysis.materials_to_send.join("; ").slice(0, 5000);
+  } else {
+    props.ai_recommendations_provided = "None promised.";
+  }
+
+  // Sentiment / engagement / complaint / escalation (dropdowns: set only safe values)
+  const sentiment = normaliseSentiment(analysis?.ai_customer_sentiment || analysis?.outcome) || "Neutral";
+  props.ai_customer_sentiment = sentiment;
+  props.ai_client_engagement_level = sentimentToEngagement(sentiment);
+
+  props.ai_complaint_detected = normaliseYesNoUnclear(analysis?.ai_complaint_detected || "No");
+  props.ai_escalation_required = normaliseEscalation(analysis?.ai_escalation_required || "No");
+  props.ai_escalation_notes = toMultiline(analysis?.ai_escalation_notes) || "No escalation required.";
+
+  // Type-specific fields
   if (inferredType === "Initial Consultation") {
-    // map 0–100 likelihood to /10 integer (1–10 min)
     if (typeof analysis?.likelihood_to_close === "number") {
       props.ai_consultation_likelihood_to_close = clamp(Math.max(1, Math.round(analysis.likelihood_to_close / 10)), 1, 10);
     }
+    props.ai_consultation_outcome = mapConsultationOutcome(analysis?.outcome || "Monitor");
     if (Array.isArray(analysis?.materials_to_send) && analysis.materials_to_send.length) {
       props.ai_consultation_required_materials = analysis.materials_to_send.join("; ").slice(0, 5000);
+    } else {
+      props.ai_consultation_required_materials = "No materials required.";
     }
     if (Array.isArray(analysis?.next_actions) && analysis.next_actions.length) {
       props.ai_next_steps = analysis.next_actions.join("; ").slice(0, 5000);
+    } else {
+      props.ai_next_steps = "No next steps captured.";
     }
-    if (objections.length) {
-      props.ai_key_objections = objections.join("; ").slice(0, 1000);
-    }
-    // ai_consultation_outcome exists but we leave unset unless you want a specific mapping
   }
 
   if (inferredType === "Follow up call") {
@@ -109,24 +141,27 @@ export async function updateCall(callId, analysis) {
     }
     if (Array.isArray(analysis?.materials_to_send) && analysis.materials_to_send.length) {
       props.ai_follow_up_required_materials = analysis.materials_to_send.join("; ").slice(0, 5000);
+    } else {
+      props.ai_follow_up_required_materials = "No materials required.";
     }
     if (objections.length) {
       props.ai_follow_up_objections_remaining = objections.join("; ").slice(0, 1000);
+    } else {
+      props.ai_follow_up_objections_remaining = "No objections remaining.";
     }
     if (Array.isArray(analysis?.next_actions) && analysis.next_actions.length) {
       props.ai_next_steps = analysis.next_actions.join("; ").slice(0, 5000);
+    } else {
+      props.ai_next_steps = "No next steps captured.";
     }
   }
 
-  if (Object.keys(props).length === 0) return;
   await hubspotPatch(`crm/v3/objects/calls/${encodeURIComponent(callId)}`, { properties: props });
 }
 
-/* ========== Create Scorecard and associate ========== */
+/* ============ Create Scorecard & associate ============ */
 export async function createScorecard(analysis, { callId, contactIds = [], dealIds = [], ownerId = null } = {}) {
-  if (SCORECARD_OBJECT === "notes") {
-    return createNoteScorecard(analysis, { callId, contactIds, dealIds, ownerId });
-  }
+  if (SCORECARD_OBJECT === "notes") return createNoteScorecard(analysis, { callId, contactIds, dealIds, ownerId });
 
   const callType = normaliseCallType(analysis?.call_type) || "Initial Consultation";
   const activityName = `${callId} — ${callType} — ${new Date().toISOString().slice(0, 10)}`;
@@ -134,24 +169,27 @@ export async function createScorecard(analysis, { callId, contactIds = [], dealI
   const props = {
     activity_type: callType,
     activity_name: activityName,
-    // coaching summary (short, bullet-y)
     sales_scorecard___what_you_can_improve_on: buildCoachingNotes(analysis),
-
-    // performance: map 0..5 “overall” to 1..10 if present; else null
     sales_performance_rating_: toScoreOutOf10OrNull(analysis?.scorecard?.overall),
 
-    // “AI copies” that exist on scorecard per your dump:
+    // Mirrors (with safe defaults)
     ai_next_steps: Array.isArray(analysis?.next_actions) && analysis.next_actions.length
       ? analysis.next_actions.join("; ").slice(0, 5000)
-      : undefined,
-    ai_key_objections: ensureArray(analysis?.objections).join("; ").slice(0, 1000) || undefined,
+      : "No next steps captured.",
+    ai_key_objections: ensureArray(analysis?.objections).length
+      ? ensureArray(analysis?.objections).join("; ").slice(0, 1000)
+      : "None.",
     ai_consultation_required_materials: Array.isArray(analysis?.materials_to_send) && analysis.materials_to_send.length
       ? analysis.materials_to_send.join("; ").slice(0, 5000)
-      : undefined,
-    ai_decision_criteria: analysis?.ai_decision_criteria ? toMultiline(analysis.ai_decision_criteria) : undefined,
+      : "No materials required.",
+    ai_decision_criteria: (() => {
+      const dc = toMultiline(analysis?.ai_decision_criteria);
+      if (dc) return dc.slice(0, 1000);
+      const crit = inferDecisionCriteriaFromSummary(analysis?.summary || []);
+      return (crit.length ? crit.join("; ") : "Not mentioned.").slice(0, 1000);
+    })(),
   };
 
-  // Consultation-only fields present on your scorecard:
   if (callType === "Initial Consultation" && typeof analysis?.likelihood_to_close === "number") {
     props.ai_consultation_likelihood_to_close = clamp(Math.max(1, Math.round(analysis.likelihood_to_close / 10)), 1, 10);
   }
@@ -163,7 +201,6 @@ export async function createScorecard(analysis, { callId, contactIds = [], dealI
     return { type: SCORECARD_OBJECT, id: null };
   }
 
-  // Associate scorecard ↔ call (primary), contacts, deals
   await associateV4UsingLabels(SCORECARD_OBJECT, scoreId, "calls", callId);
   for (const cId of contactIds) await associateV4UsingLabels(SCORECARD_OBJECT, scoreId, "contacts", cId);
   for (const dId of dealIds) await associateV4UsingLabels(SCORECARD_OBJECT, scoreId, "deals", dId);
@@ -171,7 +208,7 @@ export async function createScorecard(analysis, { callId, contactIds = [], dealI
   return { type: SCORECARD_OBJECT, id: scoreId };
 }
 
-/* ========== Legacy Note scorecard (optional) ========== */
+/* ============ Legacy Note scorecard (optional) ============ */
 async function createNoteScorecard(analysis, { callId, contactIds = [], dealIds = [], ownerId = null } = {}) {
   const body = [
     "TLPI Sales Scorecard",
@@ -193,7 +230,7 @@ async function createNoteScorecard(analysis, { callId, contactIds = [], dealIds 
   return { type: "note", id: noteId };
 }
 
-/* ========== HTTP helpers ========== */
+/* =================== HTTP helpers =================== */
 async function hubspotPost(path, body) {
   const url = `${HS_BASE}/${path}`;
   const res = await fetch(url, { method: "POST", headers: hsHeaders(), body: JSON.stringify(body) });
@@ -216,10 +253,7 @@ async function hubspotPatch(path, body) {
   try { return await res.json(); } catch { return null; }
 }
 
-/* ========== Associations ========== */
-/**
- * v3 batch association create (used for notes path).
- */
+/* ================== Associations ================== */
 async function associateV3(fromType, fromId, toType, toId, type) {
   if (!fromId || !toId) return;
   const url = `${HS_BASE}/crm/v3/associations/${encodeURIComponent(fromType)}/${encodeURIComponent(toType)}/batch/create`;
@@ -232,14 +266,8 @@ async function associateV3(fromType, fromId, toType, toId, type) {
   }
 }
 
-/**
- * v4 association using the **actual labels** (category + typeId) returned by HubSpot
- * This avoids the "association types don't match object types & direction" error.
- */
 async function associateV4UsingLabels(fromType, fromId, toType, toId) {
   if (!fromId || !toId) return;
-
-  // Fetch available labels for this (fromType -> toType) direction
   const labelsUrl = `${HS_BASE}/crm/v4/associations/${encodeURIComponent(fromType)}/${encodeURIComponent(toType)}/labels`;
   const labelsRes = await fetch(labelsUrl, { headers: hsHeaders() });
   if (!labelsRes.ok) {
@@ -254,11 +282,9 @@ async function associateV4UsingLabels(fromType, fromId, toType, toId) {
     return;
   }
 
-  // Try each label until one succeeds (category may be USER_DEFINED or HUBSPOT_DEFINED)
   for (const lab of labelList) {
     const typeId = lab?.typeId;
     const category = lab?.category || lab?.associationCategory || "USER_DEFINED";
-
     if (!typeId) continue;
 
     const url = `${HS_BASE}/crm/v4/associations/${encodeURIComponent(fromType)}/${encodeURIComponent(toType)}/batch/create`;
@@ -273,19 +299,15 @@ async function associateV4UsingLabels(fromType, fromId, toType, toId) {
     };
 
     const res = await fetch(url, { method: "POST", headers: hsHeaders(), body: JSON.stringify(body) });
-    if (res.ok) {
-      return; // success
-    } else {
-      const txt = await res.text().catch(() => "");
-      console.warn(`[HubSpot] v4 associate ${fromType}:${fromId} -> ${toType}:${toId} failed for label(typeId=${typeId}, category=${category}): ${res.status} ${txt.slice(0, 300)}`);
-      // try next label
-    }
+    if (res.ok) return;
+    const txt = await res.text().catch(() => "");
+    console.warn(`[HubSpot] v4 associate ${fromType}:${fromId} -> ${toType}:${toId} failed for label(typeId=${typeId}, category=${category}): ${res.status} ${txt.slice(0, 300)}`);
   }
 
   console.warn(`[HubSpot] v4 association failed for all labels: ${fromType} -> ${toType}`);
 }
 
-/* ========== Helpers / normalisers ========== */
+/* ================== Helpers / NLP ================== */
 function ensureArray(v) { if (Array.isArray(v)) return v.filter(Boolean).map(String); if (v == null) return []; return [String(v)].filter(Boolean); }
 function arrayToBullets(arr, bullet="• ") { const a = ensureArray(arr); return a.length ? a.map(s => `${bullet}${s}`).join("\n") : ""; }
 function toMultiline(v) { if (Array.isArray(v)) return v.join("\n"); if (v == null) return undefined; return String(v); }
@@ -297,8 +319,8 @@ function normaliseCallType(v) {
   if (!v) return null;
   const s = String(v).toLowerCase();
   const allowed = [
-    "qualification call", "initial consultation", "follow up call",
-    "application meeting", "strategy call", "annual review", "existing customer call", "other",
+    "qualification call","initial consultation","follow up call",
+    "application meeting","strategy call","annual review","existing customer call","other",
   ];
   const found = allowed.find(a => s.includes(a));
   if (found) return title(found);
@@ -313,25 +335,54 @@ function normaliseCallType(v) {
 }
 function title(txt){return txt.replace(/\w\S*/g, w => w[0].toUpperCase()+w.slice(1).toLowerCase());}
 
-function normaliseSeverity(v){const s=String(v||"").toLowerCase(); if(s.startsWith("h"))return"High"; if(s.startsWith("m"))return"Medium"; if(s.startsWith("l"))return"Low"; return undefined;}
-function mapProductInterest(products){const arr=ensureArray(products).map(p=>p.toLowerCase()); const hasSSAS=arr.some(p=>p.includes("ssas")); const hasFIC=arr.some(p=>p.includes("fic")); if(hasSSAS&&hasFIC)return"Both"; if(hasSSAS)return"SSAS"; if(hasFIC)return"FIC"; return undefined;}
-function normaliseSentiment(v){if(!v)return undefined; const s=String(v).toLowerCase(); if(s.includes("pos"))return"Positive"; if(s.includes("neu"))return"Neutral"; if(s.includes("neg"))return"Negative"; if(s.includes("win")||s.includes("close"))return"Positive"; if(s.includes("lost")||s.includes("no "))return"Negative"; return undefined;}
-function normaliseYesNoUnclear(v){const s=String(v||"").toLowerCase(); if(s.startsWith("y"))return"Yes"; if(s.startsWith("n"))return"No"; return"Unclear";}
-function normaliseEscalation(v){const s=String(v||"").toLowerCase(); if(s.startsWith("y")||s.startsWith("req"))return"Yes"; if(s.startsWith("mon"))return"Monitor"; return"No";}
+function normaliseSentiment(v){ if(!v) return undefined; const s=String(v).toLowerCase();
+  if (s.includes("pos")) return "Positive";
+  if (s.includes("neu")) return "Neutral";
+  if (s.includes("neg")) return "Negative";
+  if (s.includes("win") || s.includes("close")) return "Positive";
+  if (s.includes("lost") || s.includes("no ")) return "Negative";
+  return "Neutral";
+}
+function sentimentToEngagement(sent){ return sent==="Positive"?"High":sent==="Neutral"?"Medium":"Low"; }
 
-/* Coaching summary helper (used in scorecard) */
+function mapProductInterest(products){ const arr=ensureArray(products).map(p=>p.toLowerCase());
+  const hasSSAS=arr.some(p=>p.includes("ssas")), hasFIC=arr.some(p=>p.includes("fic"));
+  if (hasSSAS && hasFIC) return "Both"; if (hasSSAS) return "SSAS"; if (hasFIC) return "FIC"; return undefined;
+}
+
+function mapConsultationOutcome(outcome){ const s=String(outcome||"").toLowerCase();
+  if (s.includes("positive") || s.includes("win") || s.includes("proceed")) return "Likely";
+  if (s.includes("negative") || s.includes("lost") || s.includes("no")) return "Not proceeding";
+  return "Monitor";
+}
+
+function mapObjectionCategories(objs){ const cats=new Set();
+  const text=ensureArray(objs).join(" ").toLowerCase();
+  if (/fee|cost|price/.test(text)) cats.add("Fees");
+  if (/time|timeline|delay|month|week/.test(text)) cats.add("Timeline");
+  if (/risk|volatile|uncertain/.test(text)) cats.add("Risk");
+  if (/hmrc|rule|compliance|tax/.test(text)) cats.add("Compliance/Tax");
+  if (/provider|trust|reliable|previous/.test(text)) cats.add("Provider/Trust");
+  if (/paperwork|process|admin/.test(text)) cats.add("Process");
+  return Array.from(cats);
+}
+
+function inferDecisionCriteriaFromSummary(summaryArr){
+  const s = ensureArray(summaryArr).join(" ").toLowerCase();
+  const crit = [];
+  if (/fee|cost|price|charges?/.test(s)) crit.push("Fees/Cost");
+  if (/timeline|speed|quick|delay|month|week/.test(s)) crit.push("Timeline");
+  if (/hmrc|compliance|tax|rules?/.test(s)) crit.push("Compliance/Tax");
+  if (/property|investment|platform|trading/.test(s)) crit.push("Investment/Platform fit");
+  if (/loan|bridge|finance|cashflow/.test(s)) crit.push("Funding/Cashflow");
+  if (/trust|provider|previous/.test(s)) crit.push("Provider reliability");
+  return Array.from(new Set(crit));
+}
+
 function buildCoachingNotes(analysis) {
-  const positives = ensureArray(analysis?.summary)
-    .slice(0, 3)
-    .map(s => `✓ ${s}`)
-    .join("\n");
-  const improvements = ensureArray(analysis?.next_actions)
-    .slice(0, 3)
-    .map(s => `• ${s}`)
-    .join("\n");
-  return [`What went well:\n${positives}`, `\nAreas to improve:\n${improvements}`]
-    .join("\n")
-    .slice(0, 9000);
+  const positives = ensureArray(analysis?.summary).slice(0, 3).map(s => `✓ ${s}`).join("\n") || "No positives captured.";
+  const improvements = ensureArray(analysis?.next_actions).slice(0, 3).map(s => `• ${s}`).join("\n") || "No improvement items captured.";
+  return [`What went well:\n${positives}`, `\nAreas to improve:\n${improvements}`].join("\n").slice(0, 9000);
 }
 
 function arrToString(a){return Array.isArray(a)?a.join("; "):"n/a";}
