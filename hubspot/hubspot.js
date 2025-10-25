@@ -8,7 +8,7 @@ const HUBSPOT_TOKEN = process.env.HUBSPOT_TOKEN || process.env.HUBSPOT_API_KEY; 
 const HS_BASE = "https://api.hubapi.com";
 
 // Optional: override custom scorecard object type via env
-const SCORECARD_OBJECT = process.env.HUBSPOT_SCORECARD_OBJECT || "notes"; 
+const SCORECARD_OBJECT = process.env.HUBSPOT_SCORECARD_OBJECT || "notes";
 // If you *do* have a custom object, set HUBSPOT_SCORECARD_OBJECT to something like "p2_sales_scorecard" (the fully qualified object type).
 
 if (!HUBSPOT_TOKEN) {
@@ -56,20 +56,30 @@ export async function getAssociations(fromId, toType) {
 
 /**
  * Update the Call record with structured fields from analysis.
- * You likely have custom properties on the call engagement. We’ll set what we can safely,
- * and ignore properties that 400 with PROPERTY_DOESNT_EXIST.
+ * We coerce arrays -> strings where appropriate.
  */
 export async function updateCall(callId, analysis) {
   const properties = {};
 
+  // Summary: array -> neat string
+  if (analysis?.summary) {
+    let summaryStr;
+    if (Array.isArray(analysis.summary)) {
+      // bulletish join
+      summaryStr = analysis.summary.map(s => (typeof s === "string" ? `• ${s}` : "")).filter(Boolean).join("\n");
+    } else if (typeof analysis.summary === "string") {
+      summaryStr = analysis.summary;
+    }
+    if (summaryStr) properties.hs_call_body = summaryStr.slice(0, 5000);
+  }
+
   // Safe mapping — adjust to your portal’s properties
-  if (analysis?.summary) properties.hs_call_body = analysis.summary.slice(0, 5000);
   if (typeof analysis?.likelihood_to_close === "number") properties.tlpi_likelihood_close = analysis.likelihood_to_close;
-  if (analysis?.outcome) properties.tlpi_outcome = analysis.outcome;
+  if (analysis?.outcome) properties.tlpi_outcome = String(analysis.outcome);
   if (Array.isArray(analysis?.objections)) properties.tlpi_objections = analysis.objections.join("; ");
   if (Array.isArray(analysis?.next_actions)) properties.tlpi_next_actions = analysis.next_actions.join("; ");
   if (Array.isArray(analysis?.materials_to_send)) properties.tlpi_materials = analysis.materials_to_send.join("; ");
-  if (analysis?.call_type) properties.tlpi_call_type_detected = analysis.call_type;
+  if (analysis?.call_type) properties.tlpi_call_type_detected = String(analysis.call_type);
 
   await hubspotPatch(`crm/v3/objects/calls/${encodeURIComponent(callId)}`, { properties });
 }
@@ -86,23 +96,24 @@ export async function createScorecard(analysis, { callId, contactIds = [], dealI
     const body = [
       "TLPI Sales Scorecard",
       "",
-      `Overall: ${analysis?.scorecard?.overall ?? "n/a"}/5`,
-      `Problem Fit: ${analysis?.scorecard?.problem_fit ?? "n/a"}/5`,
-      `Budget Fit: ${analysis?.scorecard?.budget_fit ?? "n/a"}/5`,
-      `Authority: ${analysis?.scorecard?.authority ?? "n/a"}/5`,
-      `Urgency: ${analysis?.scorecard?.urgency ?? "n/a"}/5`,
+      `Overall: ${numOrNA(analysis?.scorecard?.overall)}/5`,
+      `Problem Fit: ${numOrNA(analysis?.scorecard?.problem_fit)}/5`,
+      `Budget Fit: ${numOrNA(analysis?.scorecard?.budget_fit)}/5`,
+      `Authority: ${numOrNA(analysis?.scorecard?.authority)}/5`,
+      `Urgency: ${numOrNA(analysis?.scorecard?.urgency)}/5`,
       "",
-      `Likelihood to Close: ${analysis?.likelihood_to_close ?? "n/a"}%`,
-      `Outcome: ${analysis?.outcome ?? "n/a"}`,
+      `Likelihood to Close: ${numOrNA(analysis?.likelihood_to_close)}%`,
+      `Outcome: ${strOrNA(analysis?.outcome)}`,
       "",
-      `Objections: ${(analysis?.objections || []).join("; ") || "n/a"}`,
-      `Next Actions: ${(analysis?.next_actions || []).join("; ") || "n/a"}`,
-      `Materials: ${(analysis?.materials_to_send || []).join("; ") || "n/a"}`,
+      `Objections: ${arrToString(analysis?.objections)}`,
+      `Next Actions: ${arrToString(analysis?.next_actions)}`,
+      `Materials: ${arrToString(analysis?.materials_to_send)}`,
     ].join("\n");
 
     objResponse = await hubspotPost(`crm/v3/objects/notes`, {
       properties: {
         hs_note_body: body.slice(0, 10000),
+        hs_timestamp: Date.now(), // REQUIRED for notes
         hubspot_owner_id: ownerId || undefined,
       },
     });
@@ -126,7 +137,7 @@ export async function createScorecard(analysis, { callId, contactIds = [], dealI
       tlpi_authority: analysis?.scorecard?.authority,
       tlpi_urgency: analysis?.scorecard?.urgency,
       tlpi_likelihood_close: analysis?.likelihood_to_close,
-      tlpi_outcome: analysis?.outcome,
+      tlpi_outcome: analysis?.outcome ? String(analysis.outcome) : undefined,
       tlpi_objections: Array.isArray(analysis?.objections) ? analysis.objections.join("; ") : undefined,
       tlpi_next_actions: Array.isArray(analysis?.next_actions) ? analysis.next_actions.join("; ") : undefined,
       tlpi_materials: Array.isArray(analysis?.materials_to_send) ? analysis.materials_to_send.join("; ") : undefined,
@@ -182,4 +193,15 @@ async function associate(fromType, fromId, toType, toId) {
     const txt = await res.text().catch(() => "");
     console.warn(`[HubSpot] Associate ${fromType}:${fromId} -> ${toType}:${toId} failed: ${res.status} ${txt.slice(0, 200)}`);
   }
+}
+
+// helpers
+function arrToString(a) {
+  return Array.isArray(a) ? a.join("; ") : "n/a";
+}
+function numOrNA(n) {
+  return typeof n === "number" ? n : "n/a";
+}
+function strOrNA(s) {
+  return s ? String(s) : "n/a";
 }
