@@ -74,21 +74,21 @@ export async function getAssociations(fromId, toType) {
 }
 
 /* =========================================================
-   CALL UPDATE (Initial Consultation — only the fields you listed)
+   CALL UPDATE (Initial Consultation — exactly the fields you listed)
    ========================================================= */
 export async function updateCall(callId, analysis) {
-  // Always treat this path as Initial Consultation mapping (per your spec)
   const props = {};
 
-  // 1) Ai inferred call type / confidence
+  // 1) Ai inferred call type / confidence (force IC path)
   props.ai_inferred_call_type = "Initial Consultation";
   props.ai_call_type_confidence = clamp(
     numberOrNull(analysis?.ai_call_type_confidence ?? analysis?.call_type_confidence) ?? 90,
     0, 100
   );
 
-  // 2) ai consultation outcome (allowed options in your portal)
-  props.ai_consultation_outcome = mapConsultationOutcomeHS(analysis?.outcome, analysis?.likelihood_to_close);
+  // 2) ai consultation outcome (allowed options)
+  const outcomeHS = mapConsultationOutcomeHS(analysis?.outcome, analysis?.likelihood_to_close, analysis);
+  props.ai_consultation_outcome = outcomeHS;
 
   // 3) ai product of interest
   const productInterest = mapProductInterest(analysis?.key_details?.products_discussed);
@@ -126,14 +126,14 @@ export async function updateCall(callId, analysis) {
     props.ai_objection_severity = "Low";
   }
 
-  // 9) ai client engagement level (NUMBER) from sentiment/outcome
+  // 9) ai client engagement level (NUMBER) from sentiment/outcome (3/2/1)
   const sentiment = normaliseSentiment(analysis?.ai_customer_sentiment || analysis?.outcome);
-  props.ai_client_engagement_level = engagementNumberFromSentiment(sentiment); // 3/2/1
+  props.ai_client_engagement_level = engagementNumberFromSentiment(sentiment);
 
-  // 10) ChatGPT helper fields
-  const likeScore10 = toOneToTenFromPct(analysis?.likelihood_to_close) ?? 5;
-  props["chat_gpt___increase_likelihood_of_sale_suggestions"] = buildIncreaseLikelihood(analysis);
+  // 10) ChatGPT helper fields (likeliness 1–10, bullets, reasoning)
+  const likeScore10 = adjustedLikelihood10(analysis, outcomeHS);
   props["chat_gpt___likliness_to_proceed_score"] = likeScore10;
+  props["chat_gpt___increase_likelihood_of_sale_suggestions"] = buildIncreaseLikelihood(analysis);
   props["chat_gpt___score_reasoning"] = buildScoreReasoning(analysis, likeScore10);
 
   // Filter & patch
@@ -144,7 +144,7 @@ export async function updateCall(callId, analysis) {
 }
 
 /* ====================================================================
-   SCORECARD CREATE (Initial Consultation — only the fields you listed)
+   SCORECARD CREATE (Initial Consultation — 20 consult_* metrics + weighted 10/10)
    ==================================================================== */
 export async function createScorecard(analysis, { callId, contactIds = [], dealIds = [], ownerId = null } = {}) {
   await getKnownPropsSet(SCORECARD_OBJECT);
@@ -152,49 +152,64 @@ export async function createScorecard(analysis, { callId, contactIds = [], dealI
 
   const activityName = `${callId} — Initial Consultation — ${new Date().toISOString().slice(0, 10)}`;
 
-  // 9 x Qual_* metrics (0 or 1)
-  const Q = buildQualFromAnalysis(analysis); // returns the 9 booleans you asked for
-  const consultScore10 = Math.max(1, Math.round((sum(Object.values(Q)) / 9) * 10));
+  // Build 20 consult_* flags (0/1) using consult_eval + heuristics
+  const consult = buildConsultFlags(analysis);
 
-  // Prompt-driven Sales performance rating (1–10) + summary
-  const perf10 = clamp(Math.round(numberOrNull(analysis?.sales_performance_rating) ?? 0), 1, 10);
+  // Weighted score (sums to 10.0), then round to nearest integer, clamp 1..10
+  const weights = CONSULT_WEIGHTS_10;
+  let raw = 0;
+  for (const [k, w] of Object.entries(weights)) raw += (consult[k] ? 1 : 0) * w;
+  const consultScore10 = clamp(Math.round(raw), 1, 10);
+
+  // Sales performance rating (prompt) with sanity floor if Proceed now
+  let perf10 = clamp(Math.round(numberOrNull(analysis?.sales_performance_rating) ?? 0), 1, 10);
+  const outcomeHS = mapConsultationOutcomeHS(analysis?.outcome, analysis?.likelihood_to_close, analysis);
+  if (outcomeHS === "Proceed now" && perf10 < 8) perf10 = 8;
+
   const summary = buildCoachingSummary(analysis);
-
-  // Mirror IC fields from the Call
-  const likeScore10 = toOneToTenFromPct(analysis?.likelihood_to_close) ?? 5;
-  const outcomeHS = mapConsultationOutcomeHS(analysis?.outcome, analysis?.likelihood_to_close);
+  const likeScore10 = adjustedLikelihood10(analysis, outcomeHS);
 
   const props = {
     activity_type: "Initial Consultation",
     activity_name: activityName,
     hubspot_owner_id: ownerId || undefined,
 
-    // The nine Qual_* fields (0/1)
-    ...(has("qual_benefits_linked_to_needs")     ? { qual_benefits_linked_to_needs: Q.benefits_linked_to_needs } : {}),
-    ...(has("qual_clear_responses_or_followup")  ? { qual_clear_responses_or_followup: Q.clear_responses_or_followup } : {}),
-    ...(has("qual_commitment_requested")         ? { qual_commitment_requested: Q.commitment_requested } : {}),
-    ...(has("qual_intro")                        ? { qual_intro: Q.intro } : {}),
-    ...(has("qual_next_steps_confirmed")         ? { qual_next_steps_confirmed: Q.next_steps_confirmed } : {}),
-    ...(has("qual_open_question")                ? { qual_open_question: Q.open_question } : {}),
-    ...(has("qual_rapport")                      ? { qual_rapport: Q.rapport } : {}),
-    ...(has("qual_relevant_pain_identified")     ? { qual_relevant_pain_identified: Q.relevant_pain_identified } : {}),
-    ...(has("qual_services_explained_clearly")   ? { qual_services_explained_clearly: Q.services_explained_clearly } : {}),
+    // 20 consult_* flags (0/1) — only set if property exists
+    ...(has("consult_closing_question_asked") ? { consult_closing_question_asked: consult.consult_closing_question_asked } : {}),
+    ...(has("consult_collected_dob_nin_when_agreed") ? { consult_collected_dob_nin_when_agreed: consult.consult_collected_dob_nin_when_agreed } : {}),
+    ...(has("consult_confirm_reason_for_zoom") ? { consult_confirm_reason_for_zoom: consult.consult_confirm_reason_for_zoom } : {}),
+    ...(has("consult_customer_agreed_to_set_up") ? { consult_customer_agreed_to_set_up: consult.consult_customer_agreed_to_set_up } : {}),
+    ...(has("consult_demo_tax_saving") ? { consult_demo_tax_saving: consult.consult_demo_tax_saving } : {}),
+    ...(has("consult_fee_phrasing_three_seven_five") ? { consult_fee_phrasing_three_seven_five: consult.consult_fee_phrasing_three_seven_five } : {}),
+    ...(has("consult_fees_annualised") ? { consult_fees_annualised: consult.consult_fees_annualised } : {}),
+    ...(has("consult_fees_tax_deductible_explained") ? { consult_fees_tax_deductible_explained: consult.consult_fees_tax_deductible_explained } : {}),
+    ...(has("consult_interactive_throughout") ? { consult_interactive_throughout: consult.consult_interactive_throughout } : {}),
+    ...(has("consult_needs_pain_uncovered") ? { consult_needs_pain_uncovered: consult.consult_needs_pain_uncovered } : {}),
+    ...(has("consult_next_contact_within_5_days") ? { consult_next_contact_within_5_days: consult.consult_next_contact_within_5_days } : {}),
+    ...(has("consult_next_step_specific_date_time") ? { consult_next_step_specific_date_time: consult.consult_next_step_specific_date_time } : {}),
+    ...(has("consult_no_assumptions_evidence_gathered") ? { consult_no_assumptions_evidence_gathered: consult.consult_no_assumptions_evidence_gathered } : {}),
+    ...(has("consult_overcame_objection_and_closed") ? { consult_overcame_objection_and_closed: consult.consult_overcame_objection_and_closed } : {}),
+    ...(has("consult_prospect_asked_next_steps") ? { consult_prospect_asked_next_steps: consult.consult_prospect_asked_next_steps } : {}),
+    ...(has("consult_purpose_clearly_stated") ? { consult_purpose_clearly_stated: consult.consult_purpose_clearly_stated } : {}),
+    ...(has("consult_quantified_value_roi") ? { consult_quantified_value_roi: consult.consult_quantified_value_roi } : {}),
+    ...(has("consult_rapport_open") ? { consult_rapport_open: consult.consult_rapport_open } : {}),
+    ...(has("consult_specific_tax_estimate_given") ? { consult_specific_tax_estimate_given: consult.consult_specific_tax_estimate_given } : {}),
+    ...(has("consult_strong_buying_signals_detected") ? { consult_strong_buying_signals_detected: consult.consult_strong_buying_signals_detected } : {}),
 
     // Consultation Score (1–10)
-    ...(has("consult_score_final")               ? { consult_score_final: consultScore10 } : {}),
+    ...(has("consult_score_final") ? { consult_score_final: consultScore10 } : {}),
 
-    // Sales performance rating (prompt) + summary
-    ...(has("sales_performance_rating")          ? { sales_performance_rating: String(perf10) } : {}),
-    ...(has("sales_scorecard___what_you_can_improve_on") 
-                                                 ? { sales_scorecard___what_you_can_improve_on: summary } : {}),
+    // Sales performance rating (prompt) + coaching summary
+    ...(has("sales_performance_rating") ? { sales_performance_rating: String(perf10) } : {}),
+    ...(has("sales_scorecard___what_you_can_improve_on") ? { sales_scorecard___what_you_can_improve_on: summary } : {}),
 
     // Mirrors from the Call
     ...(has("ai_consultation_likelihood_to_close") ? { ai_consultation_likelihood_to_close: likeScore10 } : {}),
-    ...(has("ai_consultation_outcome")             ? { ai_consultation_outcome: outcomeHS } : {}),
-    ...(has("ai_consultation_required_materials")  ? { ai_consultation_required_materials: toShortList(analysis?.materials_to_send, [], "No materials requested.") } : {}),
-    ...(has("ai_decision_criteria")                ? { ai_decision_criteria: toShortList(analysis?.ai_decision_criteria, inferDecisionCriteriaFromSummary(analysis?.summary || []), "Not mentioned.") } : {}),
-    ...(has("ai_key_objections")                   ? { ai_key_objections: ensureArray(analysis?.objections).length ? ensureArray(analysis?.objections).join("; ").slice(0, 1000) : "No objections" } : {}),
-    ...(has("ai_next_steps")                       ? { ai_next_steps: toShortList(analysis?.next_actions, [], "No next steps captured.") } : {}),
+    ...(has("ai_consultation_outcome") ? { ai_consultation_outcome: outcomeHS } : {}),
+    ...(has("ai_consultation_required_materials") ? { ai_consultation_required_materials: toShortList(analysis?.materials_to_send, [], "No materials requested.") } : {}),
+    ...(has("ai_decision_criteria") ? { ai_decision_criteria: toShortList(analysis?.ai_decision_criteria, inferDecisionCriteriaFromSummary(analysis?.summary || []), "Not mentioned.") } : {}),
+    ...(has("ai_key_objections") ? { ai_key_objections: ensureArray(analysis?.objections).length ? ensureArray(analysis?.objections).join("; ").slice(0, 1000) : "No objections" } : {}),
+    ...(has("ai_next_steps") ? { ai_next_steps: toShortList(analysis?.next_actions, [], "No next steps captured.") } : {}),
   };
 
   const safeProps = await filterPropsFor(SCORECARD_OBJECT, props);
@@ -278,7 +293,31 @@ async function associateV4UsingLabels(fromType, fromId, toType, toId) {
   console.warn(`[HubSpot] v4 association failed for all labels: ${fromType} -> ${toType}`);
 }
 
-/* ================== Helpers ================== */
+/* ================== Weights & Inference ================== */
+/** Weights that sum to 10.0, per your approval. */
+const CONSULT_WEIGHTS_10 = {
+  consult_customer_agreed_to_set_up:       2.0,
+  consult_overcame_objection_and_closed:   1.0,
+  consult_next_step_specific_date_time:    0.7,
+  consult_closing_question_asked:          0.6,
+  consult_prospect_asked_next_steps:       0.4,
+  consult_strong_buying_signals_detected:  0.6,
+  consult_needs_pain_uncovered:            0.6,
+  consult_purpose_clearly_stated:          0.4,
+  consult_quantified_value_roi:            0.7,
+  consult_demo_tax_saving:                 0.3,
+  consult_fees_tax_deductible_explained:   0.4,
+  consult_fees_annualised:                 0.3,
+  consult_fee_phrasing_three_seven_five:   0.2,
+  consult_specific_tax_estimate_given:     0.5,
+  consult_confirm_reason_for_zoom:         0.2,
+  consult_rapport_open:                    0.2,
+  consult_interactive_throughout:          0.2,
+  consult_next_contact_within_5_days:      0.3,
+  consult_no_assumptions_evidence_gathered:0.2,
+  consult_collected_dob_nin_when_agreed:   0.2,
+};
+
 function ensureArray(v){ if(Array.isArray(v)) return v.filter(Boolean).map(String); if(v==null) return []; return [String(v)].filter(Boolean); }
 function toMultiline(v){ if(Array.isArray(v)) return v.join("\n"); if(v==null) return undefined; return String(v); }
 function toShortList(primary, inferred=[], fallback=""){ const a=ensureArray(primary); if(a.length) return a.join("; ").slice(0, 1000); const b=ensureArray(inferred); return (b.length ? b.join("; ") : fallback).slice(0, 1000); }
@@ -293,15 +332,28 @@ function normaliseSentiment(v){ if(!v) return "Neutral"; const s=String(v).toLow
 }
 function engagementNumberFromSentiment(sent){ return sent==="Positive" ? 3 : sent==="Negative" ? 1 : 2; }
 
-/** Map analysis outcome/likelihood to your allowed set: Proceed now, Likely, Unclear, Not now, No fit */
-function mapConsultationOutcomeHS(outcomeText, likelihoodPct){
+/** Map analysis outcome/likelihood to your allowed set with close-detection guardrails. */
+function mapConsultationOutcomeHS(outcomeText, likelihoodPct, analysis){
   const s = String(outcomeText || "").toLowerCase();
-  if (/\bproceed|signed|go(-|\s*)ahead|commit|purchase|bought|agreed|paid/.test(s)) return "Proceed now";
+  const transcriptHints = [
+    ...(ensureArray(analysis?.summary)),
+    ...(ensureArray(analysis?.next_actions)),
+    ...(ensureArray(analysis?.materials_to_send)),
+  ].join(" ").toLowerCase();
+
+  // If transcript clearly indicates they agreed/bought/booked -> Proceed now
+  if (/\bproceed|signed|sign|go(-|\s*)ahead|commit|purchase|bought|agree(d)?|paid|payment|onboard|set[-\s]?up|application submitted/.test(transcriptHints)) {
+    return "Proceed now";
+  }
+
+  // Text hints first
+  if (/\bproceed now|signed|commit|purchase|buy|agreed/.test(s)) return "Proceed now";
   if (/\blikely|positive|good chance|favourable|favorable/.test(s)) return "Likely";
   if (/\bnot now|later|follow[-\s]?up|defer|wait/.test(s)) return "Not now";
   if (/\bno fit|not proceeding|won'?t proceed|decline|reject/.test(s)) return "No fit";
   if (/\bunclear|unsure|tbd|unknown/.test(s)) return "Unclear";
 
+  // fall back to likelihood thresholds (pct 0..100)
   const n = numberOrNull(likelihoodPct);
   if (n != null) {
     if (n >= 90) return "Proceed now";
@@ -311,6 +363,13 @@ function mapConsultationOutcomeHS(outcomeText, likelihoodPct){
     return "No fit";
   }
   return "Unclear";
+}
+
+function adjustedLikelihood10(analysis, outcomeHS){
+  const fromPct = toOneToTenFromPct(analysis?.likelihood_to_close);
+  let score = fromPct ?? 5;
+  if (outcomeHS === "Proceed now") score = Math.max(score, 10);
+  return clamp(Math.round(score), 1, 10);
 }
 
 function mapProductInterest(products){
@@ -384,29 +443,49 @@ function buildDataPointsCaptured(kd){
   return items.join("\n").slice(0, 5000);
 }
 
-function buildCoachingSummary(analysis){
-  const s = String(analysis?.sales_performance_summary || "").trim();
-  if (s) return s.slice(0, 9000);
-  const ww = ensureArray(analysis?.summary).slice(0,2).map(x=>`- ${x}`).join("\n") || "- Rapport established.";
-  const imp = ["- Ask for a specific commitment.","- Confirm next step & date."].join("\n");
-  return `What went well:\n${ww}\n\nAreas to improve:\n${imp}`;
-}
+/** Build 20 consult_* flags from consult_eval (0/0.5/1) + light inference from analysis text. */
+function buildConsultFlags(analysis){
+  const ev = analysis?.consult_eval || {};
+  const yes01 = (v)=> Number(v) >= 0.75 ? 1 : (Number(v) > 0 ? 1 : 0);
+  const hasAny = (arr)=> ensureArray(arr).length ? 1 : 0;
+  const text = [
+    ...(ensureArray(analysis?.summary)),
+    ...(ensureArray(analysis?.next_actions)),
+    ...(ensureArray(analysis?.materials_to_send))
+  ].join(" ").toLowerCase();
 
-/* The nine Qual_* (0/1) you specified */
-function buildQualFromAnalysis(analysis){
-  const e = analysis?.consult_eval || {};
-  const as01 = (v)=> (Number(v) >= 0.75 ? 1 : Number(v) > 0 ? 1 : 0);
-  const inferHas = (arr)=> ensureArray(arr).length ? 1 : 0;
+  const outcomeHS = mapConsultationOutcomeHS(analysis?.outcome, analysis?.likelihood_to_close, analysis);
+  const like10 = adjustedLikelihood10(analysis, outcomeHS);
 
-  return {
-    benefits_linked_to_needs:     as01(e.benefits_linked_to_needs ?? 0),
-    clear_responses_or_followup:  as01(e.clear_responses_or_followup ?? 0),
-    commitment_requested:         as01(e.commitment_requested ?? 0),
-    intro:                        as01(e.intro ?? 1),
-    next_steps_confirmed:         as01(e.next_steps_confirmed ?? inferHas(analysis?.next_actions)),
-    open_question:                as01(e.open_question ?? 0.5),
-    rapport:                      as01(e.rapport_open ?? 1),
-    relevant_pain_identified:     as01(e.needs_pain_uncovered ?? 1),
-    services_explained_clearly:   as01(e.services_explained_clearly ?? 1),
+  const specificDateRegex = /\b(\d{1,2}\/\d{1,2}(\/\d{2,4})?|\bmon|tue|wed|thu|fri|sat|sun\b|\btomorrow\b|\bnext (mon|tue|wed|thu|fri|week)\b|\b\d{1,2}:\d{2}\b|\b(am|pm)\b)/i;
+  const feePhraseRegex = /\b(375|three[-\s]?seven[-\s]?five|£?375)\b/;
+  const buySignalRegex = /\b(ready|keen|let'?s proceed|go ahead|how do we|what next|timeline|when can we|send (the )?agreement|invoice|payment)\b/i;
+
+  const consult = {
+    consult_closing_question_asked:           yes01(ev.commitment_requested ?? 0),
+    consult_collected_dob_nin_when_agreed:    analysis?.key_details?.dob || analysis?.key_details?.ni || analysis?.key_details?.nino ? 1 : 0,
+    consult_confirm_reason_for_zoom:          yes01(ev.intro ?? 0) || /reason|purpose/.test(text) ? 1 : 0,
+    consult_customer_agreed_to_set_up:        outcomeHS === "Proceed now" || /\b(agree|agreed|sign|signed|purchase|bought|payment|onboard|set[-\s]?up)\b/i.test(text) ? 1 : 0,
+    consult_demo_tax_saving:                  /tax saving|save.*tax|tax-efficient/.test(text) ? 1 : 0,
+    consult_fee_phrasing_three_seven_five:    feePhraseRegex.test(text) ? 1 : 0,
+    consult_fees_annualised:                  yes01(ev.fees_annualised ?? 0) || /annualis|per year|per annum|p\.a\./i.test(text) ? 1 : 0,
+    consult_fees_tax_deductible_explained:    yes01(ev.fees_tax_deductible_explained ?? 0) || /tax[-\s]?deductible/.test(text) ? 1 : 0,
+    consult_interactive_throughout:           yes01(ev.interactive_throughout ?? 0.5),
+    consult_needs_pain_uncovered:             yes01(ev.needs_pain_uncovered ?? 0),
+    consult_next_contact_within_5_days:       /\b(1|2|3|4|5)\s*(day|days)\b/i.test(text) || /\btomorrow\b/i.test(text) ? 1 : 0,
+    consult_next_step_specific_date_time:     yes01(ev.next_step_specific_date_time ?? 0) || specificDateRegex.test(text) ? 1 : 0,
+    consult_no_assumptions_evidence_gathered: yes01(ev.clear_responses_or_followup ?? 0) || yes01(ev.active_listening ?? 0),
+    consult_overcame_objection_and_closed:    (ensureArray(analysis?.objections).length > 0 && (outcomeHS === "Proceed now" || like10 >= 8)) ? 1 : 0,
+    consult_prospect_asked_next_steps:        /\bwhat (are|’re|'re) (the )?next steps\b/i.test(text) ? 1 : 0,
+    consult_purpose_clearly_stated:           /purpose|agenda|we’ll cover|we will cover|today we’ll/i.test(text) ? 1 : 0,
+    consult_quantified_value_roi:             yes01(ev.quantified_value_roi ?? 0) || /\b(roi|return|save £?\d+|£\d+)/i.test(text) ? 1 : 0,
+    consult_rapport_open:                     yes01(ev.rapport_open ?? 0.5),
+    consult_specific_tax_estimate_given:      yes01(ev.specific_tax_estimate_given ?? 0) || /\b£\s*\d{2,}(,\d{3})*\b.*tax/i.test(text) ? 1 : 0,
+    consult_strong_buying_signals_detected:   buySignalRegex.test(text) || like10 >= 7 ? 1 : 0,
   };
+
+  return consult;
 }
+
+/* ================== Helper end ================== */
+
