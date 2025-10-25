@@ -7,7 +7,7 @@ dotenv.config();
 const HUBSPOT_TOKEN = process.env.HUBSPOT_TOKEN || process.env.HUBSPOT_API_KEY;
 const HS_BASE = "https://api.hubapi.com";
 
-// Your custom object
+// Your custom object (from your dump)
 const SCORECARD_OBJECT = process.env.HUBSPOT_SCORECARD_OBJECT || "p49487487_sales_scorecards";
 
 if (!HUBSPOT_TOKEN) {
@@ -73,7 +73,7 @@ export async function updateCall(callId, analysis) {
   const productInterest = mapProductInterest(analysis?.key_details?.products_discussed);
   if (productInterest) props.ai_product_interest = productInterest;
 
-  // Optional extras
+  // Optional extras if present in your prompts/models
   if (analysis?.ai_data_points_captured) props.ai_data_points_captured = toMultiline(analysis.ai_data_points_captured);
   if (analysis?.ai_missing_information)  props.ai_missing_information  = toMultiline(analysis.ai_missing_information);
 
@@ -85,8 +85,9 @@ export async function updateCall(callId, analysis) {
   if (analysis?.ai_escalation_required) props.ai_escalation_required = normaliseEscalation(analysis.ai_escalation_required);
   if (analysis?.ai_escalation_notes) props.ai_escalation_notes = toMultiline(analysis.ai_escalation_notes);
 
-  // Type-specific fields
+  // Type-specific fields: consultation vs follow-up
   if (inferredType === "Initial Consultation") {
+    // map 0–100 likelihood to /10 integer (1–10 min)
     if (typeof analysis?.likelihood_to_close === "number") {
       props.ai_consultation_likelihood_to_close = clamp(Math.max(1, Math.round(analysis.likelihood_to_close / 10)), 1, 10);
     }
@@ -96,7 +97,10 @@ export async function updateCall(callId, analysis) {
     if (Array.isArray(analysis?.next_actions) && analysis.next_actions.length) {
       props.ai_next_steps = analysis.next_actions.join("; ").slice(0, 5000);
     }
-    if (objections.length) props.ai_key_objections = objections.join("; ").slice(0, 1000);
+    if (objections.length) {
+      props.ai_key_objections = objections.join("; ").slice(0, 1000);
+    }
+    // ai_consultation_outcome exists but we leave unset unless you want a specific mapping
   }
 
   if (inferredType === "Follow up call") {
@@ -106,7 +110,9 @@ export async function updateCall(callId, analysis) {
     if (Array.isArray(analysis?.materials_to_send) && analysis.materials_to_send.length) {
       props.ai_follow_up_required_materials = analysis.materials_to_send.join("; ").slice(0, 5000);
     }
-    if (objections.length) props.ai_follow_up_objections_remaining = objections.join("; ").slice(0, 1000);
+    if (objections.length) {
+      props.ai_follow_up_objections_remaining = objections.join("; ").slice(0, 1000);
+    }
     if (Array.isArray(analysis?.next_actions) && analysis.next_actions.length) {
       props.ai_next_steps = analysis.next_actions.join("; ").slice(0, 5000);
     }
@@ -128,10 +134,13 @@ export async function createScorecard(analysis, { callId, contactIds = [], dealI
   const props = {
     activity_type: callType,
     activity_name: activityName,
+    // coaching summary (short, bullet-y)
     sales_scorecard___what_you_can_improve_on: buildCoachingNotes(analysis),
+
+    // performance: map 0..5 “overall” to 1..10 if present; else null
     sales_performance_rating_: toScoreOutOf10OrNull(analysis?.scorecard?.overall),
 
-    // AI copies living on scorecard
+    // “AI copies” that exist on scorecard per your dump:
     ai_next_steps: Array.isArray(analysis?.next_actions) && analysis.next_actions.length
       ? analysis.next_actions.join("; ").slice(0, 5000)
       : undefined,
@@ -142,6 +151,7 @@ export async function createScorecard(analysis, { callId, contactIds = [], dealI
     ai_decision_criteria: analysis?.ai_decision_criteria ? toMultiline(analysis.ai_decision_criteria) : undefined,
   };
 
+  // Consultation-only fields present on your scorecard:
   if (callType === "Initial Consultation" && typeof analysis?.likelihood_to_close === "number") {
     props.ai_consultation_likelihood_to_close = clamp(Math.max(1, Math.round(analysis.likelihood_to_close / 10)), 1, 10);
   }
@@ -153,9 +163,10 @@ export async function createScorecard(analysis, { callId, contactIds = [], dealI
     return { type: SCORECARD_OBJECT, id: null };
   }
 
-  await associateWithFallback(SCORECARD_OBJECT, scoreId, "calls", callId);
-  for (const cId of contactIds) await associateWithFallback(SCORECARD_OBJECT, scoreId, "contacts", cId);
-  for (const dId of dealIds) await associateWithFallback(SCORECARD_OBJECT, scoreId, "deals", dId);
+  // Associate scorecard ↔ call (primary), contacts, deals
+  await associateV4UsingLabels(SCORECARD_OBJECT, scoreId, "calls", callId);
+  for (const cId of contactIds) await associateV4UsingLabels(SCORECARD_OBJECT, scoreId, "contacts", cId);
+  for (const dId of dealIds) await associateV4UsingLabels(SCORECARD_OBJECT, scoreId, "deals", dId);
 
   return { type: SCORECARD_OBJECT, id: scoreId };
 }
@@ -205,7 +216,10 @@ async function hubspotPatch(path, body) {
   try { return await res.json(); } catch { return null; }
 }
 
-/* ========== Associations (v3 + v4) ========== */
+/* ========== Associations ========== */
+/**
+ * v3 batch association create (used for notes path).
+ */
 async function associateV3(fromType, fromId, toType, toId, type) {
   if (!fromId || !toId) return;
   const url = `${HS_BASE}/crm/v3/associations/${encodeURIComponent(fromType)}/${encodeURIComponent(toType)}/batch/create`;
@@ -218,28 +232,57 @@ async function associateV3(fromType, fromId, toType, toId, type) {
   }
 }
 
-async function associateWithFallback(fromType, fromId, toType, toId) {
+/**
+ * v4 association using the **actual labels** (category + typeId) returned by HubSpot
+ * This avoids the "association types don't match object types & direction" error.
+ */
+async function associateV4UsingLabels(fromType, fromId, toType, toId) {
   if (!fromId || !toId) return;
+
+  // Fetch available labels for this (fromType -> toType) direction
   const labelsUrl = `${HS_BASE}/crm/v4/associations/${encodeURIComponent(fromType)}/${encodeURIComponent(toType)}/labels`;
   const labelsRes = await fetch(labelsUrl, { headers: hsHeaders() });
   if (!labelsRes.ok) {
     const txt = await labelsRes.text().catch(() => "");
-    console.warn(`[HubSpot] association labels fetch failed: ${labelsRes.status} ${txt.slice(0, 300)}`);
+    console.warn(`[HubSpot] association labels fetch failed for ${fromType}->${toType}: ${labelsRes.status} ${txt.slice(0, 300)}`);
     return;
   }
   const labels = await labelsRes.json();
-  const typeId = labels?.results?.[0]?.typeId;
-  if (!typeId) {
-    console.warn("[HubSpot] No association typeId available for", fromType, "->", toType);
+  const labelList = labels?.results || [];
+  if (!labelList.length) {
+    console.warn(`[HubSpot] No association labels available for ${fromType} -> ${toType}`);
     return;
   }
-  const url = `${HS_BASE}/crm/v4/associations/${encodeURIComponent(fromType)}/${encodeURIComponent(toType)}/batch/create`;
-  const body = { inputs: [{ from: { id: String(fromId) }, to: { id: String(toId) }, types: [{ associationCategory: "HUBSPOT_DEFINED", associationTypeId: typeId }] }] };
-  const res = await fetch(url, { method: "POST", headers: hsHeaders(), body: JSON.stringify(body) });
-  if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    console.warn(`[HubSpot] v4 associate ${fromType}:${fromId} -> ${toType}:${toId} failed: ${res.status} ${txt.slice(0, 300)}`);
+
+  // Try each label until one succeeds (category may be USER_DEFINED or HUBSPOT_DEFINED)
+  for (const lab of labelList) {
+    const typeId = lab?.typeId;
+    const category = lab?.category || lab?.associationCategory || "USER_DEFINED";
+
+    if (!typeId) continue;
+
+    const url = `${HS_BASE}/crm/v4/associations/${encodeURIComponent(fromType)}/${encodeURIComponent(toType)}/batch/create`;
+    const body = {
+      inputs: [
+        {
+          from: { id: String(fromId) },
+          to: { id: String(toId) },
+          types: [{ associationCategory: String(category), associationTypeId: typeId }],
+        },
+      ],
+    };
+
+    const res = await fetch(url, { method: "POST", headers: hsHeaders(), body: JSON.stringify(body) });
+    if (res.ok) {
+      return; // success
+    } else {
+      const txt = await res.text().catch(() => "");
+      console.warn(`[HubSpot] v4 associate ${fromType}:${fromId} -> ${toType}:${toId} failed for label(typeId=${typeId}, category=${category}): ${res.status} ${txt.slice(0, 300)}`);
+      // try next label
+    }
   }
+
+  console.warn(`[HubSpot] v4 association failed for all labels: ${fromType} -> ${toType}`);
 }
 
 /* ========== Helpers / normalisers ========== */
@@ -275,27 +318,20 @@ function mapProductInterest(products){const arr=ensureArray(products).map(p=>p.t
 function normaliseSentiment(v){if(!v)return undefined; const s=String(v).toLowerCase(); if(s.includes("pos"))return"Positive"; if(s.includes("neu"))return"Neutral"; if(s.includes("neg"))return"Negative"; if(s.includes("win")||s.includes("close"))return"Positive"; if(s.includes("lost")||s.includes("no "))return"Negative"; return undefined;}
 function normaliseYesNoUnclear(v){const s=String(v||"").toLowerCase(); if(s.startsWith("y"))return"Yes"; if(s.startsWith("n"))return"No"; return"Unclear";}
 function normaliseEscalation(v){const s=String(v||"").toLowerCase(); if(s.startsWith("y")||s.startsWith("req"))return"Yes"; if(s.startsWith("mon"))return"Monitor"; return"No";}
-function arrToString(a){return Array.isArray(a)?a.join("; "):"n/a";}
 
-/** Build a short coaching summary for scorecard */
+/* Coaching summary helper (used in scorecard) */
 function buildCoachingNotes(analysis) {
-  const good = [];
-  const improve = [];
-
-  // Derive from analysis summary/scorecard
-  const s = ensureArray(analysis?.summary);
-  if (s.length) good.push("Clear summary captured");
-  if (Array.isArray(analysis?.next_actions) && analysis.next_actions.length) good.push("Specific next actions set");
-  if (Array.isArray(analysis?.materials_to_send) && analysis.materials_to_send.length) good.push("Materials promised");
-
-  const overall = toScoreOutOf10OrNull(analysis?.scorecard?.overall);
-  if (overall != null && overall < 6) improve.push("Strengthen discovery depth");
-  if (ensureArray(analysis?.objections).length) improve.push("Tighter objection handling");
-  if (!analysis?.likelihood_to_close || analysis.likelihood_to_close < 60) improve.push("Create crisper close plan");
-
-  const lines = [];
-  if (good.length) lines.push("What went well: " + good.slice(0, 3).join(" • "));
-  if (improve.length) lines.push("Areas to improve: " + improve.slice(0, 3).join(" • "));
-  const out = lines.join("\n");
-  return out.slice(0, 10000);
+  const positives = ensureArray(analysis?.summary)
+    .slice(0, 3)
+    .map(s => `✓ ${s}`)
+    .join("\n");
+  const improvements = ensureArray(analysis?.next_actions)
+    .slice(0, 3)
+    .map(s => `• ${s}`)
+    .join("\n");
+  return [`What went well:\n${positives}`, `\nAreas to improve:\n${improvements}`]
+    .join("\n")
+    .slice(0, 9000);
 }
+
+function arrToString(a){return Array.isArray(a)?a.join("; "):"n/a";}
