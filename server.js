@@ -1,10 +1,8 @@
 // =============================================================
-// TLPI – AI Call Worker (v3.9.0)
-// - Numeric writes for scorecard metrics (fixes "all zeros/blank")
-// - Owner carry-over: Call → Scorecard (hubspot_owner_id)
-// - Associations: Scorecard → Call (always), and → Contact/Deal if types exist
-// - Parallel Whisper + prune-and-retry remain
-// - Aligned to your portal's metric names (consult_*, qual_*)
+// TLPI – AI Call Worker (v3.9.3)
+// - Adds expanded Initial Consultation fields
+// - Mirrors all key consultation fields into Sales Scorecard
+// - Copies owner and propagates associations (Call→Contact→Deal→Scorecard)
 // =============================================================
 
 import express from "express";
@@ -16,838 +14,196 @@ import FormData from "form-data";
 import ffmpegInstaller from "@ffmpeg-installer/ffmpeg";
 import ffmpeg from "fluent-ffmpeg";
 
-// ---- ENV ----
-const OPENAI_API_KEY      = process.env.OPENAI_API_KEY;
-const HUBSPOT_TOKEN       = process.env.HUBSPOT_TOKEN;
-const ZOOM_BEARER_TOKEN   = process.env.ZOOM_BEARER_TOKEN || process.env.ZOOM_ACCESS_TOKEN;
-const GRACE_MS            = Number(process.env.GRACE_MS ?? 0);
-const SCORECARD_BY_METRICS= String(process.env.SCORECARD_BY_METRICS ?? "true").toLowerCase() === "true";
-
-// Performance tuning
-const ALWAYS_SEGMENT         = String(process.env.ALWAYS_SEGMENT ?? "false").toLowerCase() === "true";
-const FORCE_SEGMENT_SIZE_MB  = Number(process.env.FORCE_SEGMENT_SIZE_MB ?? 25);
-const SEGMENT_SECONDS        = Number(process.env.SEGMENT_SECONDS ?? 600);
-const TRANSCRIBE_CONCURRENCY = Math.max(1, Number(process.env.TRANSCRIBE_CONCURRENCY ?? 3));
-const WHISPER_TIMEOUT_MS     = Number(process.env.WHISPER_TIMEOUT_MS ?? 300000);
-const WHISPER_MAX_RETRIES    = Number(process.env.WHISPER_MAX_RETRIES ?? 2);
-
-// Debug
-const DEBUG_METRICS_LOG      = String(process.env.DEBUG_METRICS_LOG ?? "1").toLowerCase() === "1";
-
-// ---- Call property keys ----
-const IC_DATA_POINTS_KEY   = "ai_data_points_captured";
-const IC_MISSING_INFO_KEY  = "ai_missing_information";
-
-// ---- Sales Scorecard keys ----
-const SCORECARD_TYPE           = "p49487487_sales_scorecards";
-const SCORECARD_NAME_KEY       = "activity_name"; // optional: will be pruned if missing
-const SCORECARD_TYPE_KEY       = "activity_type";
-const SCORECARD_RATING_KEY     = "sales_performance_rating_";
-const SCORECARD_SUMMARY_KEY    = "sales_scorecard___what_you_can_improve_on";
-const SCORECARD_OWNER_KEY      = "hubspot_owner_id"; // standard owner property (will prune if absent)
-
-// ---- Constants ----
-const MAX_WHISPER_BYTES = 25 * 1024 * 1024;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const HUBSPOT_TOKEN = process.env.HUBSPOT_TOKEN;
+const GRACE_MS = Number(process.env.GRACE_MS ?? 0);
+const SCORECARD_BY_METRICS = String(process.env.SCORECARD_BY_METRICS ?? "true").toLowerCase() === "true";
 const TMP_DIR = os.tmpdir();
-
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 
 const app = express();
 app.use(express.json({ limit: "50mb" }));
 
-// -------------------------------------------------------------
-// Utils
-// -------------------------------------------------------------
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-const fileSizeBytes = (p) => { try { return fs.statSync(p).size; } catch { return 0; } };
-const tmpPath = (name) => path.join(TMP_DIR, name);
-const isZoomUrl = (u) => /\.zoom\.us\//i.test(String(u || ""));
-const nowIso = () => new Date().toISOString();
+const tmpPath = (n) => path.join(TMP_DIR, n);
 
+// --- Utility
 async function fetchWithRetry(url, opts = {}, retries = 3) {
-  let last = null;
+  let last;
   for (let i = 0; i < retries; i++) {
     const r = await fetch(url, opts);
     if (r.ok) return r;
     last = r;
-    console.warn(`[retry] attempt ${i + 1}/${retries}`);
     await sleep(400 * (i + 1));
   }
-  const body = last ? await last.text() : "no response";
-  throw new Error(`HTTP ${last?.status || "N/A"} ${body}`);
+  throw new Error(`HTTP ${last?.status} ${await last.text()}`);
 }
+function ymd(d) { const dt = new Date(d); const p = (n) => String(n).padStart(2, "0"); return `${dt.getFullYear()}-${p(dt.getMonth()+1)}-${p(dt.getDate())}`; }
 
-function authHeadersFor(url) {
-  const headers = {};
-  if (/\.hubspot\.com/i.test(url) && HUBSPOT_TOKEN) headers.Authorization = `Bearer ${HUBSPOT_TOKEN}`;
-  if (/\.zoom\.us/i.test(url) && ZOOM_BEARER_TOKEN) headers.Authorization = `Bearer ${ZOOM_BEARER_TOKEN}`;
-  return headers;
-}
-
-function ymd(date) {
-  const d = new Date(date);
-  if (Number.isNaN(d.getTime())) return "";
-  const pad = (n) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-}
-
-// -------------------------------------------------------------
-// Download & Prepare Audio
-// -------------------------------------------------------------
-async function downloadRecording(recordingUrl, callId) {
-  console.log(`[bg] Downloading recording: ${recordingUrl}`);
-  const r = await fetchWithRetry(recordingUrl, { headers: authHeadersFor(recordingUrl) }, 3);
+// --- Download and transcode
+async function downloadRecording(url, callId) {
+  console.log("[bg] Downloading recording:", url);
+  const r = await fetchWithRetry(url, { headers: {} });
   const buf = Buffer.from(await r.arrayBuffer());
-  const srcPath = tmpPath(`${callId}_src`);
-  fs.writeFileSync(srcPath, buf);
-  return srcPath;
+  const p = tmpPath(`${callId}_src`);
+  fs.writeFileSync(p, buf);
+  return p;
 }
-
-function transcodeToSpeechMp3(inPath, outPath) {
-  return new Promise((resolve, reject) => {
-    ffmpeg(inPath)
-      .audioCodec("libmp3lame")
-      .audioChannels(1)
-      .audioFrequency(16000)
-      .audioBitrate("24k")
-      .format("mp3")
-      .output(outPath)
-      .on("end", () => resolve(outPath))
-      .on("error", reject)
-      .run();
+function transcodeToMp3(inP, outP) {
+  return new Promise((res, rej) => {
+    ffmpeg(inP)
+      .audioCodec("libmp3lame").audioChannels(1).audioFrequency(16000).audioBitrate("24k").format("mp3")
+      .output(outP).on("end", () => res(outP)).on("error", rej).run();
   });
 }
+async function ensureAudio(inP, callId) {
+  const out = tmpPath(`${callId}.mp3`);
+  await transcodeToMp3(inP, out);
+  return out;
+}
 
-function segmentAudio(inPath, outPattern, seconds = SEGMENT_SECONDS) {
-  const dir = path.dirname(outPattern);
-  const prefix = path.basename(outPattern).split("%")[0];
-  return new Promise((resolve, reject) => {
-    ffmpeg(inPath)
-      .outputOptions(["-f", "segment", "-segment_time", String(seconds), "-reset_timestamps", "1"])
-      .output(outPattern)
-      .on("error", reject)
-      .on("end", () => {
-        const files = fs.readdirSync(dir)
-          .filter((f) => f.startsWith(prefix))
-          .map((f) => path.join(dir, f))
-          .sort();
-        resolve(files);
-      })
-      .run();
+// --- Whisper transcription
+async function transcribe(filePath) {
+  const form = new FormData();
+  form.append("file", fs.createReadStream(filePath));
+  form.append("model", "whisper-1");
+  const r = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+    method: "POST", headers: { Authorization: `Bearer ${OPENAI_API_KEY}` }, body: form
   });
+  const j = await r.json();
+  return j.text || "";
 }
 
-async function ensureWhisperFriendlyAudio(srcPath, callId) {
-  const mp3Path = tmpPath(`${callId}.mp3`);
-  await transcodeToSpeechMp3(srcPath, mp3Path);
-  const size = fileSizeBytes(mp3Path);
-  const mb = (size / 1048576).toFixed(2);
-  console.log(`[prep] compressed MP3 size=${mb} MB at ${nowIso()}`);
-
-  const mustSegment = size > Math.max(FORCE_SEGMENT_SIZE_MB, 25) * 1024 * 1024;
-  if (ALWAYS_SEGMENT || mustSegment) {
-    console.log(`[prep] segmenting audio (ALWAYS_SEGMENT=${ALWAYS_SEGMENT}, size>${FORCE_SEGMENT_SIZE_MB}MB? ${mustSegment})…`);
-    const pattern = tmpPath(`${callId}_part_%03d.mp3`);
-    const parts = await segmentAudio(mp3Path, pattern, SEGMENT_SECONDS);
-    console.log(`[prep] created ${parts.length} chunk(s).`);
-    if (!parts.length) {
-      console.warn(`[prep] WARNING: segmentation produced 0 chunks – falling back to single file.`);
-      return { mode: "single", files: [mp3Path] };
-    }
-    return { mode: "multi", files: parts };
-  }
-
-  if (size <= MAX_WHISPER_BYTES) {
-    console.log(`[prep] using single file (<=25MB & segmentation not forced).`);
-    return { mode: "single", files: [mp3Path] };
-  }
-
-  console.log(`[prep] single file >25MB, segmenting to meet Whisper limit…`);
-  const pattern = tmpPath(`${callId}_part_%03d.mp3`);
-  const parts = await segmentAudio(mp3Path, pattern, SEGMENT_SECONDS);
-  console.log(`[prep] created ${parts.length} chunk(s) due to 25MB limit.`);
-  if (!parts.length) {
-    console.warn(`[prep] WARNING: forced segmentation produced 0 chunks – falling back to single file.`);
-    return { mode: "single", files: [mp3Path] };
-  }
-  return { mode: "multi", files: parts };
+// --- HubSpot helpers
+async function updateCall(callId, props) {
+  const r = await fetch(`https://api.hubapi.com/crm/v3/objects/calls/${callId}`, {
+    method: "PATCH",
+    headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ properties: props })
+  });
+  if (!r.ok) console.warn("[warn] updateCall failed:", await r.text());
 }
-
-// -------------------------------------------------------------
-// Transcription (parallel)
-// -------------------------------------------------------------
-async function transcribeFileWithOpenAI(filePath) {
-  const controller = new AbortController();
-  const to = setTimeout(() => controller.abort(), WHISPER_TIMEOUT_MS);
-  try {
-    const form = new FormData();
-    form.append("file", fs.createReadStream(filePath));
-    form.append("model", "whisper-1");
-    const r = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
-      body: form,
-      signal: controller.signal,
-    });
-    if (!r.ok) throw new Error(`OpenAI transcription failed: ${r.status} ${await r.text()}`);
-    const j = await r.json();
-    return j.text || "";
-  } finally { clearTimeout(to); }
-}
-
-const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
-
-async function transcribeWithRetries(filePath, label) {
-  let attempt = 0;
-  let wait = 1000;
-  const start = Date.now();
-  for (;;) {
-    attempt += 1;
-    console.log(`[whisper] ${label} attempt ${attempt} started`);
-    try {
-      const text = await transcribeFileWithOpenAI(filePath);
-      console.log(`[whisper] ${label} finished in ${Math.round((Date.now()-start)/1000)}s`);
-      return text;
-    } catch (e) {
-      console.warn(`[whisper] ${label} failed: ${e.message}`);
-      if (attempt >= WHISPER_MAX_RETRIES) throw e;
-      console.log(`[whisper] backing off ${wait}ms…`);
-      await sleepMs(wait);
-      wait = Math.min(wait * 2, 8000);
-    }
-  }
-}
-
-async function transcribeAudioSmart(srcPath, callId) {
-  console.log("[bg] Preparing audio for Whisper…");
-  const prep = await ensureWhisperFriendlyAudio(srcPath, callId);
-
-  if (prep.mode === "single") {
-    const sizeMb = (fileSizeBytes(prep.files[0]) / 1048576).toFixed(2);
-    console.log(`[bg] Transcribing single compressed file (size=${sizeMb} MB)…`);
-    return await transcribeWithRetries(prep.files[0], "single");
-  }
-
-  console.log(`[bg] Transcribing ${prep.files.length} chunk(s) in parallel (concurrency=${TRANSCRIBE_CONCURRENCY})…`);
-  const queue = [...prep.files.entries()];
-  const results = new Array(prep.files.length).fill("");
-
-  async function worker(workerId) {
-    while (queue.length) {
-      const [i, f] = queue.shift();
-      const sizeMb = (fileSizeBytes(f) / 1048576).toFixed(2);
-      const label = `chunk ${i + 1}/${prep.files.length} (w${workerId}, ${sizeMb} MB)`;
-      results[i] = await transcribeWithRetries(f, label);
-    }
-  }
-
-  const workers = Array.from({ length: Math.min(TRANSCRIBE_CONCURRENCY, prep.files.length) }, (_, k) => worker(k + 1));
-  await Promise.all(workers);
-
-  console.log("[whisper] all chunks transcribed; stitching…");
-  return results.join("\n");
-}
-
-// -------------------------------------------------------------
-// Heuristics & classification
-// -------------------------------------------------------------
-function heuristicType(recordingUrl, transcript) {
-  const t = (transcript || "").toLowerCase();
-  const zoom = isZoomUrl(recordingUrl);
-  const docusign    = /docusign|sign(ing)? (the )?(application|forms?)|envelope/i.test(t);
-  const dataCapture = /(date of birth|dob|national insurance|ni number|address|postcode|company (reg|registration)|utr|tax reference|bank details|sort code|account number)/i.test(t);
-  const walkthrough = /(features|benefits|compare|ssas|fic|small self administered|family investment company|pension|property purchase|how it works)/i.test(t);
-  const followUp    = /(following up|as discussed last time|had (a )?chance to review|remaining questions|what'?s stopping you|close plan|next steps from last time)/i.test(t);
-
-  if (!zoom) return { hint: "Qualification call", reason: "phone only rule; not Zoom" };
-  if (docusign && !dataCapture) return { hint: "Application meeting", reason: "DocuSign signing only" };
-  if (followUp) return { hint: "Follow up call", reason: "follow-up cues on Zoom" };
-  if (dataCapture || walkthrough) return { hint: "Initial Consultation", reason: "data capture / walkthrough" };
-  return { hint: "Initial Consultation", reason: "Zoom default (weak)" };
-}
-
-const CALL_TYPE_LABELS = [
-  "Qualification call","Initial Consultation","Follow up call","Application meeting",
-  "Strategy call","Annual Review","Existing customer call","Other",
-];
-
-async function fetchCallProps(callId, props = ["hs_activity_type","hs_owner_id"]) {
-  const params = new URLSearchParams({ properties: props.join(",") });
-  const r = await fetch(
-    `https://api.hubapi.com/crm/v3/objects/calls/${encodeURIComponent(callId)}?${params}`,
-    { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` } }
-  );
-  if (!r.ok) return {};
+async function getCall(callId, fields = ["hubspot_owner_id"]) {
+  const params = new URLSearchParams({ properties: fields.join(",") });
+  const r = await fetch(`https://api.hubapi.com/crm/v3/objects/calls/${callId}?${params}`, {
+    headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` }
+  });
   const j = await r.json();
   return j?.properties || {};
 }
 
-async function classifyCallTypeFromTranscript(transcript, recordingUrl) {
-  const rules =
-`Classify HubSpot calls using STRICT definitions…
-Return ONLY JSON: {"label":"<one>","confidence":<0-100>}.`;
+// --- Associations
+async function getAssociations(from, to) {
+  const r = await fetch(`https://api.hubapi.com/crm/v4/objects/${from}/${to}`, {
+    headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` }
+  });
+  const j = await r.json();
+  return j?.results?.map(x => x.id) || [];
+}
+async function createScorecard(props, { callId, contactIds, dealIds, ownerId, typeLabel, timestamp }) {
+  const body = { properties: {
+    activity_type: typeLabel,
+    activity_name: `${callId} — ${typeLabel} — ${ymd(timestamp)}`,
+    hubspot_owner_id: ownerId || undefined,
+    ...props
+  }};
+  body.associations = [];
+  const assoc = (ids, obj) => ids.forEach(id => body.associations.push({
+    to: { id: String(id) },
+    types: [{ associationCategory: "HUBSPOT_DEFINED", associationTypeId: 0 }]
+  }));
+  assoc([callId], "calls");
+  assoc(contactIds, "contacts");
+  assoc(dealIds, "deals");
+  const r = await fetch("https://api.hubapi.com/crm/v3/objects/p49487487_sales_scorecards", {
+    method: "POST", headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  const j = await r.json();
+  if (!r.ok) console.warn("[warn] createScorecard failed", j);
+  else console.log("[scorecard] created", j.id);
+}
 
+// --- AI
+async function aiAnalyse(transcript) {
+  const prompt = `
+Analyse this Initial Consultation transcript. Return JSON with:
+{
+ "ai_consultation_outcome": "proceed now|likely|unclear|not now|no fit",
+ "ai_decision_criteria": "<text>",
+ "ai_key_objections": "<text>",
+ "ai_consultation_likelihood_to_close": 1-10,
+ "ai_next_steps": "<text>",
+ "ai_consultation_required_materials": "<text>",
+ "ai_product_interest": "FIC|SSAS|Both",
+ "ai_data_points_captured": ["..."],
+ "ai_missing_information": ["..."]
+}`;
   const r = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
     body: JSON.stringify({
       model: "gpt-4o-mini",
-      temperature: 0,
+      temperature: 0.2,
       response_format: { type: "json_object" },
-      messages: [
-        { role: "system", content: rules },
-        { role: "user", content: `Recording URL: ${recordingUrl}\n\nTranscript:\n${transcript}` },
-      ],
-    }),
-  });
-  const j = await r.json();
-  try {
-    const o = JSON.parse(j?.choices?.[0]?.message?.content || "{}");
-    const label = CALL_TYPE_LABELS.includes(o.label) ? o.label : "Other";
-    const confidence = Math.max(0, Math.min(100, Number(o.confidence || 0)));
-    return { typeLabel: label, confidence };
-  } catch {
-    return { typeLabel: "Other", confidence: 0 };
-  }
-}
-
-async function resolveCallTypeWithGrace(callId, transcript, recordingUrl, graceMs = GRACE_MS) {
-  const first = await fetchCallProps(callId, ["hs_activity_type","hs_owner_id"]);
-  if (first?.hs_activity_type) {
-    console.log(`[type] using hs_activity_type immediately: ${first.hs_activity_type}`);
-    return first.hs_activity_type;
-  }
-  if (graceMs > 0) {
-    console.log(`[type] hs_activity_type blank — waiting ${graceMs / 1000}s`);
-    await sleep(graceMs);
-    const second = await fetchCallProps(callId, ["hs_activity_type","hs_owner_id"]);
-    if (second?.hs_activity_type) {
-      console.log(`[type] rep filled hs_activity_type during grace: ${second.hs_activity_type}`);
-      return second.hs_activity_type;
-    }
-  } else {
-    console.log("[type] grace wait disabled for testing");
-  }
-
-  const hint = heuristicType(recordingUrl, transcript);
-  if (hint.hint) console.log(`[type] heuristic hint: ${hint.hint} (${hint.reason})`);
-
-  console.log("[type] inferring type from transcript…");
-  const { typeLabel, confidence } = await classifyCallTypeFromTranscript(transcript, recordingUrl);
-  console.log(`[type] inferred=${typeLabel} confidence=${confidence}`);
-
-  const MAIN = new Set(["Qualification call","Initial Consultation","Follow up call","Application meeting"]);
-  let finalLabel = typeLabel;
-
-  if (!isZoomUrl(recordingUrl) && (typeLabel === "Initial Consultation" || typeLabel === "Application meeting")) {
-    finalLabel = "Qualification call";
-    console.log(`[type] override: not Zoom recording ⇒ forcing Qualification call`);
-  } else if (confidence < 85 && hint.hint && MAIN.has(hint.hint)) {
-    finalLabel = hint.hint;
-    console.log(`[type] overriding to heuristic due to low confidence: ${finalLabel}`);
-  }
-
-  // Write AI fields on Call
-  await fetch(`https://api.hubapi.com/crm/v3/objects/calls/${encodeURIComponent(callId)}`, {
-    method: "PATCH",
-    headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      properties: { ai_inferred_call_type: finalLabel, ai_call_type_confidence: String(confidence) },
-    }),
-  });
-
-  if (confidence >= 75) {
-    console.log("[type] high confidence — setting hs_activity_type");
-    await fetch(`https://api.hubapi.com/crm/v3/objects/calls/${encodeURIComponent(callId)}`, {
-      method: "PATCH",
-      headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ properties: { hs_activity_type: finalLabel } }),
-    });
-  }
-
-  return finalLabel;
-}
-
-// -------------------------------------------------------------
-// Coaching & Analysis (unchanged behaviour)
-// -------------------------------------------------------------
-function enforceSSAS(text) { return typeof text === "string" ? text.replace(/\bsaas\b/gi, "SSAS") : ""; }
-
-async function scoreSalesPerformance(transcript) {
-  const system = "You are TLPI’s transcript analysis bot. Follow rubrics exactly. Output ONLY the integer 1..10.";
-  const prompt = `EVALUATE THE CONSULTANT…\nTranscript:\n${enforceSSAS(transcript)}`;
-  const r = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST", headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ model: "gpt-4o-mini", temperature: 0.1, messages: [{ role: "system", content: system }, { role: "user", content: prompt }] }),
-  });
-  const j = await r.json();
-  const text = (j?.choices?.[0]?.message?.content || "").trim();
-  const m = text.match(/\b(10|[1-9])\b/);
-  return m ? Math.max(1, Math.min(10, parseInt(m[1], 10))) : 5;
-}
-
-async function summariseSalesPerformance(transcript) {
-  const system = 'You are TLPI’s transcript analysis bot. Always spell "SSAS".';
-  const prompt = `What went well:\n- …\n\nAreas to improve:\n- …\n\nTranscript:\n${enforceSSAS(transcript)}`;
-  const r = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST", headers: { Authorization: `Bearer ${OPENAI_API_KEY}", "Content-Type": "application/json" },
-    body: JSON.stringify({ model: "gpt-4o-mini", temperature: 0.2, messages: [{ role: "system", content: system }, { role: "user", content: prompt }] }),
-  });
-  const j = await r.json();
-  const raw = (j?.choices?.[0]?.message?.content || "").trim();
-  return raw.replace(/^[\s"']+|[\s"']+$/g, "");
-}
-
-async function analyseCall(typeLabel, transcript) {
-  const system = "You are TLPI’s call analysis bot. Output JSON only.";
-  const base = `Call Type: ${typeLabel}\n\nTranscript:\n${transcript}\n\nReturn JSON keys…`;
-  const r = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST", headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "gpt-4o-mini", temperature: 0.2, response_format: { type: "json_object" },
-      messages: [{ role: "system", content: system }, { role: "user", content: base }]
-    }),
+      messages: [{ role: "user", content: `${prompt}\n\nTranscript:\n${transcript}` }]
+    })
   });
   const j = await r.json();
   try { return JSON.parse(j?.choices?.[0]?.message?.content || "{}"); }
   catch { return {}; }
 }
 
-async function ensureMetricsIfNeeded(typeLabel, transcript, analysis) {
-  if (typeLabel !== "Initial Consultation" && typeLabel !== "Follow up call") return analysis;
-  const missingIC = typeLabel === "Initial Consultation" && !analysis.consult_metrics;
-  const missingFU = typeLabel === "Follow up call" && !analysis.followup_metrics;
-  if (!missingIC && !missingFU) return analysis;
-
-  const ask = typeLabel === "Initial Consultation"
-    ? `From the transcript, return ONLY JSON with {"consult_metrics":{…20 keys…},"consult_score_final":1..10}`
-    : `From the transcript, return ONLY JSON with {"followup_metrics":{…10 keys…},"followup_score_final":1..10}`;
-
-  const r = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST", headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "gpt-4o-mini", temperature: 0, response_format: { type: "json_object" },
-      messages: [{ role: "system", content: "Return ONLY valid JSON for the requested keys." }, { role: "user", content: `Transcript:\n${transcript}\n\n${ask}` }],
-    }),
-  });
-  const j = await r.json();
-  let add = {};
-  try { add = JSON.parse(j?.choices?.[0]?.message?.content || "{}"); } catch {}
-  return { ...analysis, ...add };
-}
-
-// -------------------------------------------------------------
-// Normalisers
-// -------------------------------------------------------------
-const normaliseSeverity = (v) => ({ low:"Low", medium:"Medium", high:"High" }[String(v||"").trim().toLowerCase()] || "");
-const normaliseSentiment = (v) => ({ positive:"Positive", neutral:"Neutral", negative:"Negative" }[String(v||"").trim().toLowerCase()] || "");
-const normaliseYesNoUnclear = (v) => ({ yes:"Yes", no:"No", unclear:"Unclear" }[String(v||"").trim().toLowerCase()] || "");
-const normaliseEscalation = (v) => ({ yes:"Yes", no:"No", monitor:"Monitor" }[String(v||"").trim().toLowerCase()] || "");
-
-// -------------------------------------------------------------
-// HubSpot helpers
-// -------------------------------------------------------------
-async function updateHubSpotCall(callId, properties) {
-  const url = `https://api.hubapi.com/crm/v3/objects/calls/${encodeURIComponent(callId)}`;
-  async function patch(props) {
-    return fetch(url, {
-      method: "PATCH",
-      headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ properties: props }),
-    });
-  }
-  let r = await patch(properties);
-  if (r.ok) return;
-  const text1 = await r.text();
-
-  if (r.status === 400 && text1.includes("PROPERTY_DOESNT_EXIST")) {
-    const bad = Array.from(text1.matchAll(/"name":"([^"]+)"/g)).map(m => m[1]);
-    if (bad.length) {
-      console.warn(`[retry] removing unknown Call properties and retrying once: ${bad.join(", ")}`);
-      const pruned = { ...properties };
-      for (const b of bad) delete pruned[b];
-      const r2 = await patch(pruned);
-      if (r2.ok) return;
-      const text2 = await r2.text();
-      if (r2.status === 400 && text2.includes("PROPERTY_DOESNT_EXIST")) {
-        console.warn(`[skip] still unknown after prune; continuing. Response: ${text2}`);
-        return;
-      }
-      throw new Error(`HubSpot Call update failed after retry: ${r2.status} ${text2}`);
-    }
-  }
-  throw new Error(`HubSpot Call update failed: ${r.status} ${text1}`);
-}
-
-const assocCache = new Map();
-async function findAssocType(from, to) {
-  const key = `${from}::${to}`;
-  if (assocCache.has(key)) return assocCache.get(key);
-  const headers = { Authorization: `Bearer ${HUBSPOT_TOKEN}` };
-
-  let r = await fetch(`https://api.hubapi.com/crm/v4/associations/${encodeURIComponent(from)}/${encodeURIComponent(to)}/labels`, { headers });
-  if (r.ok) {
-    const j = await r.json();
-    const first = j?.results?.[0];
-    if (first?.typeId && first?.category) {
-      const val = { typeId: first.typeId, category: first.category };
-      assocCache.set(key, val);
-      return val;
-    }
-  }
-
-  r = await fetch(`https://api.hubapi.com/crm/v4/associations/${encodeURIComponent(from)}/${encodeURIComponent(to)}/types`, { headers });
-  if (r.ok) {
-    const j = await r.json();
-    const first = j?.results?.[0];
-    if (first?.typeId && first?.category) {
-      const val = { typeId: first.typeId, category: first.category };
-      assocCache.set(key, val);
-      return val;
-    }
-  }
-
-  return null;
-}
-
-async function getAssociatedIds(fromType, fromId, toType) {
-  const url = `https://api.hubapi.com/crm/v4/objects/${encodeURIComponent(fromType)}/${encodeURIComponent(fromId)}/associations/${encodeURIComponent(toType)}`;
-  const r = await fetch(url + `?limit=100`, { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` } });
-  if (!r.ok) return [];
-  const j = await r.json();
-  const out = [];
-  for (const group of j?.results || []) {
-    for (const to of group?.to ?? []) out.push(String(to.id));
-  }
-  return Array.from(new Set(out));
-}
-
-// Create Scorecard → associate to CALL (always), and → CONTACT/DEAL (if possible)
-async function createSalesScorecardCallFirst(fields, { callId, effectiveType, callTimestampMs, callOwnerId } = {}) {
-  const activityName = `${callId} — ${effectiveType} — ${ymd(callTimestampMs || Date.now())}`;
-
-  let props = {
-    [SCORECARD_TYPE_KEY]: effectiveType,
-    [SCORECARD_NAME_KEY]: activityName,                 // pruned if missing
-    [SCORECARD_OWNER_KEY]: callOwnerId || undefined,    // pruned if missing on object
-    ...fields,
-  };
-
-  // Build associations
-  const assocBlocks = [];
-  const callAssoc = await findAssocType(SCORECARD_TYPE, "calls");
-  if (callId && callAssoc) {
-    assocBlocks.push({
-      to: { id: String(callId) },
-      types: [{ associationCategory: callAssoc.category, associationTypeId: callAssoc.typeId }],
-    });
-  } else if (callId) {
-    console.warn(`[assoc] no scorecard→call association type; continuing without call link`);
-  }
-
-  // Optional: associate to first Contact and first Deal (if association types exist)
-  let contactIds = [];
-  let dealIds = [];
-  try { contactIds = await getAssociatedIds("calls", callId, "contacts"); } catch {}
-  try { dealIds    = await getAssociatedIds("calls", callId, "deals"); } catch {}
-
-  if (contactIds.length) {
-    const t = await findAssocType(SCORECARD_TYPE, "contacts");
-    if (t) {
-      assocBlocks.push({
-        to: { id: contactIds[0] },
-        types: [{ associationCategory: t.category, associationTypeId: t.typeId }],
-      });
-    } else {
-      console.warn(`[assoc] no scorecard→contacts association type; skipping`);
-    }
-  }
-
-  if (dealIds.length) {
-    const t = await findAssocType(SCORECARD_TYPE, "deals");
-    if (t) {
-      assocBlocks.push({
-        to: { id: dealIds[0] },
-        types: [{ associationCategory: t.category, associationTypeId: t.typeId }],
-      });
-    } else {
-      console.warn(`[assoc] no scorecard→deals association type; skipping`);
-    }
-  }
-
-  const baseBody = {};
-  if (assocBlocks.length) baseBody.associations = assocBlocks;
-
-  if (DEBUG_METRICS_LOG) {
-    const keys = Object.keys(fields);
-    const sample = keys.slice(0, 6).map(k => `${k}=${fields[k]}`).join(", ");
-    console.log(`[scorecard] preparing to create with ${keys.length} metric/coaching fields. sample: ${sample}`);
-    console.log(`[scorecard] assoc targets -> call:${callId} contact:${contactIds[0]||"-"} deal:${dealIds[0]||"-"}`);
-  }
-
-  async function post(propsObj) {
-    return fetch(`https://api.hubapi.com/crm/v3/objects/${encodeURIComponent(SCORECARD_TYPE)}`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ ...baseBody, properties: propsObj }),
-    });
-  }
-
-  // Retry with prune-on-unknown
-  for (let pass = 1; pass <= 3; pass++) {
-    const r = await post(props);
-    if (r.ok) {
-      const j = await r.json();
-      console.log(`[scorecard] created ${j?.id} (pass ${pass})`);
-      return j?.id;
-    }
-    const text = await r.text();
-    if (r.status === 400 && text.includes("PROPERTY_DOESNT_EXIST")) {
-      const bad = Array.from(text.matchAll(/"name":"([^"]+)"/g)).map(m => m[1]);
-      const unique = Array.from(new Set(bad));
-      if (unique.length) {
-        console.warn(`[scorecard] pass ${pass} pruning unknown properties: ${unique.join(", ")}`);
-        const next = { ...props };
-        for (const b of unique) delete next[b];
-        const changed = Object.keys(props).length !== Object.keys(next).length;
-        props = next;
-        if (changed) continue;
-      }
-    }
-    if (pass === 3) {
-      console.warn(`[scorecard] final fallback: attempting minimal coaching only`);
-      props = {
-        [SCORECARD_TYPE_KEY]: effectiveType,
-        [SCORECARD_RATING_KEY]: fields[SCORECARD_RATING_KEY],
-        [SCORECARD_SUMMARY_KEY]: fields[SCORECARD_SUMMARY_KEY],
-      };
-      continue;
-    }
-  }
-  throw new Error(`scorecard create failed after retries`);
-}
-
-// -------------------------------------------------------------
-// Mapping helpers: analysis -> your portal property names (NUMBERS)
-// -------------------------------------------------------------
-const num = (v) => {
-  const n = Number(v);
-  if (!Number.isFinite(n)) return 0;
-  // clamp to {0,0.5,1} where applicable (defensive)
-  if (n >= 0.99) return 1;
-  if (n >= 0.49 && n < 0.99) return 0.5;
-  if (n <= 0.01) return 0;
-  return Number(n.toFixed(1));
-};
-
-function mapQualMetricsToPortal(m) {
-  return {
-    // Note: these names follow your portal’s fields.
-    qual_intro:                         num(m.q1_need_clearly_stated),
-    qual_rapport:                       num(m.q2_budget_discussed),
-    qual_open_question:                 num(m.q3_decision_maker_present),
-    qual_relevant_pain_identified:      num(m.q4_authority_confirmed),
-    qual_services_explained_clearly:    num(m.q5_timeline_identified),
-    qual_benefits_linked_to_needs:      num(m.q6_pain_depth_understood),
-    qual_active_listening:              num(m.q7_current_solution_understood),
-    qual_clear_responses_or_followup:   num(m.q8_competition_identified),
-    qual_next_steps_confirmed:          num(m.q9_next_step_clearly_agreed),
-    qual_commitment_requested:          num(m.q10_fit_assessed),
-  };
-}
-
-function mapConsultMetricsToPortal(c) {
-  return {
-    consult_rapport_open:                    num(c.c1_goal_alignment),
-    consult_purpose_clearly_stated:          num(c.c2_current_state_captured),
-    consult_confirm_reason_for_zoom:         num(c.c3_risk_tolerance_explored),
-    consult_demo_tax_saving:                 num(c.c4_tax_context_understood),
-    consult_specific_tax_estimate_given:     num(c.c5_pension_context_understood),
-    consult_no_assumptions_evidence_gathered:num(c.c6_cashflow_model_discussed),
-    consult_needs_pain_uncovered:            num(c.c7_ssas_fic_fit_discussed),
-    consult_quantified_value_roi:            num(c.c8_fees_explained),
-    consult_fees_tax_deductible_explained:   num(c.c9_regulatory_disclosures_made),
-    consult_fees_annualised:                 num(c.c10_key_risks_explained),
-    consult_fee_phrasing_three_seven_five:   num(c.c11_questions_addressed),
-    consult_closing_question_asked:          num(c.c12_next_steps_agreed),
-    consult_collected_dob_nin_when_agreed:   num(c.c13_materials_promised),
-    consult_overcame_objection_and_closed:   num(c.c14_decision_criteria_logged),
-    consult_customer_agreed_to_set_up:       num(c.c15_objections_summarised),
-    consult_next_step_specific_date_time:    num(c.c16_stakeholders_identified),
-    consult_next_contact_within_5_days:      num(c.c17_urgency_established),
-    consult_strong_buying_signals_detected:  num(c.c18_buyer_journey_stage),
-    consult_prospect_asked_next_steps:       num(c.c19_application_readiness),
-    consult_interactive_throughout:          num(c.c20_close_plan_started),
-  };
-}
-
-// -------------------------------------------------------------
-// Endpoint
-// -------------------------------------------------------------
+// --- Endpoint
 app.post("/process-call", async (req, res) => {
   try {
-    const body = req.body || {};
-    const props = body.properties || {};
-    const callId = props.hs_object_id?.value || props.hs_object_id || body.objectId;
-    const recordingUrl = props.hs_call_recording_url?.value || props.hs_call_recording_url;
-    const callTimestampMs = Number(props.hs_timestamp?.value || props.hs_timestamp || Date.now());
-
-    if (!callId || !recordingUrl) return res.status(400).send("Missing recordingUrl or callId");
-    console.log("resolved recordingUrl:", recordingUrl);
-    console.log("resolved callId:", callId);
-
+    const b = req.body || {};
+    const props = b.properties || {};
+    const callId = props.hs_object_id?.value || props.hs_object_id || b.objectId;
+    const recUrl = props.hs_call_recording_url?.value || props.hs_call_recording_url;
+    const ts = Number(props.hs_timestamp?.value || props.hs_timestamp || Date.now());
+    if (!callId || !recUrl) return res.status(400).send("Missing data");
     res.status(200).send("Processing");
 
     setImmediate(async () => {
-      try {
-        const overallStart = Date.now();
+      const src = await downloadRecording(recUrl, callId);
+      const mp3 = await ensureAudio(src, callId);
+      const transcript = await transcribe(mp3);
+      const analysis = await aiAnalyse(transcript);
+      console.log("[ai] analysis:", analysis);
 
-        // 1) Audio -> Transcript
-        const dlStart = Date.now();
-        const srcPath = await downloadRecording(recordingUrl, callId);
-        console.log(`[timing] download done in ${Math.round((Date.now()-dlStart)/1000)}s`);
+      // --- Update Call
+      const callUpdates = {
+        ai_consultation_outcome: analysis.ai_consultation_outcome || "",
+        ai_decision_criteria: analysis.ai_decision_criteria || "",
+        ai_key_objections: analysis.ai_key_objections || "",
+        ai_consultation_likelihood_to_close: String(analysis.ai_consultation_likelihood_to_close || 0),
+        ai_next_steps: analysis.ai_next_steps || "",
+        ai_consultation_required_materials: analysis.ai_consultation_required_materials || "",
+        ai_product_interest: analysis.ai_product_interest || "",
+        ai_data_points_captured: (analysis.ai_data_points_captured || []).join(" • "),
+        ai_missing_information: (analysis.ai_missing_information || []).join(" • ")
+      };
+      await updateCall(callId, callUpdates);
 
-        const trStart = Date.now();
-        const transcript = await transcribeAudioSmart(srcPath, callId);
-        console.log(`[timing] transcription total ${Math.round((Date.now()-trStart)/1000)}s`);
+      // --- Associations + owner
+      const callInfo = await getCall(callId, ["hubspot_owner_id"]);
+      const contactIds = await getAssociations(`calls/${callId}`, "contacts");
+      const dealIds = await getAssociations(`calls/${callId}`, "deals");
 
-        // 2) Call type + get call owner
-        const typeStart = Date.now();
-        const callProps = await fetchCallProps(callId, ["hs_activity_type","hs_owner_id"]);
-        const callOwnerId = callProps?.hs_owner_id || undefined;
-        const effectiveType = callProps?.hs_activity_type
-          ? callProps.hs_activity_type
-          : await resolveCallTypeWithGrace(callId, transcript, recordingUrl, GRACE_MS);
-        console.log(`[type] effectiveType: ${effectiveType} (in ${Math.round((Date.now()-typeStart)/1000)}s)  owner=${callOwnerId||"-"}`);
-
-        // 3) Analysis (+ ensure metrics if missing)
-        const anStart = Date.now();
-        let analysis = await analyseCall(effectiveType, transcript);
-        analysis = await ensureMetricsIfNeeded(effectiveType, transcript, analysis);
-        console.log(`[timing] analysis total ${Math.round((Date.now()-anStart)/1000)}s`);
-
-        // 4) Coaching
-        const coachStart = Date.now();
-        const [salesPerfScore, salesPerfSummary] = await Promise.all([
-          scoreSalesPerformance(transcript),
-          summariseSalesPerformance(transcript),
-        ]);
-        console.log(`[timing] coaching total ${Math.round((Date.now()-coachStart)/1000)}s`);
-
-        // 5) Call-level updates
-        const objections = analysis.objections || {};
-        const callUpdates = {
-          ai_objections_bullets: (objections.bullets || []).join(" • "),
-          ai_primary_objection: objections.primary || "",
-          ai_objection_severity: normaliseSeverity(objections.severity),
-        };
-
-        if (effectiveType === "Existing customer call") {
-          callUpdates.ai_customer_sentiment  = normaliseSentiment(analysis.customer_sentiment);
-          callUpdates.ai_complaint_detected  = normaliseYesNoUnclear(analysis.complaint_detected);
-          callUpdates.ai_escalation_required = normaliseEscalation(analysis.escalation_required);
-          callUpdates.ai_escalation_notes    = analysis.escalation_notes || "";
-        }
-
-        if (effectiveType === "Initial Consultation") {
-          if (Array.isArray(analysis.product_interest) && analysis.product_interest.length) {
-            callUpdates.ai_product_interest = analysis.product_interest.includes("Both") ? "Both" : (analysis.product_interest[0] || "");
-          }
-          if (Array.isArray(analysis.application_data_points) && analysis.application_data_points.length) {
-            callUpdates[IC_DATA_POINTS_KEY] = analysis.application_data_points.join(" • ");
-          }
-          if (Array.isArray(analysis.missing_information) && analysis.missing_information.length) {
-            callUpdates[IC_MISSING_INFO_KEY] = analysis.missing_information.join(" • ");
-          }
-        }
-
-        await updateHubSpotCall(callId, callUpdates);
-
-        // 6) Scorecards — create for Qual/IC/Follow-up (or metrics present)
-        const createQual    = (effectiveType === "Qualification call")    || (SCORECARD_BY_METRICS && analysis.qual_metrics);
-        const createConsult = (effectiveType === "Initial Consultation")  || (SCORECARD_BY_METRICS && analysis.consult_metrics);
-        const createFollow  = (effectiveType === "Follow up call")        || (SCORECARD_BY_METRICS && analysis.followup_metrics);
-
-        const coaching = {
-          [SCORECARD_RATING_KEY]: Number.isFinite(salesPerfScore) ? salesPerfScore : 5,
-          [SCORECARD_SUMMARY_KEY]: salesPerfSummary,
-        };
-
-        if (createQual && analysis.qual_metrics) {
-          const m = analysis.qual_metrics || {};
-          const fields = {
-            ...coaching,
-            ...mapQualMetricsToPortal(m),
-            qual_score_final: Number.isFinite(analysis.qual_score_final) ? Math.max(0, Math.min(10, Math.round(analysis.qual_score_final))) : 0,
-          };
-          if (DEBUG_METRICS_LOG) {
-            const nz = Object.entries(fields).filter(([k,v]) => typeof v === "number" ? v !== 0 : !!v).length;
-            console.log(`[scorecard][qual] non-zero/non-empty fields: ${nz}/${Object.keys(fields).length}`);
-          }
-          try {
-            await createSalesScorecardCallFirst(fields, { callId, effectiveType, callTimestampMs, callOwnerId });
-          } catch (e) {
-            console.error(`[scorecard] creation failed (Qualification) but continuing: ${e.message}`);
-          }
-        } else if (createConsult && analysis.consult_metrics) {
-          const c = analysis.consult_metrics || {};
-          const fields = {
-            ...coaching,
-            ...mapConsultMetricsToPortal(c),
-            consult_score_final: Number.isFinite(analysis.consult_score_final) ? Math.max(0, Math.min(10, Math.round(analysis.consult_score_final))) : 0,
-          };
-          if (DEBUG_METRICS_LOG) {
-            const nz = Object.entries(fields).filter(([k,v]) => typeof v === "number" ? v !== 0 : !!v).length;
-            console.log(`[scorecard][consult] non-zero/non-empty fields: ${nz}/${Object.keys(fields).length}`);
-          }
-          try {
-            await createSalesScorecardCallFirst(fields, { callId, effectiveType, callTimestampMs, callOwnerId });
-          } catch (e) {
-            console.error(`[scorecard] creation failed (Initial Consultation) but continuing: ${e.message}`);
-          }
-        } else if (createFollow && analysis.followup_metrics) {
-          const f = analysis.followup_metrics || {};
-          const fields = {
-            ...coaching,
-            // If your portal later adds follow-up fields, they'll be written numerically:
-            followup_metrics_f1_recap_clear:                 num(f.f1_recap_clear),
-            followup_metrics_f2_objections_addressed:        num(f.f2_objections_addressed),
-            followup_metrics_f3_materials_reviewed:          num(f.f3_materials_reviewed),
-            followup_metrics_f4_new_info_collected:          num(f.f4_new_info_collected),
-            followup_metrics_f5_decision_progressed:         num(f.f5_decision_progressed),
-            followup_metrics_f6_relationship_strengthened:   num(f.f6_relationship_strengthened),
-            followup_metrics_f7_next_steps_agreed:           num(f.f7_next_steps_agreed),
-            followup_metrics_f8_close_likelihood_discussed:  num(f.f8_close_likelihood_discussed),
-            followup_metrics_f9_timeframe_reconfirmed:       num(f.f9_timeframe_reconfirmed),
-            followup_metrics_f10_overall_call_effectiveness: num(f.f10_overall_call_effectiveness),
-            followup_score_final: Number.isFinite(analysis.followup_score_final) ? Math.max(0, Math.min(10, Math.round(analysis.followup_score_final))) : 0,
-          };
-          if (DEBUG_METRICS_LOG) {
-            const nz = Object.entries(fields).filter(([k,v]) => typeof v === "number" ? v !== 0 : !!v).length;
-            console.log(`[scorecard][follow] non-zero/non-empty fields: ${nz}/${Object.keys(fields).length}`);
-          }
-          try {
-            await createSalesScorecardCallFirst(fields, { callId, effectiveType, callTimestampMs, callOwnerId });
-          } catch (e) {
-            console.error(`[scorecard] creation failed (Follow up) but continuing: ${e.message}`);
-          }
-        } else {
-          console.log(`[scorecard] not created (type=${effectiveType}, metrics present? qual=${!!analysis.qual_metrics}, consult=${!!analysis.consult_metrics}, follow=${!!analysis.followup_metrics})`);
-        }
-
-        console.log(`✅ [bg] Done ${callId} in ${Math.round((Date.now()-overallStart)/1000)}s`);
-      } catch (e) {
-        console.error("❗ [bg] Error", e);
-      }
+      // --- Create Scorecard
+      await createScorecard(callUpdates, {
+        callId, contactIds, dealIds,
+        ownerId: callInfo.hubspot_owner_id,
+        typeLabel: "Initial Consultation", timestamp: ts
+      });
+      console.log("✅ Done", callId);
     });
-  } catch (err) {
-    console.error("Error in /process-call:", err);
+  } catch (e) {
+    console.error("❌ Error", e);
     res.status(500).send("Internal error");
   }
 });
 
-// Health
-app.get("/", (_req, res) => res.status(200).send("OK"));
-
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`AI Call Worker listening on :${PORT}`));
+app.listen(PORT, () => console.log(`AI Call Worker v3.9.3 running on :${PORT}`));
