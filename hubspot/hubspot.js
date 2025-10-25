@@ -6,8 +6,6 @@ dotenv.config();
 
 const HUBSPOT_TOKEN = process.env.HUBSPOT_TOKEN || process.env.HUBSPOT_API_KEY;
 const HS_BASE = "https://api.hubapi.com";
-
-// Custom Scorecard object
 const SCORECARD_OBJECT = process.env.HUBSPOT_SCORECARD_OBJECT || "p49487487_sales_scorecards";
 
 if (!HUBSPOT_TOKEN) console.warn("[cfg] HUBSPOT_TOKEN missing — HubSpot updates will fail.");
@@ -45,7 +43,7 @@ export async function getAssociations(fromId, toType) {
 export async function updateCall(callId, analysis) {
   const props = {};
 
-  // SUMMARY: use hs_call_summary (this is what HubSpot renders on the call)
+  // SUMMARY (HubSpot renders this): hs_call_summary
   const summaryStr = arrayToBullets(analysis?.summary, "• ") || "No summary generated.";
   props.hs_call_summary = summaryStr.slice(0, 5000);
 
@@ -58,7 +56,7 @@ export async function updateCall(callId, analysis) {
   if (conf != null) props.ai_call_type_confidence = conf;
   if (inferredType && conf >= 75) props.hs_activity_type = inferredType;
 
-  // Objections (text fields defaulted so nothing looks blank)
+  // Objections
   const objections = ensureArray(analysis?.objections);
   if (objections.length) {
     props.ai_objections_bullets = objections.join(" • ").slice(0, 5000);
@@ -66,21 +64,19 @@ export async function updateCall(callId, analysis) {
     props.ai_key_objections = objections.join("; ").slice(0, 1000);
     props.ai_objection_categories = mapObjectionCategories(objections).join("; ") || "Not mentioned.";
     props.ai_objection_severity = analysis?.ai_objection_severity
-      ? normaliseSeverity(analysis.ai_objection_severity)
-      : "Medium"; // default when objections exist
+      ? normaliseSeverity(analysis.ai_objection_severity) : "Medium";
   } else {
     props.ai_objections_bullets = "No objections mentioned.";
     props.ai_primary_objection = "None.";
     props.ai_key_objections = "None.";
     props.ai_objection_categories = "None.";
-    // don't set severity if there are none
   }
 
-  // Product interest (dropdown only if clear)
+  // Product interest (dropdown)
   const productInterest = mapProductInterest(analysis?.key_details?.products_discussed);
   if (productInterest) props.ai_product_interest = productInterest;
 
-  // Data points captured (or default)
+  // Data points captured
   const kd = analysis?.key_details || {};
   const dp = [];
   if (kd.client_name) dp.push(`Client: ${kd.client_name}`);
@@ -89,7 +85,7 @@ export async function updateCall(callId, analysis) {
   if (kd.timeline) dp.push(`Timeline: ${kd.timeline}`);
   props.ai_data_points_captured = (dp.length ? dp.join("\n") : "Not mentioned.");
 
-  // Missing info & decision criteria (derive or default)
+  // Missing info & decision criteria
   props.ai_missing_information = toMultiline(analysis?.ai_missing_information) || "Not mentioned.";
   let decisionCriteria = toMultiline(analysis?.ai_decision_criteria);
   if (!decisionCriteria) {
@@ -98,14 +94,13 @@ export async function updateCall(callId, analysis) {
   }
   props.ai_decision_criteria = decisionCriteria.slice(0, 1000);
 
-  // Recommendations provided
-  if (Array.isArray(analysis?.materials_to_send) && analysis.materials_to_send.length) {
-    props.ai_recommendations_provided = analysis.materials_to_send.join("; ").slice(0, 5000);
-  } else {
-    props.ai_recommendations_provided = "None promised.";
-  }
+  // Recommendations
+  props.ai_recommendations_provided =
+    (Array.isArray(analysis?.materials_to_send) && analysis.materials_to_send.length)
+      ? analysis.materials_to_send.join("; ").slice(0, 5000)
+      : "None promised.";
 
-  // Sentiment/engagement/complaint/escalation (safe defaults)
+  // Sentiment etc.
   const sentiment = normaliseSentiment(analysis?.ai_customer_sentiment || analysis?.outcome) || "Neutral";
   props.ai_customer_sentiment = sentiment;
   props.ai_client_engagement_level = sentimentToEngagement(sentiment);
@@ -113,42 +108,42 @@ export async function updateCall(callId, analysis) {
   props.ai_escalation_required = normaliseEscalation(analysis?.ai_escalation_required || "No");
   props.ai_escalation_notes = toMultiline(analysis?.ai_escalation_notes) || "No escalation required.";
 
-  // Type-specific
+  // IC specifics
   if (inferredType === "Initial Consultation") {
     if (typeof analysis?.likelihood_to_close === "number") {
       props.ai_consultation_likelihood_to_close = clamp(Math.max(1, Math.round(analysis.likelihood_to_close / 10)), 1, 10);
     }
     props.ai_consultation_outcome = mapConsultationOutcome(analysis?.outcome || "Monitor");
-    if (Array.isArray(analysis?.materials_to_send) && analysis.materials_to_send.length) {
-      props.ai_consultation_required_materials = analysis.materials_to_send.join("; ").slice(0, 5000);
-    } else {
-      props.ai_consultation_required_materials = "No materials required.";
-    }
-    if (Array.isArray(analysis?.next_actions) && analysis.next_actions.length) {
-      props.ai_next_steps = analysis.next_actions.join("; ").slice(0, 5000);
-    } else {
-      props.ai_next_steps = "No next steps captured.";
-    }
+    props.ai_consultation_required_materials =
+      (Array.isArray(analysis?.materials_to_send) && analysis.materials_to_send.length)
+        ? analysis.materials_to_send.join("; ").slice(0, 5000)
+        : "No materials required.";
+    props.ai_next_steps =
+      (Array.isArray(analysis?.next_actions) && analysis.next_actions.length)
+        ? analysis.next_actions.join("; ").slice(0, 5000)
+        : "No next steps captured.";
   }
 
   if (inferredType === "Follow up call") {
     if (typeof analysis?.likelihood_to_close === "number") {
       props.ai_follow_up_close_likelihood = clamp(Math.max(1, Math.round(analysis.likelihood_to_close / 10)), 1, 10);
     }
-    props.ai_follow_up_required_materials = (Array.isArray(analysis?.materials_to_send) && analysis.materials_to_send.length)
-      ? analysis.materials_to_send.join("; ").slice(0, 5000)
-      : "No materials required.";
+    props.ai_follow_up_required_materials =
+      (Array.isArray(analysis?.materials_to_send) && analysis.materials_to_send.length)
+        ? analysis.materials_to_send.join("; ").slice(0, 5000)
+        : "No materials required.";
     props.ai_follow_up_objections_remaining = objections.length
       ? objections.join("; ").slice(0, 1000)
       : "No objections remaining.";
-    props.ai_next_steps = (Array.isArray(analysis?.next_actions) && analysis.next_actions.length)
-      ? analysis.next_actions.join("; ").slice(0, 5000)
-      : "No next steps captured.";
+    props.ai_next_steps =
+      (Array.isArray(analysis?.next_actions) && analysis.next_actions.length)
+        ? analysis.next_actions.join("; ").slice(0, 5000)
+        : "No next steps captured.";
   }
 
   const patchResp = await hubspotPatch(`crm/v3/objects/calls/${encodeURIComponent(callId)}`, { properties: props });
 
-  // DEBUG: read back the key fields so we know they saved
+  // DEBUG echo
   try {
     const echo = await getHubSpotObject("calls", callId, ["ai_inferred_call_type","ai_call_type_confidence","hs_activity_type","hs_call_summary"]);
     console.log("[debug] Call after update:", {
@@ -171,45 +166,79 @@ export async function createScorecard(analysis, { callId, contactIds = [], dealI
   const callType = normaliseCallType(analysis?.call_type) || "Initial Consultation";
   const activityName = `${callId} — ${callType} — ${new Date().toISOString().slice(0, 10)}`;
 
+  // ---- ingest consult metrics from analysis.consult_eval ----
+  const consult = analysis?.consult_eval || {};
+  // rubric items 0/0.5/1
+  const R = {
+    consult_intro: consult.intro,
+    consult_rapport_open: consult.rapport_open,
+    consult_open_question: consult.open_question,
+    consult_needs_pain_uncovered: consult.needs_pain_uncovered,
+    consult_services_explained_clearly: consult.services_explained_clearly,
+    consult_benefits_linked_to_needs: consult.benefits_linked_to_needs,
+    consult_active_listening: consult.active_listening,
+    consult_clear_responses_or_followup: consult.clear_responses_or_followup,
+    consult_commitment_requested: consult.commitment_requested,
+    consult_next_steps_confirmed: consult.next_steps_confirmed,
+  };
+  // operational items 0 or 10 (normalise to 0..1)
+  const Oraw = {
+    consult_specific_tax_estimate_given: consult.specific_tax_estimate_given, // 0 or 10
+    consult_fees_tax_deductible_explained: consult.fees_tax_deductible_explained, // 0 or 10
+    consult_next_step_specific_date_time: consult.next_step_specific_date_time, // 0 or 10
+    consult_interactive_throughout: consult.interactive_throughout, // 0 or 10
+    consult_quantified_value_roi: consult.quantified_value_roi, // 0 or 10
+  };
+  const O = Object.fromEntries(Object.entries(Oraw).map(([k,v]) => [k, normaliseZeroTen(v)]));
+
+  // write-through props (only when provided)
   const props = {
     activity_type: callType,
     activity_name: activityName,
-    hubspot_owner_id: ownerId || undefined, // copy owner to scorecard
-    // coaching + rating (use model output if present; else fallbacks)
+    hubspot_owner_id: ownerId || undefined,
+
+    // coaching + rating
     sales_scorecard___what_you_can_improve_on:
       (analysis?.sales_performance_summary && String(analysis.sales_performance_summary).slice(0, 9000))
       || buildCoachingNotes(analysis),
-    sales_performance_rating_:
-      (toNumberOrNull(analysis?.sales_performance_rating)) ??
-      toScoreOutOf10OrNull(analysis?.scorecard?.overall),
-
-    // Mirrors (with safe defaults)
-    ai_next_steps: Array.isArray(analysis?.next_actions) && analysis.next_actions.length
-      ? analysis.next_actions.join("; ").slice(0, 5000)
-      : "No next steps captured.",
-    ai_key_objections: ensureArray(analysis?.objections).length
-      ? ensureArray(analysis?.objections).join("; ").slice(0, 1000)
-      : "None.",
-    ai_consultation_required_materials: Array.isArray(analysis?.materials_to_send) && analysis.materials_to_send.length
-      ? analysis.materials_to_send.join("; ").slice(0, 5000)
-      : "No materials required.",
-    ai_decision_criteria: (() => {
-      const dc = toMultiline(analysis?.ai_decision_criteria);
-      if (dc) return dc.slice(0, 1000);
-      const crit = inferDecisionCriteriaFromSummary(analysis?.summary || []);
-      return (crit.length ? crit.join("; ") : "Not mentioned.").slice(0, 1000);
-    })(),
+    // 1–10 (string+number): write both variants
+    sales_performance_rating: String(clamp(Math.round(toNumberOrNull(analysis?.sales_performance_rating) ?? 0), 1, 10)),
   };
 
-  // Initial Consultation: optional likelihood mapping
+  // copy consult metrics onto scorecard if present
+  for (const [prop, val] of Object.entries(R)) {
+    const n = toScore01(val);
+    if (n != null) props[prop] = n;
+  }
+  for (const [prop, val] of Object.entries(O)) {
+    const n = toScore01(val);
+    if (n != null) props[prop] = n === 1 ? 10 : 0; // keep 0 or 10 in CRM as requested
+  }
+
+  // compute 0–100 weighted score → sales_performance_rating_
+  const weighted = computeWeightedScore(R, O);
+  if (weighted != null) props.sales_performance_rating_ = weighted;
+
+  // mirrors
+  props.ai_next_steps = Array.isArray(analysis?.next_actions) && analysis.next_actions.length
+    ? analysis.next_actions.join("; ").slice(0, 5000)
+    : "No next steps captured.";
+  props.ai_key_objections = ensureArray(analysis?.objections).length
+    ? ensureArray(analysis?.objections).join("; ").slice(0, 1000)
+    : "None.";
+  props.ai_consultation_required_materials = Array.isArray(analysis?.materials_to_send) && analysis.materials_to_send.length
+    ? analysis.materials_to_send.join("; ").slice(0, 5000)
+    : "No materials required.";
+  props.ai_decision_criteria = (() => {
+    const dc = toMultiline(analysis?.ai_decision_criteria);
+    if (dc) return dc.slice(0, 1000);
+    const crit = inferDecisionCriteriaFromSummary(analysis?.summary || []);
+    return (crit.length ? crit.join("; ") : "Not mentioned.").slice(0, 1000);
+  })();
+
   if (callType === "Initial Consultation" && typeof analysis?.likelihood_to_close === "number") {
     props.ai_consultation_likelihood_to_close = clamp(Math.max(1, Math.round(analysis.likelihood_to_close / 10)), 1, 10);
   }
-
-  // NOTE: Your Scorecard currently exposes fields like:
-  //   consult_purpose_clearly_stated, consult_needs_pain_uncovered, consult_specific_tax_estimate_given, ...
-  // These are different from the c1..c20 names I expected.
-  // I will ONLY populate these once you confirm the exact mapping (see Step 3 below).
 
   const created = await hubspotPost(`crm/v3/objects/${encodeURIComponent(SCORECARD_OBJECT)}`, { properties: props });
   const scoreId = created?.id;
@@ -330,6 +359,8 @@ function arrayToBullets(arr, bullet="• ") { const a = ensureArray(arr); return
 function toMultiline(v) { if (Array.isArray(v)) return v.join("\n"); if (v == null) return undefined; return String(v); }
 function toNumberOrNull(v) { if (v == null) return null; const n = Number(v); return Number.isFinite(n) ? n : null; }
 function clamp(n, lo, hi) { return Math.max(lo, Math.min(hi, n)); }
+function toScore01(v) { if (v === true) return 1; if (v === false) return 0; const n = Number(v); if (!Number.isFinite(n)) return null; if (n === 0 || n === 0.5 || n === 1) return n; return null; }
+function normaliseZeroTen(v){ const n = Number(v); if (!Number.isFinite(n)) return null; if (n===0) return 0; if (n===10) return 1; return null; }
 function toScoreOutOf10OrNull(v) { if (v == null) return null; const n = Number(v); if (!Number.isFinite(n)) return null; return n <= 5 ? clamp(Math.round(n * 2), 0, 10) : clamp(Math.round(n), 0, 10); }
 
 function normaliseCallType(v) {
@@ -361,20 +392,17 @@ function normaliseSentiment(v){ if(!v) return undefined; const s=String(v).toLow
   return "Neutral";
 }
 function sentimentToEngagement(sent){ return sent==="Positive"?"High":sent==="Neutral"?"Medium":"Low"; }
+function normaliseSeverity(v){const s=String(v||"").toLowerCase(); if(s.startsWith("h"))return"High"; if(s.startsWith("m"))return"Medium"; if(s.startsWith("l"))return"Low"; return undefined;}
 
 function mapProductInterest(products){ const arr=ensureArray(products).map(p=>p.toLowerCase());
   const hasSSAS=arr.some(p=>p.includes("ssas")), hasFIC=arr.some(p=>p.includes("fic"));
   if (hasSSAS && hasFIC) return "Both"; if (hasSSAS) return "SSAS"; if (hasFIC) return "FIC"; return undefined;
 }
-
 function mapConsultationOutcome(outcome){ const s=String(outcome||"").toLowerCase();
   if (s.includes("positive") || s.includes("win") || s.includes("proceed")) return "Likely";
   if (s.includes("negative") || s.includes("lost") || s.includes("no")) return "Not proceeding";
   return "Monitor";
 }
-
-function normaliseSeverity(v){const s=String(v||"").toLowerCase(); if(s.startsWith("h"))return"High"; if(s.startsWith("m"))return"Medium"; if(s.startsWith("l"))return"Low"; return undefined;}
-
 function mapObjectionCategories(objs){ const cats=new Set();
   const text=ensureArray(objs).join(" ").toLowerCase();
   if (/fee|cost|price/.test(text)) cats.add("Fees");
@@ -385,7 +413,6 @@ function mapObjectionCategories(objs){ const cats=new Set();
   if (/paperwork|process|admin/.test(text)) cats.add("Process");
   return Array.from(cats);
 }
-
 function inferDecisionCriteriaFromSummary(summaryArr){
   const s = ensureArray(summaryArr).join(" ").toLowerCase();
   const crit = [];
@@ -398,10 +425,32 @@ function inferDecisionCriteriaFromSummary(summaryArr){
   return Array.from(new Set(crit));
 }
 
-function buildCoachingNotes(analysis) {
-  const positives = ensureArray(analysis?.summary).slice(0, 3).map(s => `✓ ${s}`).join("\n") || "No positives captured.";
-  const improvements = ensureArray(analysis?.next_actions).slice(0, 3).map(s => `• ${s}`).join("\n") || "No improvement items captured.";
-  return [`What went well:\n${positives}`, `\nAreas to improve:\n${improvements}`].join("\n").slice(0, 9000);
+function computeWeightedScore(R, O){
+  // weights as agreed (sum = 100)
+  const W = {
+    consult_intro:4, consult_rapport_open:4, consult_open_question:8,
+    consult_needs_pain_uncovered:10, consult_services_explained_clearly:8,
+    consult_benefits_linked_to_needs:10, consult_active_listening:8,
+    consult_clear_responses_or_followup:8, consult_commitment_requested:12,
+    consult_next_steps_confirmed:12,
+    consult_specific_tax_estimate_given:4, consult_fees_tax_deductible_explained:4,
+    consult_next_step_specific_date_time:4, consult_interactive_throughout:4,
+    consult_quantified_value_roi:4,
+  };
+
+  let total = 0;
+
+  for (const [prop, w] of Object.entries(W)) {
+    if (prop in R) {
+      const s = toScore01(R[prop]); // 0/0.5/1
+      if (s != null) total += s * w;
+    } else if (prop in O) {
+      const s = toScore01(O[prop]); // 0/1 after normalisation
+      if (s != null) total += s * w;
+    }
+  }
+  // clamp to 0..100 (integer)
+  return Math.max(0, Math.min(100, Math.round(total)));
 }
 
 function arrToString(a){return Array.isArray(a)?a.join("; "):"n/a";}
