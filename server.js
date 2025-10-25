@@ -1,11 +1,11 @@
 // =============================================================
-// TLPI – AI Call Worker (v3.0)
-// - IC field keys: ai_data_points_captured / ai_missing_information
-// - MUST-return consultation metrics; second-pass fallback if missing
-// - Scorecards only: Qualification / Initial Consultation / Follow up
-// - Robust updater: prunes unknown HubSpot props, retries, continues
-// - Heuristic + rules-based call-type classification (Zoom vs phone,
-//   data-capture vs DocuSign) per your latest definitions
+// TLPI – AI Call Worker (v3.1)
+// - IC fields: ai_data_points_captured / ai_missing_information
+// - Scorecards for Qualification / Initial Consultation / Follow up
+// - Strong call-type rules (Zoom vs phone; data capture vs DocuSign)
+// - Robust HubSpot updater (prunes unknown props; retry; continue)
+// - Best-effort associations (always to Call; Contact/Deal if available)
+// - Whisper compression/chunking; grace for hs_activity_type
 // =============================================================
 
 import express from "express";
@@ -23,10 +23,10 @@ const HUBSPOT_TOKEN  = process.env.HUBSPOT_TOKEN;
 const ZOOM_BEARER_TOKEN = process.env.ZOOM_BEARER_TOKEN || process.env.ZOOM_ACCESS_TOKEN;
 const GRACE_MS = Number(process.env.GRACE_MS ?? 0); // 0 during testing
 
-// Optional: create scorecard when metrics block exists even if type mismatched
+// Optional: create scorecard if metrics exist even when type misclassified
 const SCORECARD_BY_METRICS = String(process.env.SCORECARD_BY_METRICS ?? "true").toLowerCase() === "true";
 
-// IC field keys (your portal)
+// IC field keys in your portal
 const IC_DATA_POINTS_KEY = "ai_data_points_captured";
 const IC_MISSING_INFO_KEY = "ai_missing_information";
 
@@ -156,23 +156,20 @@ async function transcribeAudioSmart(srcPath, callId) {
 }
 
 // -------------------------------------------------------------
-// Heuristics for call type
+// Heuristics for call type (assist the model)
 // -------------------------------------------------------------
 function heuristicType(recordingUrl, transcript) {
   const t = (transcript || "").toLowerCase();
   const zoom = isZoomUrl(recordingUrl);
 
-  const docusign = /docusign|sign(ing)? (the )?(application|forms?)|envelope/i.test(t);
+  const docusign   = /docusign|sign(ing)? (the )?(application|forms?)|envelope/i.test(t);
   const dataCapture = /(date of birth|dob|national insurance|ni number|address|postcode|company (reg|registration)|utr|tax reference|bank details|sort code|account number)/i.test(t);
   const walkthrough = /(features|benefits|compare|ssas|fic|small self administered|family investment company|pension|property purchase|how it works)/i.test(t);
-  const followUp = /(following up|as discussed last time|had (a )?chance to review|remaining questions|what'?s stopping you|close plan|next steps from last time)/i.test(t);
-  const bookingConsult = /book (a|the) (zoom|consultation)|schedule (a|the) (zoom|consultation)/i.test(t);
+  const followUp    = /(following up|as discussed last time|had (a )?chance to review|remaining questions|what'?s stopping you|close plan|next steps from last time)/i.test(t);
 
   if (!zoom) {
-    // Not Zoom ⇒ cannot be IC or Application
     return { hint: "Qualification call", reason: "phone only rule; not Zoom" };
   } else {
-    // Zoom path
     if (docusign && !dataCapture) return { hint: "Application meeting", reason: "DocuSign signing only" };
     if (followUp) return { hint: "Follow up call", reason: "follow-up cues on Zoom" };
     if (dataCapture || walkthrough) return { hint: "Initial Consultation", reason: "data capture and/or walkthrough on Zoom" };
@@ -207,19 +204,19 @@ async function fetchCallProps(callId, props = ["hs_activity_type"]) {
 
 async function classifyCallTypeFromTranscript(transcript, recordingUrl) {
   const rules =
-`Classify HubSpot calls using these STRICT operational definitions:
+`Classify HubSpot calls using STRICT definitions:
 
 - Qualification call: PHONE ONLY. Discover interest/eligibility and book a Zoom consultation. Never a Zoom recording. No structured product walkthrough.
-- Initial Consultation: ZOOM ONLY. Explain SSAS/FIC/Both, answer questions, ask to proceed. MAY include capturing personal details (DOB, NI, address, etc.). These should be reflected in "application_data_points" / "missing_information".
+- Initial Consultation: ZOOM ONLY. Explain SSAS/FIC/Both, answer questions, ask to proceed. MAY include capturing personal details (DOB, NI, address, etc.) → fill "application_data_points"/"missing_information".
 - Follow up call: ZOOM. After the initial consultation. Address remaining objections, confirm materials were reviewed, attempt to close.
-- Application meeting: ZOOM ONLY. Sole purpose is completing DocuSign signing of the full pension application. Data already collected previously; do NOT capture new personal details here.
+- Application meeting: ZOOM ONLY. Sole purpose is completing DocuSign signing of the full pension application. Data was collected earlier; do NOT capture new personal details here.
 - Strategy / Annual Review / Existing customer / Other: as usual.
 
 Disambiguation:
-- If non-Zoom recording => NOT Initial Consultation / Application (likely Qualification).
-- If DocuSign/“sign the application/envelope” and no data capture => Application meeting.
-- If personal data capture occurs on Zoom => Initial Consultation (not Application).
-- If follow-up cues (“as discussed last time”, “had a chance to review”, “remaining questions”, “close plan”) => Follow up call.
+- Non-Zoom recording ⇒ NOT Initial Consultation/Application (likely Qualification).
+- DocuSign signing without data capture ⇒ Application meeting.
+- Personal data capture on Zoom ⇒ Initial Consultation (not Application).
+- Follow-up cues (“as discussed last time”, “had a chance to review”, “remaining questions”, “close plan”) ⇒ Follow up call.
 
 Return ONLY JSON: {"label":"<one>","confidence":<0-100>}.`;
 
@@ -284,6 +281,7 @@ async function resolveCallTypeWithGrace(callId, transcript, recordingUrl, graceM
     console.log(`[type] overriding to heuristic due to low confidence: ${finalLabel}`);
   }
 
+  // Write AI fields
   await fetch(`https://api.hubapi.com/crm/v3/objects/calls/${encodeURIComponent(callId)}`, {
     method: "PATCH",
     headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}`, "Content-Type": "application/json" },
@@ -308,7 +306,7 @@ async function resolveCallTypeWithGrace(callId, transcript, recordingUrl, graceM
 }
 
 // -------------------------------------------------------------
-// Analysis (with MUST-return blocks + second-pass ensure)
+// Analysis (+ MUST-return metric blocks; second-pass ensure)
 // -------------------------------------------------------------
 async function analyseCall(typeLabel, transcript) {
   const system = "You are TLPI’s call analysis bot. Output JSON only.";
@@ -431,57 +429,18 @@ If Call Type is "Existing customer call", include:
   catch { return {}; }
 }
 
-// If IC or Follow-up metrics missing, do a focused second pass
+// Ensure metrics exist for IC/Follow-up (second pass if needed)
 async function ensureMetricsIfNeeded(typeLabel, transcript, analysis) {
   if (typeLabel !== "Initial Consultation" && typeLabel !== "Follow up call") return analysis;
-
   const missingIC = typeLabel === "Initial Consultation" && !analysis.consult_metrics;
   const missingFU = typeLabel === "Follow up call" && !analysis.followup_metrics;
   if (!missingIC && !missingFU) return analysis;
 
   const ask = typeLabel === "Initial Consultation"
-    ? `From the transcript, return ONLY JSON with keys:
-{
-  "consult_metrics": {
-    "c1_goal_alignment": 0|0.5|1,
-    "c2_current_state_captured": 0|0.5|1,
-    "c3_risk_tolerance_explored": 0|0.5|1,
-    "c4_tax_context_understood": 0|0.5|1,
-    "c5_pension_context_understood": 0|0.5|1,
-    "c6_cashflow_model_discussed": 0|0.5|1,
-    "c7_ssas_fic_fit_discussed": 0|0.5|1,
-    "c8_fees_explained": 0|0.5|1,
-    "c9_regulatory_disclosures_made": 0|0.5|1,
-    "c10_key_risks_explained": 0|0.5|1,
-    "c11_questions_addressed": 0|0.5|1,
-    "c12_next_steps_agreed": 0|0.5|1,
-    "c13_materials_promised": 0|0.5|1,
-    "c14_decision_criteria_logged": 0|0.5|1,
-    "c15_objections_summarised": 0|0.5|1,
-    "c16_stakeholders_identified": 0|0.5|1,
-    "c17_urgency_established": 0|0.5|1,
-    "c18_buyer_journey_stage": 0|0.5|1,
-    "c19_application_readiness": 0|0.5|1,
-    "c20_close_plan_started": 0|0.5|1
-  },
-  "consult_score_final": <integer 1..10>
-}`
-    : `From the transcript, return ONLY JSON with keys:
-{
-  "followup_metrics": {
-    "f1_recap_clear": 0|0.5|1,
-    "f2_objections_addressed": 0|0.5|1,
-    "f3_materials_reviewed": 0|0.5|1,
-    "f4_new_info_collected": 0|0.5|1,
-    "f5_decision_progressed": 0|0.5|1,
-    "f6_relationship_strengthened": 0|0.5|1,
-    "f7_next_steps_agreed": 0|0.5|1,
-    "f8_close_likelihood_discussed": 0|0.5|1,
-    "f9_timeframe_reconfirmed": 0|0.5|1,
-    "f10_overall_call_effectiveness": 0|0.5|1
-  },
-  "followup_score_final": <integer 1..10>
-}`;
+    ? `From the transcript, return ONLY JSON with:
+{"consult_metrics": {"c1_goal_alignment":0|0.5|1,"c2_current_state_captured":0|0.5|1,"c3_risk_tolerance_explored":0|0.5|1,"c4_tax_context_understood":0|0.5|1,"c5_pension_context_understood":0|0.5|1,"c6_cashflow_model_discussed":0|0.5|1,"c7_ssas_fic_fit_discussed":0|0.5|1,"c8_fees_explained":0|0.5|1,"c9_regulatory_disclosures_made":0|0.5|1,"c10_key_risks_explained":0|0.5|1,"c11_questions_addressed":0|0.5|1,"c12_next_steps_agreed":0|0.5|1,"c13_materials_promised":0|0.5|1,"c14_decision_criteria_logged":0|0.5|1,"c15_objections_summarised":0|0.5|1,"c16_stakeholders_identified":0|0.5|1,"c17_urgency_established":0|0.5|1,"c18_buyer_journey_stage":0|0.5|1,"c19_application_readiness":0|0.5|1,"c20_close_plan_started":0|0.5|1},"consult_score_final":1..10}`
+    : `From the transcript, return ONLY JSON with:
+{"followup_metrics": {"f1_recap_clear":0|0.5|1,"f2_objections_addressed":0|0.5|1,"f3_materials_reviewed":0|0.5|1,"f4_new_info_collected":0|0.5|1,"f5_decision_progressed":0|0.5|1,"f6_relationship_strengthened":0|0.5|1,"f7_next_steps_agreed":0|0.5|1,"f8_close_likelihood_discussed":0|0.5|1,"f9_timeframe_reconfirmed":0|0.5|1,"f10_overall_call_effectiveness":0|0.5|1},"followup_score_final":1..10}`;
 
   const r = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
@@ -491,7 +450,7 @@ async function ensureMetricsIfNeeded(typeLabel, transcript, analysis) {
       temperature: 0,
       response_format: { type: "json_object" },
       messages: [
-        { role: "system", content: "Return ONLY valid JSON for the requested keys. No commentary." },
+        { role: "system", content: "Return ONLY valid JSON for the requested keys." },
         { role: "user", content: `Transcript:\n${transcript}\n\n${ask}` },
       ],
     }),
@@ -574,20 +533,32 @@ async function updateHubSpotCall(callId, properties) {
   throw new Error(`HubSpot update failed: ${r.status} ${text1}`);
 }
 
-// association helpers (discover type ids)
-const assocCache = new Map(); // key: `${from}::${to}` -> id
-async function getAssociationTypeId(from, to) {
+// Association helpers — best-effort (never block creation)
+const assocCache = new Map(); // key: `${from}::${to}` -> typeId
+
+async function findAssocTypeId(from, to) {
   const key = `${from}::${to}`;
   if (assocCache.has(key)) return assocCache.get(key);
-  const r = await fetch(`https://api.hubapi.com/crm/v4/associations/${encodeURIComponent(from)}/${encodeURIComponent(to)}/labels`, {
-    headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` }
-  });
-  if (!r.ok) throw new Error(`assoc labels failed: ${r.status} ${await r.text()}`);
-  const j = await r.json();
-  const id = j?.results?.[0]?.typeId;
-  if (!id) throw new Error(`no association type between ${from} and ${to}`);
-  assocCache.set(key, id);
-  return id;
+
+  const headers = { Authorization: `Bearer ${HUBSPOT_TOKEN}` };
+
+  // Try labels
+  let r = await fetch(`https://api.hubapi.com/crm/v4/associations/${encodeURIComponent(from)}/${encodeURIComponent(to)}/labels`, { headers });
+  if (r.ok) {
+    const j = await r.json();
+    const id = j?.results?.[0]?.typeId;
+    if (id) { assocCache.set(key, id); return id; }
+  }
+
+  // Try types
+  r = await fetch(`https://api.hubapi.com/crm/v4/associations/${encodeURIComponent(from)}/${encodeURIComponent(to)}/types`, { headers });
+  if (r.ok) {
+    const j = await r.json();
+    const id = j?.results?.[0]?.typeId;
+    if (id) { assocCache.set(key, id); return id; }
+  }
+
+  return null; // not found (don’t throw)
 }
 
 async function getCallAssociations(callId) {
@@ -603,23 +574,40 @@ async function getCallAssociations(callId) {
   return { contacts, deals };
 }
 
-const SCORECARD_TYPE = "p49487487_sales_scorecards"; // fully qualified name
+const SCORECARD_TYPE = "p49487487_sales_scorecards";
 
-async function createSalesScorecard(fields, associations = {}) {
+async function createSalesScorecard(fields, { callId, contactIds = [], dealIds = [] } = {}) {
   const body = { properties: fields };
   const assocBlocks = [];
 
-  if (associations.callId) {
-    const id = await getAssociationTypeId(SCORECARD_TYPE, "calls");
-    assocBlocks.push({ to: { id: String(associations.callId) }, types: [{ associationTypeId: id }] });
+  // Always try to associate to the Call (primary)
+  if (callId) {
+    const typeId = await findAssocTypeId(SCORECARD_TYPE, "calls");
+    if (typeId) {
+      assocBlocks.push({ to: { id: String(callId) }, types: [{ associationTypeId: typeId }] });
+    } else {
+      console.warn(`[assoc] no scorecard→call association type; creating scorecard without call link`);
+    }
   }
-  for (const cId of (associations.contactIds || [])) {
-    const id = await getAssociationTypeId(SCORECARD_TYPE, "contacts");
-    assocBlocks.push({ to: { id: String(cId) }, types: [{ associationTypeId: id }] });
+
+  // Contacts (optional)
+  for (const cId of contactIds) {
+    const typeId = await findAssocTypeId(SCORECARD_TYPE, "contacts");
+    if (typeId) {
+      assocBlocks.push({ to: { id: String(cId) }, types: [{ associationTypeId: typeId }] });
+    } else {
+      console.warn(`[assoc] no scorecard→contact association type; skipping contact ${cId}`);
+    }
   }
-  for (const dId of (associations.dealIds || [])) {
-    const id = await getAssociationTypeId(SCORECARD_TYPE, "deals");
-    assocBlocks.push({ to: { id: String(dId) }, types: [{ associationTypeId: id }] });
+
+  // Deals (optional)
+  for (const dId of dealIds) {
+    const typeId = await findAssocTypeId(SCORECARD_TYPE, "deals");
+    if (typeId) {
+      assocBlocks.push({ to: { id: String(dId) }, types: [{ associationTypeId: typeId }] });
+    } else {
+      console.warn(`[assoc] no scorecard→deal association type; skipping deal ${dId}`);
+    }
   }
 
   if (assocBlocks.length) body.associations = assocBlocks;
@@ -640,7 +628,7 @@ async function createSalesScorecard(fields, associations = {}) {
 app.post("/process-call", async (req, res) => {
   try {
     const body = req.body || {};
-       const props = body.properties || {};
+    const props = body.properties || {};
     const callId = props.hs_object_id?.value || props.hs_object_id || body.objectId;
     const recordingUrl = props.hs_call_recording_url?.value || props.hs_call_recording_url;
 
@@ -699,8 +687,8 @@ app.post("/process-call", async (req, res) => {
         // 5) Scorecards — only for the three call types (with metrics fallback if enabled)
         const { contacts: contactIds, deals: dealIds } = await getCallAssociations(callId);
 
-        const createQual = (effectiveType === "Qualification call") || (SCORECARD_BY_METRICS && analysis.qual_metrics);
-        const createConsult = (effectiveType === "Initial Consultation") || (SCORECARD_BY_METRICS && analysis.consult_metrics);
+        const createQual   = (effectiveType === "Qualification call") || (SCORECARD_BY_METRICS && analysis.qual_metrics);
+        const createConsult= (effectiveType === "Initial Consultation") || (SCORECARD_BY_METRICS && analysis.consult_metrics);
         const createFollow = (effectiveType === "Follow up call") || (SCORECARD_BY_METRICS && analysis.followup_metrics);
 
         // Single scorecard per call — priority: Qualification > Consultation > Follow up
