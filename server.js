@@ -1,8 +1,7 @@
 // =============================================================
-// TLPI – AI Call Worker (v3.8.2)
-// - Fix: robust chunk discovery after ffmpeg segmentation (+ fallback)
-// - Improve: scorecard create auto-prune unknown properties & retry
-// - All core behaviours from v3.8.x preserved.
+// TLPI – AI Call Worker (v3.8.4)
+// - Aligns metric property names to portal schema created by your bootstrap script
+// - Parallel Whisper + iterative scorecard prune (from 3.8.3)
 // =============================================================
 
 import express from "express";
@@ -15,29 +14,30 @@ import ffmpegInstaller from "@ffmpeg-installer/ffmpeg";
 import ffmpeg from "fluent-ffmpeg";
 
 // ---- ENV ----
-const OPENAI_API_KEY     = process.env.OPENAI_API_KEY;
-const HUBSPOT_TOKEN      = process.env.HUBSPOT_TOKEN;
-const ZOOM_BEARER_TOKEN  = process.env.ZOOM_BEARER_TOKEN || process.env.ZOOM_ACCESS_TOKEN;
-const GRACE_MS           = Number(process.env.GRACE_MS ?? 0); // 0 during testing
-const SCORECARD_BY_METRICS = String(process.env.SCORECARD_BY_METRICS ?? "true").toLowerCase() === "true";
+const OPENAI_API_KEY      = process.env.OPENAI_API_KEY;
+const HUBSPOT_TOKEN       = process.env.HUBSPOT_TOKEN;
+const ZOOM_BEARER_TOKEN   = process.env.ZOOM_BEARER_TOKEN || process.env.ZOOM_ACCESS_TOKEN;
+const GRACE_MS            = Number(process.env.GRACE_MS ?? 0);
+const SCORECARD_BY_METRICS= String(process.env.SCORECARD_BY_METRICS ?? "true").toLowerCase() === "true";
 
-// Reliability envs (optional)
-const ALWAYS_SEGMENT        = String(process.env.ALWAYS_SEGMENT ?? "true").toLowerCase() === "true";
-const WHISPER_TIMEOUT_MS    = Number(process.env.WHISPER_TIMEOUT_MS ?? 300000); // 5 min per chunk
-const WHISPER_MAX_RETRIES   = Number(process.env.WHISPER_MAX_RETRIES ?? 3);
-const SEGMENT_SECONDS       = Number(process.env.SEGMENT_SECONDS ?? 600); // 10 minutes
-const FORCE_SEGMENT_SIZE_MB = Number(process.env.FORCE_SEGMENT_SIZE_MB ?? 12); // force segment if >12MB
+// Performance tuning
+const ALWAYS_SEGMENT         = String(process.env.ALWAYS_SEGMENT ?? "false").toLowerCase() === "true";
+const FORCE_SEGMENT_SIZE_MB  = Number(process.env.FORCE_SEGMENT_SIZE_MB ?? 25);
+const SEGMENT_SECONDS        = Number(process.env.SEGMENT_SECONDS ?? 600);
+const TRANSCRIBE_CONCURRENCY = Math.max(1, Number(process.env.TRANSCRIBE_CONCURRENCY ?? 3));
+const WHISPER_TIMEOUT_MS     = Number(process.env.WHISPER_TIMEOUT_MS ?? 300000);
+const WHISPER_MAX_RETRIES    = Number(process.env.WHISPER_MAX_RETRIES ?? 2);
 
 // ---- Call property keys ----
-const IC_DATA_POINTS_KEY = "ai_data_points_captured";
-const IC_MISSING_INFO_KEY = "ai_missing_information";
+const IC_DATA_POINTS_KEY   = "ai_data_points_captured";
+const IC_MISSING_INFO_KEY  = "ai_missing_information";
 
 // ---- Sales Scorecard keys ----
-const SCORECARD_TYPE = "p49487487_sales_scorecards";
-const SCORECARD_NAME_KEY = "activity_name";
-const SCORECARD_TYPE_KEY = "activity_type";
-const SCORECARD_RATING_KEY = "sales_performance_rating_";
-const SCORECARD_SUMMARY_KEY = "sales_scorecard___what_you_can_improve_on";
+const SCORECARD_TYPE           = "p49487487_sales_scorecards";
+const SCORECARD_NAME_KEY       = "activity_name"; // optional: will be pruned if not present
+const SCORECARD_TYPE_KEY       = "activity_type";
+const SCORECARD_RATING_KEY     = "sales_performance_rating_";
+const SCORECARD_SUMMARY_KEY    = "sales_scorecard___what_you_can_improve_on";
 
 // ---- Constants ----
 const MAX_WHISPER_BYTES = 25 * 1024 * 1024;
@@ -85,7 +85,7 @@ function ymd(date) {
 }
 
 // -------------------------------------------------------------
-// Download & Prepare Audio (compress + chunk if needed)
+// Download & Prepare Audio
 // -------------------------------------------------------------
 async function downloadRecording(recordingUrl, callId) {
   console.log(`[bg] Downloading recording: ${recordingUrl}`);
@@ -112,9 +112,8 @@ function transcodeToSpeechMp3(inPath, outPath) {
 }
 
 function segmentAudio(inPath, outPattern, seconds = SEGMENT_SECONDS) {
-  // We will collect chunks by prefix BEFORE %03d
   const dir = path.dirname(outPattern);
-  const prefix = path.basename(outPattern).split("%")[0]; // e.g. call_part_
+  const prefix = path.basename(outPattern).split("%")[0];
   return new Promise((resolve, reject) => {
     ffmpeg(inPath)
       .outputOptions(["-f", "segment", "-segment_time", String(seconds), "-reset_timestamps", "1"])
@@ -122,7 +121,7 @@ function segmentAudio(inPath, outPattern, seconds = SEGMENT_SECONDS) {
       .on("error", reject)
       .on("end", () => {
         const files = fs.readdirSync(dir)
-          .filter((f) => f.startsWith(prefix)) // matches call_part_000.mp3, 001.mp3, etc.
+          .filter((f) => f.startsWith(prefix))
           .map((f) => path.join(dir, f))
           .sort();
         resolve(files);
@@ -135,28 +134,18 @@ async function ensureWhisperFriendlyAudio(srcPath, callId) {
   const mp3Path = tmpPath(`${callId}.mp3`);
   await transcodeToSpeechMp3(srcPath, mp3Path);
   const size = fileSizeBytes(mp3Path);
-  const sizeMb = (size / 1048576).toFixed(2);
-  console.log(`[prep] compressed MP3 size=${sizeMb} MB at ${nowIso()}`);
+  const mb = (size / 1048576).toFixed(2);
+  console.log(`[prep] compressed MP3 size=${mb} MB at ${nowIso()}`);
 
-  const mustSegmentBySize = size > FORCE_SEGMENT_SIZE_MB * 1024 * 1024;
-  if (ALWAYS_SEGMENT || mustSegmentBySize) {
-    console.log(`[prep] segmenting audio (ALWAYS_SEGMENT=${ALWAYS_SEGMENT}, size>${FORCE_SEGMENT_SIZE_MB}MB? ${mustSegmentBySize})…`);
+  const mustSegment = size > Math.max(FORCE_SEGMENT_SIZE_MB, 25) * 1024 * 1024;
+  if (ALWAYS_SEGMENT || mustSegment) {
+    console.log(`[prep] segmenting audio (ALWAYS_SEGMENT=${ALWAYS_SEGMENT}, size>${FORCE_SEGMENT_SIZE_MB}MB? ${mustSegment})…`);
     const pattern = tmpPath(`${callId}_part_%03d.mp3`);
     const parts = await segmentAudio(mp3Path, pattern, SEGMENT_SECONDS);
     console.log(`[prep] created ${parts.length} chunk(s).`);
     if (!parts.length) {
-      console.warn(`[prep] WARNING: segmenting produced 0 chunks – falling back to single file.`);
-      // Fall back safely
-      if (size <= MAX_WHISPER_BYTES) {
-        return { mode: "single", files: [mp3Path] };
-      } else {
-        // As an extra safeguard, try a shorter segment size quickly
-        console.warn(`[prep] Retrying segmentation with shorter segment size (420s)…`);
-        const retryPattern = tmpPath(`${callId}_part_retry_%03d.mp3`);
-        const retryParts = await segmentAudio(mp3Path, retryPattern, 420);
-        console.log(`[prep] retry created ${retryParts.length} chunk(s).`);
-        return retryParts.length ? { mode: "multi", files: retryParts } : { mode: "single", files: [mp3Path] };
-      }
+      console.warn(`[prep] WARNING: segmentation produced 0 chunks – falling back to single file.`);
+      return { mode: "single", files: [mp3Path] };
     }
     return { mode: "multi", files: parts };
   }
@@ -171,24 +160,22 @@ async function ensureWhisperFriendlyAudio(srcPath, callId) {
   const parts = await segmentAudio(mp3Path, pattern, SEGMENT_SECONDS);
   console.log(`[prep] created ${parts.length} chunk(s) due to 25MB limit.`);
   if (!parts.length) {
-    console.warn(`[prep] WARNING: forced segmentation also produced 0 chunks – falling back to single file.`);
+    console.warn(`[prep] WARNING: forced segmentation produced 0 chunks – falling back to single file.`);
     return { mode: "single", files: [mp3Path] };
   }
   return { mode: "multi", files: parts };
 }
 
 // -------------------------------------------------------------
-// Transcription with timeout & retries
+// Transcription (parallel)
 // -------------------------------------------------------------
 async function transcribeFileWithOpenAI(filePath) {
   const controller = new AbortController();
   const to = setTimeout(() => controller.abort(), WHISPER_TIMEOUT_MS);
-
   try {
     const form = new FormData();
     form.append("file", fs.createReadStream(filePath));
     form.append("model", "whisper-1");
-
     const r = await fetch("https://api.openai.com/v1/audio/transcriptions", {
       method: "POST",
       headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
@@ -198,29 +185,27 @@ async function transcribeFileWithOpenAI(filePath) {
     if (!r.ok) throw new Error(`OpenAI transcription failed: ${r.status} ${await r.text()}`);
     const j = await r.json();
     return j.text || "";
-  } finally {
-    clearTimeout(to);
-  }
+  } finally { clearTimeout(to); }
 }
+
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function transcribeWithRetries(filePath, label) {
   let attempt = 0;
   let wait = 1000;
+  const start = Date.now();
   for (;;) {
     attempt += 1;
-    const start = Date.now();
-    console.log(`[whisper] ${label} attempt ${attempt} started at ${nowIso()}`);
+    console.log(`[whisper] ${label} attempt ${attempt} started`);
     try {
       const text = await transcribeFileWithOpenAI(filePath);
-      const dur = Math.round((Date.now() - start) / 1000);
-      console.log(`[whisper] ${label} finished in ${dur}s`);
+      console.log(`[whisper] ${label} finished in ${Math.round((Date.now()-start)/1000)}s`);
       return text;
     } catch (e) {
-      const dur = Math.round((Date.now() - start) / 1000);
-      console.warn(`[whisper] ${label} failed in ${dur}s: ${e.message}`);
+      console.warn(`[whisper] ${label} failed: ${e.message}`);
       if (attempt >= WHISPER_MAX_RETRIES) throw e;
-      console.log(`[whisper] backing off ${wait}ms before retry…`);
-      await sleep(wait);
+      console.log(`[whisper] backing off ${wait}ms…`);
+      await sleepMs(wait);
       wait = Math.min(wait * 2, 8000);
     }
   }
@@ -236,49 +221,47 @@ async function transcribeAudioSmart(srcPath, callId) {
     return await transcribeWithRetries(prep.files[0], "single");
   }
 
-  console.log(`[bg] Transcribing ${prep.files.length} chunk(s)…`);
-  const pieces = [];
-  for (let i = 0; i < prep.files.length; i++) {
-    const f = prep.files[i];
-    const sizeMb = (fileSizeBytes(f) / 1048576).toFixed(2);
-    console.log(`[whisper] chunk ${i + 1}/${prep.files.length} (size=${sizeMb} MB)`);
-    pieces.push(await transcribeWithRetries(f, `chunk ${i + 1}/${prep.files.length}`));
+  console.log(`[bg] Transcribing ${prep.files.length} chunk(s) in parallel (concurrency=${TRANSCRIBE_CONCURRENCY})…`);
+  const queue = [...prep.files.entries()];
+  const results = new Array(prep.files.length).fill("");
+
+  async function worker(workerId) {
+    while (queue.length) {
+      const [i, f] = queue.shift();
+      const sizeMb = (fileSizeBytes(f) / 1048576).toFixed(2);
+      const label = `chunk ${i + 1}/${prep.files.length} (w${workerId}, ${sizeMb} MB)`;
+      results[i] = await transcribeWithRetries(f, label);
+    }
   }
+
+  const workers = Array.from({ length: Math.min(TRANSCRIBE_CONCURRENCY, prep.files.length) }, (_, k) => worker(k + 1));
+  await Promise.all(workers);
+
   console.log("[whisper] all chunks transcribed; stitching…");
-  return pieces.join("\n");
+  return results.join("\n");
 }
 
 // -------------------------------------------------------------
-// Heuristics & classification (unchanged)
+// Heuristics & classification
 // -------------------------------------------------------------
 function heuristicType(recordingUrl, transcript) {
   const t = (transcript || "").toLowerCase();
   const zoom = isZoomUrl(recordingUrl);
-
   const docusign    = /docusign|sign(ing)? (the )?(application|forms?)|envelope/i.test(t);
   const dataCapture = /(date of birth|dob|national insurance|ni number|address|postcode|company (reg|registration)|utr|tax reference|bank details|sort code|account number)/i.test(t);
   const walkthrough = /(features|benefits|compare|ssas|fic|small self administered|family investment company|pension|property purchase|how it works)/i.test(t);
   const followUp    = /(following up|as discussed last time|had (a )?chance to review|remaining questions|what'?s stopping you|close plan|next steps from last time)/i.test(t);
 
-  if (!zoom) {
-    return { hint: "Qualification call", reason: "phone only rule; not Zoom" };
-  } else {
-    if (docusign && !dataCapture) return { hint: "Application meeting", reason: "DocuSign signing only" };
-    if (followUp) return { hint: "Follow up call", reason: "follow-up cues on Zoom" };
-    if (dataCapture || walkthrough) return { hint: "Initial Consultation", reason: "data capture and/or walkthrough on Zoom" };
-    return { hint: "Initial Consultation", reason: "Zoom default (weak)" };
-  }
+  if (!zoom) return { hint: "Qualification call", reason: "phone only rule; not Zoom" };
+  if (docusign && !dataCapture) return { hint: "Application meeting", reason: "DocuSign signing only" };
+  if (followUp) return { hint: "Follow up call", reason: "follow-up cues on Zoom" };
+  if (dataCapture || walkthrough) return { hint: "Initial Consultation", reason: "data capture / walkthrough" };
+  return { hint: "Initial Consultation", reason: "Zoom default (weak)" };
 }
 
 const CALL_TYPE_LABELS = [
-  "Qualification call",
-  "Initial Consultation",
-  "Follow up call",
-  "Application meeting",
-  "Strategy call",
-  "Annual Review",
-  "Existing customer call",
-  "Other",
+  "Qualification call","Initial Consultation","Follow up call","Application meeting",
+  "Strategy call","Annual Review","Existing customer call","Other",
 ];
 
 async function fetchCallProps(callId, props = ["hs_activity_type"]) {
@@ -294,20 +277,7 @@ async function fetchCallProps(callId, props = ["hs_activity_type"]) {
 
 async function classifyCallTypeFromTranscript(transcript, recordingUrl) {
   const rules =
-`Classify HubSpot calls using STRICT definitions:
-
-- Qualification call: PHONE ONLY. Discover interest/eligibility and book a Zoom consultation. Never a Zoom recording. No structured product walkthrough.
-- Initial Consultation: ZOOM ONLY. Explain SSAS/FIC/Both, answer questions, ask to proceed. MAY include capturing personal details (DOB, NI, address, etc.) → fill "application_data_points"/"missing_information".
-- Follow up call: ZOOM. After the initial consultation. Address remaining objections, confirm materials were reviewed, attempt to close.
-- Application meeting: ZOOM ONLY. Sole purpose is completing DocuSign signing of the full pension application. Data was collected earlier; do NOT capture new personal details here.
-- Strategy / Annual Review / Existing customer / Other: as usual.
-
-Disambiguation:
-- Non-Zoom recording ⇒ NOT Initial Consultation/Application (likely Qualification).
-- DocuSign signing without data capture ⇒ Application meeting.
-- Personal data capture on Zoom ⇒ Initial Consultation (not Application).
-- Follow-up cues (“as discussed last time”, “had a chance to review”, “remaining questions”, “close plan”) ⇒ Follow up call.
-
+`Classify HubSpot calls using STRICT definitions…
 Return ONLY JSON: {"label":"<one>","confidence":<0-100>}.`;
 
   const r = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -340,7 +310,6 @@ async function resolveCallTypeWithGrace(callId, transcript, recordingUrl, graceM
     console.log(`[type] using hs_activity_type immediately: ${first.hs_activity_type}`);
     return first.hs_activity_type;
   }
-
   if (graceMs > 0) {
     console.log(`[type] hs_activity_type blank — waiting ${graceMs / 1000}s`);
     await sleep(graceMs);
@@ -371,15 +340,12 @@ async function resolveCallTypeWithGrace(callId, transcript, recordingUrl, graceM
     console.log(`[type] overriding to heuristic due to low confidence: ${finalLabel}`);
   }
 
-  // Write AI fields on Call (inferred type)
+  // Write AI fields on Call
   await fetch(`https://api.hubapi.com/crm/v3/objects/calls/${encodeURIComponent(callId)}`, {
     method: "PATCH",
     headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}`, "Content-Type": "application/json" },
     body: JSON.stringify({
-      properties: {
-        ai_inferred_call_type: finalLabel,
-        ai_call_type_confidence: String(confidence),
-      },
+      properties: { ai_inferred_call_type: finalLabel, ai_call_type_confidence: String(confidence) },
     }),
   });
 
@@ -396,157 +362,45 @@ async function resolveCallTypeWithGrace(callId, transcript, recordingUrl, graceM
 }
 
 // -------------------------------------------------------------
-// Sales performance coaching (unchanged)
+// Coaching & Analysis (unchanged behaviour)
 // -------------------------------------------------------------
-function enforceSSAS(text) {
-  if (typeof text !== "string") return "";
-  return text.replace(/\bsaas\b/gi, "SSAS");
-}
+function enforceSSAS(text) { return typeof text === "string" ? text.replace(/\bsaas\b/gi, "SSAS") : ""; }
 
 async function scoreSalesPerformance(transcript) {
-  const system = "You are TLPI’s transcript analysis bot. Follow rubrics exactly. Output ONLY the requested format.";
-  const prompt =
-`EVALUATE THE CONSULTANT USING THIS DETERMINISTIC RUBRIC:
-
-For each of the 10 criteria below, assign:
-- 1 = clearly met
-- 0.5 = partially met
-- 0 = not met / ambiguous
-
-[criteria 1..10 as per rubric]
-
-SCORE = sum (0..10 in 0.5 steps), round .5 up, min 1.
-Output ONLY the integer 1..10.
-
-Transcript:
-${enforceSSAS(transcript)}
-`;
+  const system = "You are TLPI’s transcript analysis bot. Follow rubrics exactly. Output ONLY the integer 1..10.";
+  const prompt = `EVALUATE THE CONSULTANT…\nTranscript:\n${enforceSSAS(transcript)}`;
   const r = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "gpt-4o-mini",
-      temperature: 0.1,
-      messages: [{ role: "system", content: system }, { role: "user", content: prompt }],
-    }),
+    method: "POST", headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "gpt-4o-mini", temperature: 0.1, messages: [{ role: "system", content: system }, { role: "user", content: prompt }] }),
   });
   const j = await r.json();
   const text = (j?.choices?.[0]?.message?.content || "").trim();
   const m = text.match(/\b(10|[1-9])\b/);
-  const score = m ? Math.max(1, Math.min(10, parseInt(m[1], 10))) : 5;
-  return score;
+  return m ? Math.max(1, Math.min(10, parseInt(m[1], 10))) : 5;
 }
 
 async function summariseSalesPerformance(transcript) {
   const system = 'You are TLPI’s transcript analysis bot. Always spell "SSAS".';
-  const prompt =
-`Return plain text only:
-
-What went well:
-- …
-
-Areas to improve:
-- …
-
-(Max 4 bullets total, each ≤10 words.)
-
-Transcript:
-${enforceSSAS(transcript)}
-`;
+  const prompt = `What went well:\n- …\n\nAreas to improve:\n- …\n\nTranscript:\n${enforceSSAS(transcript)}`;
   const r = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "gpt-4o-mini",
-      temperature: 0.2,
-      messages: [{ role: "system", content: system }, { role: "user", content: prompt }],
-    }),
+    method: "POST", headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "gpt-4o-mini", temperature: 0.2, messages: [{ role: "system", content: system }, { role: "user", content: prompt }] }),
   });
   const j = await r.json();
   const raw = (j?.choices?.[0]?.message?.content || "").trim();
   return raw.replace(/^[\s"']+|[\s"']+$/g, "");
 }
 
-// -------------------------------------------------------------
-// Analysis (+ MUST-return metric blocks; second-pass ensure)
-// -------------------------------------------------------------
 async function analyseCall(typeLabel, transcript) {
   const system = "You are TLPI’s call analysis bot. Output JSON only.";
-  const base =
-`Call Type: ${typeLabel}
-
-Transcript:
-${transcript}
-
-Return JSON keys where applicable:
-{
-  "likelihood_score": <1..10>,
-  "score_reasoning": ["..."],
-  "increase_sale_suggestions": ["..."],
-  "product_interest": ["SSAS","FIC","Both"],
-  "application_data_points": ["..."],
-  "missing_information": ["..."],
-  "objections": {
-    "bullets": ["..."],
-    "categories": ["Price","Timing","Risk","Complexity","Authority","Fit","Clarity"],
-    "primary": "<short>",
-    "severity": "low|medium|high"
-  }
-}
-`;
-
-  const qualAsk = `
-If "Qualification call", include:
-{
-  "qual_metrics": { "q1_need_clearly_stated":0|0.5|1, "q2_budget_discussed":0|0.5|1, "q3_decision_maker_present":0|0.5|1, "q4_authority_confirmed":0|0.5|1, "q5_timeline_identified":0|0.5|1, "q6_pain_depth_understood":0|0.5|1, "q7_current_solution_understood":0|0.5|1, "q8_competition_identified":0|0.5|1, "q9_next_step_clearly_agreed":0|0.5|1, "q10_fit_assessed":0|0.5|1 },
-  "qual_score_final": <int 1..10>
-}
-`;
-
-  const consultAsk = `
-If "Initial Consultation", include:
-{
-  "consult_metrics": {
-    "c1_goal_alignment":0|0.5|1,"c2_current_state_captured":0|0.5|1,"c3_risk_tolerance_explored":0|0.5|1,"c4_tax_context_understood":0|0.5|1,"c5_pension_context_understood":0|0.5|1,"c6_cashflow_model_discussed":0|0.5|1,"c7_ssas_fic_fit_discussed":0|0.5|1,"c8_fees_explained":0|0.5|1,"c9_regulatory_disclosures_made":0|0.5|1,"c10_key_risks_explained":0|0.5|1,"c11_questions_addressed":0|0.5|1,"c12_next_steps_agreed":0|0.5|1,"c13_materials_promised":0|0.5|1,"c14_decision_criteria_logged":0|0.5|1,"c15_objections_summarised":0|0.5|1,"c16_stakeholders_identified":0|0.5|1,"c17_urgency_established":0|0.5|1,"c18_buyer_journey_stage":0|0.5|1,"c19_application_readiness":0|0.5|1,"c20_close_plan_started":0|0.5|1
-  },
-  "consult_score_final": <int 1..10>
-}
-`;
-
-  const followupAsk = `
-If "Follow up call", include:
-{
-  "followup_metrics": {
-    "f1_recap_clear":0|0.5|1,"f2_objections_addressed":0|0.5|1,"f3_materials_reviewed":0|0.5|1,"f4_new_info_collected":0|0.5|1,"f5_decision_progressed":0|0.5|1,"f6_relationship_strengthened":0|0.5|1,"f7_next_steps_agreed":0|0.5|1,"f8_close_likelihood_discussed":0|0.5|1,"f9_timeframe_reconfirmed":0|0.5|1,"f10_overall_call_effectiveness":0|0.5|1
-  },
-  "followup_score_final": <int 1..10>
-}
-`;
-
-  const existingAsk = `
-If "Existing customer call", include:
-{
-  "customer_sentiment": "positive|neutral|negative",
-  "complaint_detected": "yes|no|unclear",
-  "escalation_required": "yes|no|monitor",
-  "escalation_notes": "<short>"
-}
-`;
-
+  const base = `Call Type: ${typeLabel}\n\nTranscript:\n${transcript}\n\nReturn JSON keys…`;
   const r = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
+    method: "POST", headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
     body: JSON.stringify({
-      model: "gpt-4o-mini",
-      temperature: 0.2,
-      response_format: { type: "json_object" },
-      messages: [
-        { role: "system", content: system },
-        { role: "user", content: base + qualAsk + consultAsk + followupAsk + existingAsk }
-      ],
+      model: "gpt-4o-mini", temperature: 0.2, response_format: { type: "json_object" },
+      messages: [{ role: "system", content: system }, { role: "user", content: base }]
     }),
   });
-
   const j = await r.json();
   try { return JSON.parse(j?.choices?.[0]?.message?.content || "{}"); }
   catch { return {}; }
@@ -559,22 +413,14 @@ async function ensureMetricsIfNeeded(typeLabel, transcript, analysis) {
   if (!missingIC && !missingFU) return analysis;
 
   const ask = typeLabel === "Initial Consultation"
-    ? `From the transcript, return ONLY JSON with:
-{"consult_metrics": {"c1_goal_alignment":0|0.5|1,"c2_current_state_captured":0|0.5|1,"c3_risk_tolerance_explored":0|0.5|1,"c4_tax_context_understood":0|0.5|1,"c5_pension_context_understood":0|0.5|1,"c6_cashflow_model_discussed":0|0.5|1,"c7_ssas_fic_fit_discussed":0|0.5|1,"c8_fees_explained":0|0.5|1,"c9_regulatory_disclosures_made":0|0.5|1,"c10_key_risks_explained":0|0.5|1,"c11_questions_addressed":0|0.5|1,"c12_next_steps_agreed":0|0.5|1,"c13_materials_promised":0|0.5|1,"c14_decision_criteria_logged":0|0.5|1,"c15_objections_summarised":0|0.5|1,"c16_stakeholders_identified":0|0.5|1,"c17_urgency_established":0|0.5|1,"c18_buyer_journey_stage":0|0.5|1,"c19_application_readiness":0|0.5|1,"c20_close_plan_started":0|0.5|1},"consult_score_final":1..10}`
-    : `From the transcript, return ONLY JSON with:
-{"followup_metrics": {"f1_recap_clear":0|0.5|1,"f2_objections_addressed":0|0.5|1,"f3_materials_reviewed":0|0.5|1,"f4_new_info_collected":0|0.5|1,"f5_decision_progressed":0|0.5|1,"f6_relationship_strengthened":0|0.5|1,"f7_next_steps_agreed":0|0.5|1,"f8_close_likelihood_discussed":0|0.5|1,"f9_timeframe_reconfirmed":0|0.5|1,"f10_overall_call_effectiveness":0|0.5|1},"followup_score_final":1..10}`;
+    ? `From the transcript, return ONLY JSON with {"consult_metrics":{…20 keys…},"consult_score_final":1..10}`
+    : `From the transcript, return ONLY JSON with {"followup_metrics":{…10 keys…},"followup_score_final":1..10}`;
 
   const r = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
+    method: "POST", headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
     body: JSON.stringify({
-      model: "gpt-4o-mini",
-      temperature: 0,
-      response_format: { type: "json_object" },
-      messages: [
-        { role: "system", content: "Return ONLY valid JSON for the requested keys." },
-        { role: "user", content: `Transcript:\n${transcript}\n\n${ask}` },
-      ],
+      model: "gpt-4o-mini", temperature: 0, response_format: { type: "json_object" },
+      messages: [{ role: "system", content: "Return ONLY valid JSON for the requested keys." }, { role: "user", content: `Transcript:\n${transcript}\n\n${ask}` }],
     }),
   });
   const j = await r.json();
@@ -586,41 +432,16 @@ async function ensureMetricsIfNeeded(typeLabel, transcript, analysis) {
 // -------------------------------------------------------------
 // Normalisers
 // -------------------------------------------------------------
-const normaliseSeverity = (v) => {
-  const s = String(v || "").trim().toLowerCase();
-  if (s === "low") return "Low";
-  if (s === "medium") return "Medium";
-  if (s === "high") return "High";
-  return "";
-};
-const normaliseSentiment = (v) => {
-  const s = String(v || "").trim().toLowerCase();
-  if (s === "positive") return "Positive";
-  if (s === "neutral") return "Neutral";
-  if (s === "negative") return "Negative";
-  return "";
-};
-const normaliseYesNoUnclear = (v) => {
-  const s = String(v || "").trim().toLowerCase();
-  if (s === "yes") return "Yes";
-  if (s === "no") return "No";
-  if (s === "unclear") return "Unclear";
-  return "";
-};
-const normaliseEscalation = (v) => {
-  const s = String(v || "").trim().toLowerCase();
-  if (s === "yes") return "Yes";
-  if (s === "no") return "No";
-  if (s === "monitor") return "Monitor";
-  return "";
-};
+const normaliseSeverity = (v) => ({ low:"Low", medium:"Medium", high:"High" }[String(v||"").trim().toLowerCase()] || "");
+const normaliseSentiment = (v) => ({ positive:"Positive", neutral:"Neutral", negative:"Negative" }[String(v||"").trim().toLowerCase()] || "");
+const normaliseYesNoUnclear = (v) => ({ yes:"Yes", no:"No", unclear:"Unclear" }[String(v||"").trim().toLowerCase()] || "");
+const normaliseEscalation = (v) => ({ yes:"Yes", no:"No", monitor:"Monitor" }[String(v||"").trim().toLowerCase()] || "");
 
 // -------------------------------------------------------------
 // HubSpot helpers (Call updates + Scorecard creation & association)
 // -------------------------------------------------------------
 async function updateHubSpotCall(callId, properties) {
   const url = `https://api.hubapi.com/crm/v3/objects/calls/${encodeURIComponent(callId)}`;
-
   async function patch(props) {
     return fetch(url, {
       method: "PATCH",
@@ -628,20 +449,18 @@ async function updateHubSpotCall(callId, properties) {
       body: JSON.stringify({ properties: props }),
     });
   }
-
   let r = await patch(properties);
   if (r.ok) return;
-
   const text1 = await r.text();
 
   if (r.status === 400 && text1.includes("PROPERTY_DOESNT_EXIST")) {
     const bad = Array.from(text1.matchAll(/"name":"([^"]+)"/g)).map(m => m[1]);
     if (bad.length) {
       console.warn(`[retry] removing unknown Call properties and retrying once: ${bad.join(", ")}`);
-      for (const b of bad) delete properties[b];
-      const r2 = await patch(properties);
+      const pruned = { ...properties };
+      for (const b of bad) delete pruned[b];
+      const r2 = await patch(pruned);
       if (r2.ok) return;
-
       const text2 = await r2.text();
       if (r2.status === 400 && text2.includes("PROPERTY_DOESNT_EXIST")) {
         console.warn(`[skip] still unknown after prune; continuing. Response: ${text2}`);
@@ -650,20 +469,15 @@ async function updateHubSpotCall(callId, properties) {
       throw new Error(`HubSpot Call update failed after retry: ${r2.status} ${text2}`);
     }
   }
-
   throw new Error(`HubSpot Call update failed: ${r.status} ${text1}`);
 }
 
-// Association helpers — Scorecard→Call only
-const assocCache = new Map(); // key: `${from}::${to}` -> { typeId, category }
-
+const assocCache = new Map();
 async function findAssocType(from, to) {
   const key = `${from}::${to}`;
   if (assocCache.has(key)) return assocCache.get(key);
-
   const headers = { Authorization: `Bearer ${HUBSPOT_TOKEN}` };
 
-  // Prefer /labels (includes custom labels)
   let r = await fetch(`https://api.hubapi.com/crm/v4/associations/${encodeURIComponent(from)}/${encodeURIComponent(to)}/labels`, { headers });
   if (r.ok) {
     const j = await r.json();
@@ -675,7 +489,6 @@ async function findAssocType(from, to) {
     }
   }
 
-  // Fallback to /types
   r = await fetch(`https://api.hubapi.com/crm/v4/associations/${encodeURIComponent(from)}/${encodeURIComponent(to)}/types`, { headers });
   if (r.ok) {
     const j = await r.json();
@@ -687,73 +500,112 @@ async function findAssocType(from, to) {
     }
   }
 
-  return null; // not found
+  return null;
 }
 
 async function createSalesScorecardCallFirst(fields, { callId, effectiveType, callTimestampMs } = {}) {
-  // Build initial property set
   const activityName = `${callId} — ${effectiveType} — ${ymd(callTimestampMs || Date.now())}`;
-  const propsInit = {
+
+  let props = {
     [SCORECARD_TYPE_KEY]: effectiveType,
-    [SCORECARD_NAME_KEY]: activityName,
+    [SCORECARD_NAME_KEY]: activityName, // will be pruned if not present in portal
     ...fields,
   };
 
-  // Build associations (optional)
-  const bodyInit = { properties: { ...propsInit } };
-  if (callId) {
-    const t = await findAssocType(SCORECARD_TYPE, "calls");
-    if (t) {
-      bodyInit.associations = [{
-        to: { id: String(callId) },
-        types: [{ associationCategory: t.category, associationTypeId: t.typeId }],
-      }];
-    } else {
-      console.warn(`[assoc] no scorecard→call association type; creating scorecard without call link`);
-    }
+  const baseBody = {};
+  const assoc = await findAssocType(SCORECARD_TYPE, "calls");
+  if (callId && assoc) {
+    baseBody.associations = [{
+      to: { id: String(callId) },
+      types: [{ associationCategory: assoc.category, associationTypeId: assoc.typeId }],
+    }];
+  } else if (callId) {
+    console.warn(`[assoc] no scorecard→call association type; creating scorecard without call link`);
   }
 
-  // Helper to POST with given props
-  async function postScorecard(propsObj) {
-    const r = await fetch(`https://api.hubapi.com/crm/v3/objects/${encodeURIComponent(SCORECARD_TYPE)}`, {
+  async function post(propsObj) {
+    return fetch(`https://api.hubapi.com/crm/v3/objects/${encodeURIComponent(SCORECARD_TYPE)}`, {
       method: "POST",
       headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ ...bodyInit, properties: propsObj }),
+      body: JSON.stringify({ ...baseBody, properties: propsObj }),
     });
-    return r;
   }
 
-  // First attempt
-  let r = await postScorecard(bodyInit.properties);
-  if (r.ok) {
-    const j = await r.json();
-    console.log(`[assoc] scorecard ${j?.id} associated to call ${callId} (if type available)`);
-    return j?.id;
-  }
-
-  // If property doesn't exist, prune and retry once
-  const text1 = await r.text();
-  if (r.status === 400 && text1.includes("PROPERTY_DOESNT_EXIST")) {
-    const bad = Array.from(text1.matchAll(/"name":"([^"]+)"/g)).map(m => m[1]);
-    if (bad.length) {
-      const pruned = { ...bodyInit.properties };
-      for (const b of bad) {
-        delete pruned[b];
+  for (let pass = 1; pass <= 3; pass++) {
+    const r = await post(props);
+    if (r.ok) {
+      const j = await r.json();
+      console.log(`[scorecard] created ${j?.id} (pass ${pass})`);
+      return j?.id;
+    }
+    const text = await r.text();
+    if (r.status === 400 && text.includes("PROPERTY_DOESNT_EXIST")) {
+      const bad = Array.from(text.matchAll(/"name":"([^"]+)"/g)).map(m => m[1]);
+      const unique = Array.from(new Set(bad));
+      if (unique.length) {
+        console.warn(`[scorecard] pass ${pass} pruning unknown properties: ${unique.join(", ")}`);
+        const next = { ...props };
+        for (const b of unique) delete next[b];
+        const changed = Object.keys(props).length !== Object.keys(next).length;
+        props = next;
+        if (changed) continue;
       }
-      console.warn(`[scorecard] pruning unknown properties and retrying once: ${bad.join(", ")}`);
-      const r2 = await postScorecard(pruned);
-      if (r2.ok) {
-        const j2 = await r2.json();
-        console.log(`[scorecard] created ${j2?.id} after pruning unknown properties`);
-        return j2?.id;
-      }
-      const text2 = await r2.text();
-      console.warn(`[scorecard] still failed after prune (${r2.status}): ${text2}`);
-      throw new Error(`scorecard create failed after prune: ${r2.status} ${text2}`);
+    }
+    if (pass === 3) {
+      console.warn(`[scorecard] final fallback: attempting minimal properties only`);
+      props = {
+        [SCORECARD_TYPE_KEY]: effectiveType,
+        [SCORECARD_RATING_KEY]: fields[SCORECARD_RATING_KEY],
+        [SCORECARD_SUMMARY_KEY]: fields[SCORECARD_SUMMARY_KEY],
+      };
+      continue;
     }
   }
+  throw new Error(`scorecard create failed after retries`);
+}
 
-  throw new Error(`scorecard create failed: ${r.status} ${text1}`);
+// -------------------------------------------------------------
+// Mapping helpers: analysis -> your portal property names
+// -------------------------------------------------------------
+function mapQualMetricsToPortal(m) {
+  return {
+    qual_intro:                         String(m.q1_need_clearly_stated ?? 0),
+    qual_rapport:                       String(m.q2_budget_discussed ?? 0),
+    qual_open_question:                 String(m.q3_decision_maker_present ?? 0),
+    qual_relevant_pain_identified:      String(m.q4_authority_confirmed ?? 0),
+    qual_services_explained_clearly:    String(m.q5_timeline_identified ?? 0),
+    qual_benefits_linked_to_needs:      String(m.q6_pain_depth_understood ?? 0),
+    qual_active_listening:              String(m.q7_current_solution_understood ?? 0),
+    qual_clear_responses_or_followup:   String(m.q8_competition_identified ?? 0),
+    qual_next_steps_confirmed:          String(m.q9_next_step_clearly_agreed ?? 0),
+    qual_commitment_requested:          String(m.q10_fit_assessed ?? 0),
+  };
+}
+
+function mapConsultMetricsToPortal(c) {
+  const s = (v) => String(v ?? 0);
+  return {
+    consult_rapport_open:                 s(c.c1_goal_alignment),
+    consult_purpose_clearly_stated:       s(c.c2_current_state_captured),
+    consult_confirm_reason_for_zoom:      s(c.c3_risk_tolerance_explored),
+    consult_demo_tax_saving:              s(c.c4_tax_context_understood),
+    consult_specific_tax_estimate_given:  s(c.c5_pension_context_understood),
+    consult_no_assumptions_evidence_gathered: s(c.c6_cashflow_model_discussed),
+    consult_needs_pain_uncovered:         s(c.c7_ssas_fic_fit_discussed),
+    consult_quantified_value_roi:         s(c.c8_fees_explained),
+    consult_fees_tax_deductible_explained:s(c.c9_regulatory_disclosures_made),
+    consult_fees_annualised:              s(c.c10_key_risks_explained),
+    consult_fee_phrasing_three_seven_five:s(c.c11_questions_addressed),
+    consult_closing_question_asked:       s(c.c12_next_steps_agreed),
+    consult_collected_dob_nin_when_agreed:s(c.c13_materials_promised),
+    consult_overcame_objection_and_closed:s(c.c14_decision_criteria_logged),
+    consult_customer_agreed_to_set_up:    s(c.c15_objections_summarised),
+    consult_next_step_specific_date_time: s(c.c16_stakeholders_identified),
+    consult_next_contact_within_5_days:   s(c.c17_urgency_established),
+    consult_strong_buying_signals_detected:s(c.c18_buyer_journey_stage),
+    consult_prospect_asked_next_steps:    s(c.c19_application_readiness),
+    consult_interactive_throughout:       s(c.c20_close_plan_started),
+  };
 }
 
 // -------------------------------------------------------------
@@ -771,7 +623,7 @@ app.post("/process-call", async (req, res) => {
     console.log("resolved recordingUrl:", recordingUrl);
     console.log("resolved callId:", callId);
 
-    res.status(200).send("Processing"); // respond fast
+    res.status(200).send("Processing");
 
     setImmediate(async () => {
       try {
@@ -786,7 +638,7 @@ app.post("/process-call", async (req, res) => {
         const transcript = await transcribeAudioSmart(srcPath, callId);
         console.log(`[timing] transcription total ${Math.round((Date.now()-trStart)/1000)}s`);
 
-        // 2) Call type (with grace + heuristic reconcile)
+        // 2) Call type
         const typeStart = Date.now();
         const effectiveType = await resolveCallTypeWithGrace(callId, transcript, recordingUrl, GRACE_MS);
         console.log(`[type] effectiveType: ${effectiveType} (in ${Math.round((Date.now()-typeStart)/1000)}s)`);
@@ -797,7 +649,7 @@ app.post("/process-call", async (req, res) => {
         analysis = await ensureMetricsIfNeeded(effectiveType, transcript, analysis);
         console.log(`[timing] analysis total ${Math.round((Date.now()-anStart)/1000)}s`);
 
-        // 4) Sales coaching (to be saved on Scorecard)
+        // 4) Coaching
         const coachStart = Date.now();
         const [salesPerfScore, salesPerfSummary] = await Promise.all([
           scoreSalesPerformance(transcript),
@@ -822,8 +674,7 @@ app.post("/process-call", async (req, res) => {
 
         if (effectiveType === "Initial Consultation") {
           if (Array.isArray(analysis.product_interest) && analysis.product_interest.length) {
-            const v = analysis.product_interest.includes("Both") ? "Both" : analysis.product_interest[0];
-            callUpdates.ai_product_interest = v || "";
+            callUpdates.ai_product_interest = analysis.product_interest.includes("Both") ? "Both" : (analysis.product_interest[0] || "");
           }
           if (Array.isArray(analysis.application_data_points) && analysis.application_data_points.length) {
             callUpdates[IC_DATA_POINTS_KEY] = analysis.application_data_points.join(" • ");
@@ -840,7 +691,7 @@ app.post("/process-call", async (req, res) => {
         const createConsult = (effectiveType === "Initial Consultation")  || (SCORECARD_BY_METRICS && analysis.consult_metrics);
         const createFollow  = (effectiveType === "Follow up call")        || (SCORECARD_BY_METRICS && analysis.followup_metrics);
 
-        const commonScorecardCoaching = {
+        const coaching = {
           [SCORECARD_RATING_KEY]: salesPerfScore,
           [SCORECARD_SUMMARY_KEY]: salesPerfSummary,
         };
@@ -848,61 +699,26 @@ app.post("/process-call", async (req, res) => {
         if (createQual && analysis.qual_metrics) {
           const m = analysis.qual_metrics || {};
           const fields = {
-            ...commonScorecardCoaching,
-            qual_metrics_q1_need_clearly_stated:              String(m.q1_need_clearly_stated ?? 0),
-            qual_metrics_q2_budget_discussed:                  String(m.q2_budget_discussed ?? 0),
-            qual_metrics_q3_decision_maker_present:            String(m.q3_decision_maker_present ?? 0),
-            qual_metrics_q4_authority_confirmed:               String(m.q4_authority_confirmed ?? 0),
-            qual_metrics_q5_timeline_identified:               String(m.q5_timeline_identified ?? 0),
-            qual_metrics_q6_pain_depth_understood:             String(m.q6_pain_depth_understood ?? 0),
-            qual_metrics_q7_current_solution_understood:       String(m.q7_current_solution_understood ?? 0),
-            qual_metrics_q8_competition_identified:            String(m.q8_competition_identified ?? 0),
-            qual_metrics_q9_next_step_clearly_agreed:          String(m.q9_next_step_clearly_agreed ?? 0),
-            qual_metrics_q10_fit_assessed:                     String(m.q10_fit_assessed ?? 0),
-            qual_score_final:                                  String(analysis.qual_score_final ?? 0)
+            ...coaching,
+            ...mapQualMetricsToPortal(m),          // <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+            qual_score_final: String(analysis.qual_score_final ?? 0),
           };
-          try {
-            const id = await createSalesScorecardCallFirst(fields, { callId, effectiveType, callTimestampMs });
-            console.log(`[scorecard] created ${id} for Qualification call (call ${callId})`);
-          } catch (e) {
-            console.error(`[scorecard] creation failed (Qualification) but continuing: ${e.message}`);
-          }
+          try { await createSalesScorecardCallFirst(fields, { callId, effectiveType, callTimestampMs }); }
+          catch (e) { console.error(`[scorecard] creation failed (Qualification) but continuing: ${e.message}`); }
         } else if (createConsult && analysis.consult_metrics) {
           const c = analysis.consult_metrics || {};
           const fields = {
-            ...commonScorecardCoaching,
-            consult_metrics_c1_goal_alignment:              String(c.c1_goal_alignment ?? 0),
-            consult_metrics_c2_current_state_captured:      String(c.c2_current_state_captured ?? 0),
-            consult_metrics_c3_risk_tolerance_explored:     String(c.c3_risk_tolerance_explored ?? 0),
-            consult_metrics_c4_tax_context_understood:      String(c.c4_tax_context_understood ?? 0),
-            consult_metrics_c5_pension_context_understood:  String(c.c5_pension_context_understood ?? 0),
-            consult_metrics_c6_cashflow_model_discussed:    String(c.c6_cashflow_model_discussed ?? 0),
-            consult_metrics_c7_ssas_fic_fit_discussed:      String(c.c7_ssas_fic_fit_discussed ?? 0),
-            consult_metrics_c8_fees_explained:              String(c.c8_fees_explained ?? 0),
-            consult_metrics_c9_regulatory_disclosures_made: String(c.c9_regulatory_disclosures_made ?? 0),
-            consult_metrics_c10_key_risks_explained:        String(c.c10_key_risks_explained ?? 0),
-            consult_metrics_c11_questions_addressed:        String(c.c11_questions_addressed ?? 0),
-            consult_metrics_c12_next_steps_agreed:          String(c.c12_next_steps_agreed ?? 0),
-            consult_metrics_c13_materials_promised:         String(c.c13_materials_promised ?? 0),
-            consult_metrics_c14_decision_criteria_logged:   String(c.c14_decision_criteria_logged ?? 0),
-            consult_metrics_c15_objections_summarised:      String(c.c15_objections_summarised ?? 0),
-            consult_metrics_c16_stakeholders_identified:    String(c.c16_stakeholders_identified ?? 0),
-            consult_metrics_c17_urgency_established:        String(c.c17_urgency_established ?? 0),
-            consult_metrics_c18_buyer_journey_stage:        String(c.c18_buyer_journey_stage ?? 0),
-            consult_metrics_c19_application_readiness:      String(c.c19_application_readiness ?? 0),
-            consult_metrics_c20_close_plan_started:         String(c.c20_close_plan_started ?? 0),
-            consult_score_final:                             String(analysis.consult_score_final ?? 0)
+            ...coaching,
+            ...mapConsultMetricsToPortal(c),       // <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+            consult_score_final: String(analysis.consult_score_final ?? 0),
           };
-          try {
-            const id = await createSalesScorecardCallFirst(fields, { callId, effectiveType, callTimestampMs });
-            console.log(`[scorecard] created ${id} for Initial Consultation (call ${callId})`);
-          } catch (e) {
-            console.error(`[scorecard] creation failed (Initial Consultation) but continuing: ${e.message}`);
-          }
+          try { await createSalesScorecardCallFirst(fields, { callId, effectiveType, callTimestampMs }); }
+          catch (e) { console.error(`[scorecard] creation failed (Initial Consultation) but continuing: ${e.message}`); }
         } else if (createFollow && analysis.followup_metrics) {
           const f = analysis.followup_metrics || {};
           const fields = {
-            ...commonScorecardCoaching,
+            ...coaching,
+            // NOTE: your portal currently lacks follow-up metric fields; prune loop will handle.
             followup_metrics_f1_recap_clear:                 String(f.f1_recap_clear ?? 0),
             followup_metrics_f2_objections_addressed:        String(f.f2_objections_addressed ?? 0),
             followup_metrics_f3_materials_reviewed:          String(f.f3_materials_reviewed ?? 0),
@@ -913,14 +729,10 @@ app.post("/process-call", async (req, res) => {
             followup_metrics_f8_close_likelihood_discussed:  String(f.f8_close_likelihood_discussed ?? 0),
             followup_metrics_f9_timeframe_reconfirmed:       String(f.f9_timeframe_reconfirmed ?? 0),
             followup_metrics_f10_overall_call_effectiveness: String(f.f10_overall_call_effectiveness ?? 0),
-            followup_score_final:                             String(analysis.followup_score_final ?? 0)
+            followup_score_final: String(analysis.followup_score_final ?? 0),
           };
-          try {
-            const id = await createSalesScorecardCallFirst(fields, { callId, effectiveType, callTimestampMs });
-            console.log(`[scorecard] created ${id} for Follow up call (call ${callId})`);
-          } catch (e) {
-            console.error(`[scorecard] creation failed (Follow up) but continuing: ${e.message}`);
-          }
+          try { await createSalesScorecardCallFirst(fields, { callId, effectiveType, callTimestampMs }); }
+          catch (e) { console.error(`[scorecard] creation failed (Follow up) but continuing: ${e.message}`); }
         } else {
           console.log(`[scorecard] not created (type=${effectiveType}, metrics present? qual=${!!analysis.qual_metrics}, consult=${!!analysis.consult_metrics}, follow=${!!analysis.followup_metrics})`);
         }
@@ -936,8 +748,8 @@ app.post("/process-call", async (req, res) => {
   }
 });
 
-// -------------------------------------------------------------
-// Start
-// -------------------------------------------------------------
+// Keep 404s quiet
+app.get("/", (_req, res) => res.status(200).send("OK"));
+
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`AI Call Worker listening on :${PORT}`));
