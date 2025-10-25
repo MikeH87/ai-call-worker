@@ -1,11 +1,15 @@
 // =============================================================
-// TLPI – AI Call Worker (v2.7)
-// - Scorecards for: Qualification, Initial Consultation, Follow up
-// - No scorecards for other call types
+// TLPI – AI Call Worker (v2.9)
+// - Updated call-type cues per business rules:
+//   * Qualification = PHONE ONLY (never Zoom)
+//   * Initial Consultation = ZOOM ONLY; may include personal data capture + walkthrough
+//   * Application meeting = ZOOM ONLY; DocuSign signing session; no data capture
+// - Heuristic assist + stricter prompt
+// - Scorecards only: Qualification / Initial Consultation / Follow up
 // - Existing-customer fields use portal names:
 //     ai_customer_sentiment / ai_complaint_detected / ai_escalation_required / ai_escalation_notes
-// - Safe retry-on-unknown properties (works even without calls-read)
-// - Keeps: compression/chunking, Whisper, type inference (GRACE_MS)
+// - Safe retry-on-unknown properties for HubSpot call updates
+// - Keeps: compression/chunking, Whisper, GRACE_MS grace handling
 // =============================================================
 
 import express from "express";
@@ -22,6 +26,9 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const HUBSPOT_TOKEN  = process.env.HUBSPOT_TOKEN;
 const ZOOM_BEARER_TOKEN = process.env.ZOOM_BEARER_TOKEN || process.env.ZOOM_ACCESS_TOKEN;
 const GRACE_MS = Number(process.env.GRACE_MS ?? 0); // 0 during testing
+
+// Optional: create scorecard when metrics block exists even if type mismatched
+const SCORECARD_BY_METRICS = String(process.env.SCORECARD_BY_METRICS ?? "true").toLowerCase() === "true";
 
 // ---- Constants ----
 const MAX_WHISPER_BYTES = 25 * 1024 * 1024; // Whisper limit
@@ -58,6 +65,8 @@ function authHeadersFor(url) {
   if (/\.zoom\.us/i.test(url) && ZOOM_BEARER_TOKEN) headers.Authorization = `Bearer ${ZOOM_BEARER_TOKEN}`;
   return headers;
 }
+
+const isZoomUrl = (u) => /\.zoom\.us\//i.test(String(u || ""));
 
 // -------------------------------------------------------------
 // Download & Prepare Audio (compress + chunk if needed)
@@ -147,7 +156,50 @@ async function transcribeAudioSmart(srcPath, callId) {
 }
 
 // -------------------------------------------------------------
-// Call type inference with (configurable) grace
+// Heuristics for call type (assist the model)
+// -------------------------------------------------------------
+function heuristicType(recordingUrl, transcript) {
+  const t = (transcript || "").toLowerCase();
+  const zoom = isZoomUrl(recordingUrl);
+
+  // Strong cues: DocuSign signing session (Application)
+  const docusign = /docusign|sign(ing)? (the )?(application|forms?)|envelope/i.test(t);
+  // Personal data capture cues
+  const dataCapture = /(date of birth|dob|national insurance|ni number|address|postcode|company (reg|registration)|utr|tax reference|bank details|sort code|account number)/i.test(t);
+  // Product walkthrough cues
+  const walkthrough = /(features|benefits|compare|ssas|fic|small self administered|family investment company|pension|property purchase|how it works)/i.test(t);
+  // Follow-up cues
+  const followUp = /(following up|as discussed last time|have you had a chance to review|remaining questions|what'?s stopping you|close plan|next steps from last time)/i.test(t);
+  // Booking consult cues (qualification)
+  const bookingConsult = /book (a|the) (zoom|consultation)|schedule (a|the) (zoom|consultation)/i.test(t);
+
+  // Hard constraints first
+  if (!zoom) {
+    // If it's not Zoom, it cannot be Initial Consultation or Application meeting
+    if (bookingConsult || walkthrough || !dataCapture) {
+      return { hint: "Qualification call", reason: "phone only rule; not Zoom" };
+    }
+  } else {
+    // Zoom only path
+    if (docusign && !dataCapture) {
+      return { hint: "Application meeting", reason: "DocuSign signing, no data capture" };
+    }
+    if (followUp) {
+      return { hint: "Follow up call", reason: "explicit follow-up cues on Zoom" };
+    }
+    // Zoom with data capture and/or walkthrough → Initial Consultation
+    if (dataCapture || walkthrough) {
+      return { hint: "Initial Consultation", reason: "Zoom + data capture and/or walkthrough" };
+    }
+    // If Zoom but none of the above, default to Initial Consultation (weak)
+    return { hint: "Initial Consultation", reason: "Zoom default (weak)" };
+  }
+
+  return { hint: "", reason: "no decisive cues" };
+}
+
+// -------------------------------------------------------------
+// Call type inference with (configurable) grace + heuristic reconcile
 // -------------------------------------------------------------
 const CALL_TYPE_LABELS = [
   "Qualification call",
@@ -171,10 +223,24 @@ async function fetchCallProps(callId, props = ["hs_activity_type"]) {
   return j?.properties || {};
 }
 
-async function classifyCallTypeFromTranscript(transcript) {
-  const system =
-    "Classify the call into ONE label. Return ONLY JSON {\"label\":\"<one>\",\"confidence\":<0-100>}.\n" +
-    "Valid labels: " + CALL_TYPE_LABELS.join(", ");
+async function classifyCallTypeFromTranscript(transcript, recordingUrl) {
+  const rules =
+`Classify HubSpot calls using these STRICT operational definitions:
+
+- Qualification call: PHONE ONLY, short, discover interest/eligibility and book a Zoom consultation. Never a Zoom recording. No structured product walkthrough.
+- Initial Consultation: ZOOM ONLY. Explain SSAS/FIC/Both, answer questions, ask to proceed. May include capturing personal details (DOB, NI, address) as part of proceeding, and should reflect in "application_data_points" / "missing_information".
+- Follow up call: ZOOM. After the initial consultation. Address remaining objections, confirm materials were reviewed, attempt to close.
+- Application meeting: ZOOM ONLY. Sole purpose is completing DocuSign signing of the full pension application. Data has already been collected previously, so do NOT capture new personal details here.
+- Strategy / Annual Review / Existing customer / Other: as usual.
+
+Disambiguation rules:
+- If non-Zoom recording => NOT Initial Consultation or Application meeting; likely Qualification call.
+- If any DocuSign/“sign the application/envelope” without personal data capture => Application meeting.
+- If personal data capture (DOB, NI number, address, company details, tax refs, bank details) on Zoom => Initial Consultation (NOT Application).
+- If follow-up cues (“as discussed last time”, “had a chance to review”, “remaining questions”, “close plan”) => Follow up call.
+
+Return ONLY JSON: {"label":"<one>","confidence":<0-100>}. No rationale.`;
+
   const r = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
@@ -182,7 +248,10 @@ async function classifyCallTypeFromTranscript(transcript) {
       model: "gpt-4o-mini",
       temperature: 0,
       response_format: { type: "json_object" },
-      messages: [{ role: "system", content: system }, { role: "user", content: transcript }],
+      messages: [
+        { role: "system", content: rules },
+        { role: "user", content: `Recording URL: ${recordingUrl}\n\nTranscript:\n${transcript}` },
+      ],
     }),
   });
   const j = await r.json();
@@ -196,13 +265,13 @@ async function classifyCallTypeFromTranscript(transcript) {
   }
 }
 
-async function resolveCallTypeWithGrace(callId, transcript, graceMs = GRACE_MS) {
+async function resolveCallTypeWithGrace(callId, transcript, recordingUrl, graceMs = GRACE_MS) {
+  // 1) Respect rep-set type first (after optional grace)
   const first = await fetchCallProps(callId, ["hs_activity_type"]);
   if (first?.hs_activity_type) {
     console.log(`[type] using hs_activity_type immediately: ${first.hs_activity_type}`);
     return first.hs_activity_type;
   }
-
   if (graceMs > 0) {
     console.log(`[type] hs_activity_type blank — waiting ${graceMs / 1000}s`);
     await sleep(graceMs);
@@ -215,9 +284,28 @@ async function resolveCallTypeWithGrace(callId, transcript, graceMs = GRACE_MS) 
     console.log("[type] grace wait disabled for testing");
   }
 
+  // 2) Heuristic hint (non-binding, but strong constraints)
+  const hint = heuristicType(recordingUrl, transcript);
+  if (hint.hint) console.log(`[type] heuristic hint: ${hint.hint} (${hint.reason})`);
+
+  // 3) Model classification
   console.log("[type] inferring type from transcript…");
-  const { typeLabel, confidence } = await classifyCallTypeFromTranscript(transcript);
+  const { typeLabel, confidence } = await classifyCallTypeFromTranscript(transcript, recordingUrl);
   console.log(`[type] inferred=${typeLabel} confidence=${confidence}`);
+
+  // 4) Reconcile:
+  //    - If recording is NOT Zoom, force NOT Initial Consultation/Application.
+  //    - If confidence < 85 and heuristic gives one of our main four, prefer heuristic.
+  const MAIN = new Set(["Qualification call","Initial Consultation","Follow up call","Application meeting"]);
+  let finalLabel = typeLabel;
+
+  if (!isZoomUrl(recordingUrl) && (typeLabel === "Initial Consultation" || typeLabel === "Application meeting")) {
+    finalLabel = "Qualification call";
+    console.log(`[type] override: not Zoom recording ⇒ forcing Qualification call`);
+  } else if (confidence < 85 && hint.hint && MAIN.has(hint.hint)) {
+    finalLabel = hint.hint;
+    console.log(`[type] overriding to heuristic due to low confidence: ${finalLabel}`);
+  }
 
   // write AI fields
   await fetch(`https://api.hubapi.com/crm/v3/objects/calls/${encodeURIComponent(callId)}`, {
@@ -225,7 +313,7 @@ async function resolveCallTypeWithGrace(callId, transcript, graceMs = GRACE_MS) 
     headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}`, "Content-Type": "application/json" },
     body: JSON.stringify({
       properties: {
-        ai_inferred_call_type: typeLabel,
+        ai_inferred_call_type: finalLabel,
         ai_call_type_confidence: String(confidence),
       },
     }),
@@ -236,15 +324,15 @@ async function resolveCallTypeWithGrace(callId, transcript, graceMs = GRACE_MS) 
     await fetch(`https://api.hubapi.com/crm/v3/objects/calls/${encodeURIComponent(callId)}`, {
       method: "PATCH",
       headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ properties: { hs_activity_type: typeLabel } }),
+      body: JSON.stringify({ properties: { hs_activity_type: finalLabel } }),
     });
   }
 
-  return typeLabel;
+  return finalLabel;
 }
 
 // -------------------------------------------------------------
-// Analysis (adds follow-up metrics)
+// Analysis (Follow-up metrics included; consultation data mapped)
 // -------------------------------------------------------------
 async function analyseCall(typeLabel, transcript) {
   const system = "You are TLPI’s call analysis bot. Output JSON only.";
@@ -511,8 +599,8 @@ app.post("/process-call", async (req, res) => {
         const srcPath = await downloadRecording(recordingUrl, callId);
         const transcript = await transcribeAudioSmart(srcPath, callId);
 
-        // 2) Call type (with optional grace)
-        const effectiveType = await resolveCallTypeWithGrace(callId, transcript, GRACE_MS);
+        // 2) Call type (with grace + heuristic reconcile)
+        const effectiveType = await resolveCallTypeWithGrace(callId, transcript, recordingUrl, GRACE_MS);
         console.log("[type] effectiveType:", effectiveType);
 
         // 3) Analysis
@@ -534,7 +622,7 @@ app.post("/process-call", async (req, res) => {
           updates.ai_escalation_notes    = analysis.escalation_notes || "";
         }
 
-        // Initial Consultation → capture application info if present
+        // Initial Consultation → capture application info if present (data capture supported here)
         if (effectiveType === "Initial Consultation") {
           if (Array.isArray(analysis.product_interest) && analysis.product_interest.length) {
             const v = analysis.product_interest.includes("Both") ? "Both" : analysis.product_interest[0];
@@ -550,13 +638,17 @@ app.post("/process-call", async (req, res) => {
 
         await updateHubSpotCall(callId, updates);
 
-        // 5) Scorecards — only for the three call types
+        // 5) Scorecards — only for the three call types (with metrics fallback if enabled)
         const { contacts: contactIds, deals: dealIds } = await getCallAssociations(callId);
 
-        if (effectiveType === "Qualification call" && analysis.qual_metrics) {
+        const createQual = (effectiveType === "Qualification call") || (SCORECARD_BY_METRICS && analysis.qual_metrics);
+        const createConsult = (effectiveType === "Initial Consultation") || (SCORECARD_BY_METRICS && analysis.consult_metrics);
+        const createFollow = (effectiveType === "Follow up call") || (SCORECARD_BY_METRICS && analysis.followup_metrics);
+
+        // Single scorecard per call — priority: Qualification > Consultation > Follow up
+        if (createQual && analysis.qual_metrics) {
           const m = analysis.qual_metrics || {};
           const fields = {
-            // qual_metrics group
             qual_metrics_q1_need_clearly_stated:              String(m.q1_need_clearly_stated ?? 0),
             qual_metrics_q2_budget_discussed:                  String(m.q2_budget_discussed ?? 0),
             qual_metrics_q3_decision_maker_present:            String(m.q3_decision_maker_present ?? 0),
@@ -567,13 +659,10 @@ app.post("/process-call", async (req, res) => {
             qual_metrics_q8_competition_identified:            String(m.q8_competition_identified ?? 0),
             qual_metrics_q9_next_step_clearly_agreed:          String(m.q9_next_step_clearly_agreed ?? 0),
             qual_metrics_q10_fit_assessed:                     String(m.q10_fit_assessed ?? 0),
-            // rollup
             qual_score_final:                                  String(analysis.qual_score_final ?? 0)
           };
           await createSalesScorecard(fields, { callId, contactIds, dealIds });
-        }
-
-        if (effectiveType === "Initial Consultation" && analysis.consult_metrics) {
+        } else if (createConsult && analysis.consult_metrics) {
           const c = analysis.consult_metrics || {};
           const fields = {
             consult_metrics_c1_goal_alignment:              String(c.c1_goal_alignment ?? 0),
@@ -599,9 +688,7 @@ app.post("/process-call", async (req, res) => {
             consult_score_final:                             String(analysis.consult_score_final ?? 0)
           };
           await createSalesScorecard(fields, { callId, contactIds, dealIds });
-        }
-
-        if (effectiveType === "Follow up call" && analysis.followup_metrics) {
+        } else if (createFollow && analysis.followup_metrics) {
           const f = analysis.followup_metrics || {};
           const fields = {
             followup_metrics_f1_recap_clear:                 String(f.f1_recap_clear ?? 0),
