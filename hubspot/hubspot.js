@@ -110,35 +110,45 @@ export async function updateCall(callId, analysis) {
   // 7) ai next steps
   props.ai_next_steps = toShortList(analysis?.next_actions, [], "No next steps captured.");
 
-  // 8) AI key objections (concise) + bullets/category/severity/primary
+  // 8) Objections (primary/bullets/category/severity)
   const objections = ensureArray(analysis?.objections);
   if (objections.length) {
     props.ai_key_objections = objections.join("; ").slice(0, 1000);
     props.ai_objections_bullets = objections.join(" • ").slice(0, 5000);
     props.ai_primary_objection = objections[0].slice(0, 300);
-    props.ai_objection_categories = mapObjectionCategories(objections).join("; ") || "None.";
+    const mappedCat = mapObjectionCategoryToAllowed(objections);
+    if (mappedCat) props.ai_objection_categories = mappedCat; // single allowed option only
     props.ai_objection_severity = normaliseSeverity(analysis?.ai_objection_severity || "Medium");
   } else {
     props.ai_key_objections = "No objections";
     props.ai_objections_bullets = "No objections";
     props.ai_primary_objection = "No objections";
-    props.ai_objection_categories = "None.";
+    // Do NOT set ai_objection_categories at all when none; avoids INVALID_OPTION
     props.ai_objection_severity = "Low";
   }
 
-  // 9) ai client engagement level (NUMBER) from sentiment/outcome (3/2/1)
+  // 9) ai client engagement level (NUMBER 3/2/1)
   const sentiment = normaliseSentiment(analysis?.ai_customer_sentiment || analysis?.outcome);
   props.ai_client_engagement_level = engagementNumberFromSentiment(sentiment);
 
-  // 10) ChatGPT helper fields (likeliness 1–10, bullets, reasoning)
+  // 10) ChatGPT helper fields (careful: internal name is **likeliness** with an 'e')
   const likeScore10 = adjustedLikelihood10(analysis, outcomeHS);
-  props["chat_gpt___likliness_to_proceed_score"] = likeScore10;
+  props["chat_gpt___likeliness_to_proceed_score"] = likeScore10;
   props["chat_gpt___increase_likelihood_of_sale_suggestions"] = buildIncreaseLikelihood(analysis);
   props["chat_gpt___score_reasoning"] = buildScoreReasoning(analysis, likeScore10);
 
   // Filter & patch
   const safeProps = await filterPropsFor("calls", props);
   const patchResp = await hubspotPatch(`crm/v3/objects/calls/${encodeURIComponent(callId)}`, { properties: safeProps });
+
+  // Optional echo to logs
+  try {
+    const echo = await getHubSpotObject("calls", callId, [
+      "ai_inferred_call_type","ai_call_type_confidence","ai_consultation_outcome",
+      "ai_product_interest","ai_decision_criteria","chat_gpt___likeliness_to_proceed_score"
+    ]);
+    console.log("[debug] Call updated:", echo?.properties);
+  } catch {}
 
   return patchResp;
 }
@@ -155,7 +165,7 @@ export async function createScorecard(analysis, { callId, contactIds = [], dealI
   // Build 20 consult_* flags (0/1) using consult_eval + heuristics
   const consult = buildConsultFlags(analysis);
 
-  // Weighted score (sums to 10.0), then round to nearest integer, clamp 1..10
+  // Weighted score (sums to 10.0), round to nearest integer, clamp 1..10
   const weights = CONSULT_WEIGHTS_10;
   let raw = 0;
   for (const [k, w] of Object.entries(weights)) raw += (consult[k] ? 1 : 0) * w;
@@ -174,7 +184,7 @@ export async function createScorecard(analysis, { callId, contactIds = [], dealI
     activity_name: activityName,
     hubspot_owner_id: ownerId || undefined,
 
-    // 20 consult_* flags (0/1) — only set if property exists
+    // 20 consult_* flags (0/1)
     ...(has("consult_closing_question_asked") ? { consult_closing_question_asked: consult.consult_closing_question_asked } : {}),
     ...(has("consult_collected_dob_nin_when_agreed") ? { consult_collected_dob_nin_when_agreed: consult.consult_collected_dob_nin_when_agreed } : {}),
     ...(has("consult_confirm_reason_for_zoom") ? { consult_confirm_reason_for_zoom: consult.consult_confirm_reason_for_zoom } : {}),
@@ -323,7 +333,6 @@ function toMultiline(v){ if(Array.isArray(v)) return v.join("\n"); if(v==null) r
 function toShortList(primary, inferred=[], fallback=""){ const a=ensureArray(primary); if(a.length) return a.join("; ").slice(0, 1000); const b=ensureArray(inferred); return (b.length ? b.join("; ") : fallback).slice(0, 1000); }
 function numberOrNull(v){ if(v==null) return null; const n=Number(v); return Number.isFinite(n) ? n : null; }
 function clamp(n, lo, hi){ return Math.max(lo, Math.min(hi, n)); }
-function sum(arr){ return arr.reduce((a,b)=>a+(Number(b)||0),0); }
 
 function normaliseSentiment(v){ if(!v) return "Neutral"; const s=String(v).toLowerCase();
   if (s.includes("pos")) return "Positive";
@@ -346,14 +355,12 @@ function mapConsultationOutcomeHS(outcomeText, likelihoodPct, analysis){
     return "Proceed now";
   }
 
-  // Text hints first
   if (/\bproceed now|signed|commit|purchase|buy|agreed/.test(s)) return "Proceed now";
   if (/\blikely|positive|good chance|favourable|favorable/.test(s)) return "Likely";
   if (/\bnot now|later|follow[-\s]?up|defer|wait/.test(s)) return "Not now";
   if (/\bno fit|not proceeding|won'?t proceed|decline|reject/.test(s)) return "No fit";
   if (/\bunclear|unsure|tbd|unknown/.test(s)) return "Unclear";
 
-  // fall back to likelihood thresholds (pct 0..100)
   const n = numberOrNull(likelihoodPct);
   if (n != null) {
     if (n >= 90) return "Proceed now";
@@ -372,22 +379,35 @@ function adjustedLikelihood10(analysis, outcomeHS){
   return clamp(Math.round(score), 1, 10);
 }
 
+function toOneToTenFromPct(pct){
+  const n = numberOrNull(pct);
+  if (n==null) return null;
+  return clamp(Math.max(1, Math.round(n/10)), 1, 10);
+}
+
 function mapProductInterest(products){
   const arr=ensureArray(products).map(p=>p.toLowerCase());
   const hasSSAS=arr.some(p=>p.includes("ssas")), hasFIC=arr.some(p=>p.includes("fic"));
   if (hasSSAS && hasFIC) return "Both"; if (hasSSAS) return "SSAS"; if (hasFIC) return "FIC"; return undefined;
 }
 
-function mapObjectionCategories(objs){
-  const cats=new Set();
-  const text=ensureArray(objs).join(" ").toLowerCase();
-  if (/fee|cost|price/.test(text)) cats.add("Fees");
-  if (/time|timeline|delay|month|week/.test(text)) cats.add("Timeline");
-  if (/risk|volatile|uncertain/.test(text)) cats.add("Risk");
-  if (/hmrc|compliance|tax|rules?/.test(text)) cats.add("Compliance/Tax");
-  if (/provider|trust|reliable|previous/.test(text)) cats.add("Provider/Trust");
-  if (/paperwork|process|admin/.test(text)) cats.add("Process");
-  return Array.from(cats);
+/** Map our free-form categories to your **allowed single-select**: [Price, Timing, Risk, Complexity, Authority, Clarity]. */
+function mapObjectionCategoryToAllowed(objs){
+  const text = ensureArray(objs).join(" ").toLowerCase();
+  if (/fee|cost|price/.test(text)) return "Price";
+  if (/time|timeline|delay|month|week|schedule/.test(text)) return "Timing";
+  if (/risk|volatile|uncertain|concern/.test(text)) return "Risk";
+  if (/hmrc|compliance|tax|rules?|paperwork|process|admin|complex/.test(text)) return "Complexity";
+  if (/authority|director|decision[-\s]?maker|trust|provider|sign[-\s]?off|approval/.test(text)) return "Authority";
+  if (/confus|unclear|don.?t understand|clarif/.test(text)) return "Clarity";
+  return null; // IMPORTANT: return null rather than an invalid value
+}
+
+function normaliseSeverity(v){
+  const s = String(v || "").toLowerCase();
+  if (s.startsWith("h")) return "High";
+  if (s.startsWith("m")) return "Medium";
+  return "Low";
 }
 
 function inferDecisionCriteriaFromSummary(summaryArr){
@@ -400,12 +420,6 @@ function inferDecisionCriteriaFromSummary(summaryArr){
   if (/loan|bridge|finance|cashflow/.test(s)) crit.push("Funding/Cashflow");
   if (/trust|provider|previous/.test(s)) crit.push("Provider reliability");
   return Array.from(new Set(crit));
-}
-
-function toOneToTenFromPct(pct){
-  const n = numberOrNull(pct);
-  if (n==null) return null;
-  return clamp(Math.max(1, Math.round(n/10)), 1, 10);
 }
 
 function buildScoreReasoning(analysis, score10){
@@ -443,11 +457,18 @@ function buildDataPointsCaptured(kd){
   return items.join("\n").slice(0, 5000);
 }
 
+function buildCoachingSummary(analysis){
+  const s = String(analysis?.sales_performance_summary || "").trim();
+  if (s) return s.slice(0, 9000);
+  const ww = ensureArray(analysis?.summary).slice(0,2).map(x=>`- ${x}`).join("\n") || "- Rapport established.";
+  const imp = ["- Ask for a specific commitment.","- Confirm next step & date."].join("\n");
+  return `What went well:\n${ww}\n\nAreas to improve:\n${imp}`;
+}
+
 /** Build 20 consult_* flags from consult_eval (0/0.5/1) + light inference from analysis text. */
 function buildConsultFlags(analysis){
   const ev = analysis?.consult_eval || {};
   const yes01 = (v)=> Number(v) >= 0.75 ? 1 : (Number(v) > 0 ? 1 : 0);
-  const hasAny = (arr)=> ensureArray(arr).length ? 1 : 0;
   const text = [
     ...(ensureArray(analysis?.summary)),
     ...(ensureArray(analysis?.next_actions)),
@@ -461,7 +482,7 @@ function buildConsultFlags(analysis){
   const feePhraseRegex = /\b(375|three[-\s]?seven[-\s]?five|£?375)\b/;
   const buySignalRegex = /\b(ready|keen|let'?s proceed|go ahead|how do we|what next|timeline|when can we|send (the )?agreement|invoice|payment)\b/i;
 
-  const consult = {
+  return {
     consult_closing_question_asked:           yes01(ev.commitment_requested ?? 0),
     consult_collected_dob_nin_when_agreed:    analysis?.key_details?.dob || analysis?.key_details?.ni || analysis?.key_details?.nino ? 1 : 0,
     consult_confirm_reason_for_zoom:          yes01(ev.intro ?? 0) || /reason|purpose/.test(text) ? 1 : 0,
@@ -483,9 +504,4 @@ function buildConsultFlags(analysis){
     consult_specific_tax_estimate_given:      yes01(ev.specific_tax_estimate_given ?? 0) || /\b£\s*\d{2,}(,\d{3})*\b.*tax/i.test(text) ? 1 : 0,
     consult_strong_buying_signals_detected:   buySignalRegex.test(text) || like10 >= 7 ? 1 : 0,
   };
-
-  return consult;
 }
-
-/* ================== Helper end ================== */
-
