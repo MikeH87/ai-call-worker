@@ -1,8 +1,8 @@
 // =============================================================
-// TLPI – AI Call Worker (v3.8.1)
-// - Reliability upgrade: always-or-threshold segmentation, per-chunk
-//   Whisper timeouts & retries, detailed progress logging.
-// - All core behaviours from v3.8 preserved.
+// TLPI – AI Call Worker (v3.8.2)
+// - Fix: robust chunk discovery after ffmpeg segmentation (+ fallback)
+// - Improve: scorecard create auto-prune unknown properties & retry
+// - All core behaviours from v3.8.x preserved.
 // =============================================================
 
 import express from "express";
@@ -21,23 +21,23 @@ const ZOOM_BEARER_TOKEN  = process.env.ZOOM_BEARER_TOKEN || process.env.ZOOM_ACC
 const GRACE_MS           = Number(process.env.GRACE_MS ?? 0); // 0 during testing
 const SCORECARD_BY_METRICS = String(process.env.SCORECARD_BY_METRICS ?? "true").toLowerCase() === "true";
 
-// New reliability envs (optional)
-const ALWAYS_SEGMENT       = String(process.env.ALWAYS_SEGMENT ?? "true").toLowerCase() === "true";
-const WHISPER_TIMEOUT_MS   = Number(process.env.WHISPER_TIMEOUT_MS ?? 300000); // 5 min per chunk
-const WHISPER_MAX_RETRIES  = Number(process.env.WHISPER_MAX_RETRIES ?? 3);
-const SEGMENT_SECONDS      = Number(process.env.SEGMENT_SECONDS ?? 600); // 10 minutes
-const FORCE_SEGMENT_SIZE_MB= Number(process.env.FORCE_SEGMENT_SIZE_MB ?? 12); // segment if >12MB even if ALWAYS_SEGMENT=false
+// Reliability envs (optional)
+const ALWAYS_SEGMENT        = String(process.env.ALWAYS_SEGMENT ?? "true").toLowerCase() === "true";
+const WHISPER_TIMEOUT_MS    = Number(process.env.WHISPER_TIMEOUT_MS ?? 300000); // 5 min per chunk
+const WHISPER_MAX_RETRIES   = Number(process.env.WHISPER_MAX_RETRIES ?? 3);
+const SEGMENT_SECONDS       = Number(process.env.SEGMENT_SECONDS ?? 600); // 10 minutes
+const FORCE_SEGMENT_SIZE_MB = Number(process.env.FORCE_SEGMENT_SIZE_MB ?? 12); // force segment if >12MB
 
-// ---- Call property keys (confirmed in your portal) ----
+// ---- Call property keys ----
 const IC_DATA_POINTS_KEY = "ai_data_points_captured";
 const IC_MISSING_INFO_KEY = "ai_missing_information";
 
-// ---- Sales Scorecard property keys (confirmed in your portal) ----
+// ---- Sales Scorecard keys ----
 const SCORECARD_TYPE = "p49487487_sales_scorecards";
-const SCORECARD_NAME_KEY = "activity_name"; // friendly name
-const SCORECARD_TYPE_KEY = "activity_type"; // call type
-const SCORECARD_RATING_KEY = "sales_performance_rating_"; // NUMBER (1..10), note underscore
-const SCORECARD_SUMMARY_KEY = "sales_scorecard___what_you_can_improve_on"; // multiline text
+const SCORECARD_NAME_KEY = "activity_name";
+const SCORECARD_TYPE_KEY = "activity_type";
+const SCORECARD_RATING_KEY = "sales_performance_rating_";
+const SCORECARD_SUMMARY_KEY = "sales_scorecard___what_you_can_improve_on";
 
 // ---- Constants ----
 const MAX_WHISPER_BYTES = 25 * 1024 * 1024;
@@ -55,8 +55,7 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const fileSizeBytes = (p) => { try { return fs.statSync(p).size; } catch { return 0; } };
 const tmpPath = (name) => path.join(TMP_DIR, name);
 const isZoomUrl = (u) => /\.zoom\.us\//i.test(String(u || ""));
-
-function nowIso() { return new Date().toISOString(); }
+const nowIso = () => new Date().toISOString();
 
 async function fetchWithRetry(url, opts = {}, retries = 3) {
   let last = null;
@@ -113,16 +112,20 @@ function transcodeToSpeechMp3(inPath, outPath) {
 }
 
 function segmentAudio(inPath, outPattern, seconds = SEGMENT_SECONDS) {
+  // We will collect chunks by prefix BEFORE %03d
+  const dir = path.dirname(outPattern);
+  const prefix = path.basename(outPattern).split("%")[0]; // e.g. call_part_
   return new Promise((resolve, reject) => {
     ffmpeg(inPath)
       .outputOptions(["-f", "segment", "-segment_time", String(seconds), "-reset_timestamps", "1"])
       .output(outPattern)
       .on("error", reject)
       .on("end", () => {
-        const dir = path.dirname(outPattern);
-        const base = path.basename(outPattern).replace("%03d", "");
-        const all = fs.readdirSync(dir).filter(f => f.startsWith(base)).map(f => path.join(dir, f)).sort();
-        resolve(all);
+        const files = fs.readdirSync(dir)
+          .filter((f) => f.startsWith(prefix)) // matches call_part_000.mp3, 001.mp3, etc.
+          .map((f) => path.join(dir, f))
+          .sort();
+        resolve(files);
       })
       .run();
   });
@@ -135,17 +138,29 @@ async function ensureWhisperFriendlyAudio(srcPath, callId) {
   const sizeMb = (size / 1048576).toFixed(2);
   console.log(`[prep] compressed MP3 size=${sizeMb} MB at ${nowIso()}`);
 
-  // Decide segmentation strategy
   const mustSegmentBySize = size > FORCE_SEGMENT_SIZE_MB * 1024 * 1024;
   if (ALWAYS_SEGMENT || mustSegmentBySize) {
     console.log(`[prep] segmenting audio (ALWAYS_SEGMENT=${ALWAYS_SEGMENT}, size>${FORCE_SEGMENT_SIZE_MB}MB? ${mustSegmentBySize})…`);
     const pattern = tmpPath(`${callId}_part_%03d.mp3`);
     const parts = await segmentAudio(mp3Path, pattern, SEGMENT_SECONDS);
     console.log(`[prep] created ${parts.length} chunk(s).`);
+    if (!parts.length) {
+      console.warn(`[prep] WARNING: segmenting produced 0 chunks – falling back to single file.`);
+      // Fall back safely
+      if (size <= MAX_WHISPER_BYTES) {
+        return { mode: "single", files: [mp3Path] };
+      } else {
+        // As an extra safeguard, try a shorter segment size quickly
+        console.warn(`[prep] Retrying segmentation with shorter segment size (420s)…`);
+        const retryPattern = tmpPath(`${callId}_part_retry_%03d.mp3`);
+        const retryParts = await segmentAudio(mp3Path, retryPattern, 420);
+        console.log(`[prep] retry created ${retryParts.length} chunk(s).`);
+        return retryParts.length ? { mode: "multi", files: retryParts } : { mode: "single", files: [mp3Path] };
+      }
+    }
     return { mode: "multi", files: parts };
   }
 
-  // If not forced to segment and <= 25MB, still single-file unless too big for Whisper API
   if (size <= MAX_WHISPER_BYTES) {
     console.log(`[prep] using single file (<=25MB & segmentation not forced).`);
     return { mode: "single", files: [mp3Path] };
@@ -155,6 +170,10 @@ async function ensureWhisperFriendlyAudio(srcPath, callId) {
   const pattern = tmpPath(`${callId}_part_%03d.mp3`);
   const parts = await segmentAudio(mp3Path, pattern, SEGMENT_SECONDS);
   console.log(`[prep] created ${parts.length} chunk(s) due to 25MB limit.`);
+  if (!parts.length) {
+    console.warn(`[prep] WARNING: forced segmentation also produced 0 chunks – falling back to single file.`);
+    return { mode: "single", files: [mp3Path] };
+  }
   return { mode: "multi", files: parts };
 }
 
@@ -230,7 +249,7 @@ async function transcribeAudioSmart(srcPath, callId) {
 }
 
 // -------------------------------------------------------------
-// Heuristics for call type (assist the model)
+// Heuristics & classification (unchanged)
 // -------------------------------------------------------------
 function heuristicType(recordingUrl, transcript) {
   const t = (transcript || "").toLowerCase();
@@ -251,9 +270,6 @@ function heuristicType(recordingUrl, transcript) {
   }
 }
 
-// -------------------------------------------------------------
-// Call type inference with grace + heuristic reconcile
-// -------------------------------------------------------------
 const CALL_TYPE_LABELS = [
   "Qualification call",
   "Initial Consultation",
@@ -380,7 +396,7 @@ async function resolveCallTypeWithGrace(callId, transcript, recordingUrl, graceM
 }
 
 // -------------------------------------------------------------
-// Sales performance coaching (unchanged core logic)
+// Sales performance coaching (unchanged)
 // -------------------------------------------------------------
 function enforceSSAS(text) {
   if (typeof text !== "string") return "";
@@ -393,25 +409,14 @@ async function scoreSalesPerformance(transcript) {
 `EVALUATE THE CONSULTANT USING THIS DETERMINISTIC RUBRIC:
 
 For each of the 10 criteria below, assign:
-- 1 = clearly met (explicit evidence in transcript)
-- 0.5 = partially met (some evidence but incomplete)
-- 0 = not met / absent / ambiguous
+- 1 = clearly met
+- 0.5 = partially met
+- 0 = not met / ambiguous
 
-Criteria (same order):
-1) Clear, professional intro
-2) Early rapport/trust attempt
-3) At least one open-ended question for needs
-4) Pain/opportunity relevant to corp/business tax/IHT/funding identified
-5) Services explained clearly, simply
-6) Benefits connected to client’s specific needs
-7) Active listening & acknowledgment of concerns
-8) Clear, confident responses (or committed follow-up)
-9) Asked for a commitment (next meeting/docs/proposal)
-10) Confirmed clear next steps
+[criteria 1..10 as per rubric]
 
-SCORE = sum of the 10 items (0..10 in 0.5 increments), then round to nearest integer (0.5 rounds up). If final <1, output 1.
-
-Output ONLY the integer 1..10 (no words).
+SCORE = sum (0..10 in 0.5 steps), round .5 up, min 1.
+Output ONLY the integer 1..10.
 
 Transcript:
 ${enforceSSAS(transcript)}
@@ -433,43 +438,17 @@ ${enforceSSAS(transcript)}
 }
 
 async function summariseSalesPerformance(transcript) {
-  const system = 'You are TLPI’s transcript analysis bot. Always spell "SSAS" (Small Self-Administered Scheme).';
+  const system = 'You are TLPI’s transcript analysis bot. Always spell "SSAS".';
   const prompt =
-`You are evaluating a sales call transcript against this scorecard:
-
-Opening & Rapport
-1. Clear, professional intro?
-2. Early rapport/trust attempt?
-
-Discovery & Qualification
-3. Open-ended question to understand needs?
-4. Identified pain/opportunity re: corp/business tax/inheritance tax or loaning money to prospect’s business?
-
-Value Positioning
-5. Explained firm’s services clearly and simply?
-6. Connected benefits to client’s specific needs?
-
-Handling Concerns
-7. Active listening and acknowledged concerns/questions?
-8. Clear, confident responses (follow-up if needed)?
-
-Closing & Next Steps
-9. Asked for a commitment (next meeting/docs/proposal)?
-10. Confirmed clear next steps?
-
-Return a short plain text summary in bullet points.
-
-Rules:
-- Maximum of 4 bullets total.
-- Prioritise "Areas to improve" if more important.
-- Each bullet ≤10 words.
-- Use this exact format (plain text, no JSON, no arrays):
+`Return plain text only:
 
 What went well:
-- [bullet(s)]
+- …
 
 Areas to improve:
-- [bullet(s)]
+- …
+
+(Max 4 bullets total, each ≤10 words.)
 
 Transcript:
 ${enforceSSAS(transcript)}
@@ -499,11 +478,11 @@ async function analyseCall(typeLabel, transcript) {
 Transcript:
 ${transcript}
 
-Return JSON with these keys where applicable:
+Return JSON keys where applicable:
 {
   "likelihood_score": <1..10>,
-  "score_reasoning": ["...","...","..."],
-  "increase_sale_suggestions": ["...","...","..."],
+  "score_reasoning": ["..."],
+  "increase_sale_suggestions": ["..."],
   "product_interest": ["SSAS","FIC","Both"],
   "application_data_points": ["..."],
   "missing_information": ["..."],
@@ -517,79 +496,40 @@ Return JSON with these keys where applicable:
 `;
 
   const qualAsk = `
-If Call Type is "Qualification call", you MUST include:
+If "Qualification call", include:
 {
-  "qual_metrics": {
-    "q1_need_clearly_stated": 0|0.5|1,
-    "q2_budget_discussed": 0|0.5|1,
-    "q3_decision_maker_present": 0|0.5|1,
-    "q4_authority_confirmed": 0|0.5|1,
-    "q5_timeline_identified": 0|0.5|1,
-    "q6_pain_depth_understood": 0|0.5|1,
-    "q7_current_solution_understood": 0|0.5|1,
-    "q8_competition_identified": 0|0.5|1,
-    "q9_next_step_clearly_agreed": 0|0.5|1,
-    "q10_fit_assessed": 0|0.5|1
-  },
-  "qual_score_final": <integer 1..10>
+  "qual_metrics": { "q1_need_clearly_stated":0|0.5|1, "q2_budget_discussed":0|0.5|1, "q3_decision_maker_present":0|0.5|1, "q4_authority_confirmed":0|0.5|1, "q5_timeline_identified":0|0.5|1, "q6_pain_depth_understood":0|0.5|1, "q7_current_solution_understood":0|0.5|1, "q8_competition_identified":0|0.5|1, "q9_next_step_clearly_agreed":0|0.5|1, "q10_fit_assessed":0|0.5|1 },
+  "qual_score_final": <int 1..10>
 }
 `;
 
   const consultAsk = `
-If Call Type is "Initial Consultation", you MUST include:
+If "Initial Consultation", include:
 {
   "consult_metrics": {
-    "c1_goal_alignment": 0|0.5|1,
-    "c2_current_state_captured": 0|0.5|1,
-    "c3_risk_tolerance_explored": 0|0.5|1,
-    "c4_tax_context_understood": 0|0.5|1,
-    "c5_pension_context_understood": 0|0.5|1,
-    "c6_cashflow_model_discussed": 0|0.5|1,
-    "c7_ssas_fic_fit_discussed": 0|0.5|1,
-    "c8_fees_explained": 0|0.5|1,
-    "c9_regulatory_disclosures_made": 0|0.5|1,
-    "c10_key_risks_explained": 0|0.5|1,
-    "c11_questions_addressed": 0|0.5|1,
-    "c12_next_steps_agreed": 0|0.5|1,
-    "c13_materials_promised": 0|0.5|1,
-    "c14_decision_criteria_logged": 0|0.5|1,
-    "c15_objections_summarised": 0|0.5|1,
-    "c16_stakeholders_identified": 0|0.5|1,
-    "c17_urgency_established": 0|0.5|1,
-    "c18_buyer_journey_stage": 0|0.5|1,
-    "c19_application_readiness": 0|0.5|1,
-    "c20_close_plan_started": 0|0.5|1
+    "c1_goal_alignment":0|0.5|1,"c2_current_state_captured":0|0.5|1,"c3_risk_tolerance_explored":0|0.5|1,"c4_tax_context_understood":0|0.5|1,"c5_pension_context_understood":0|0.5|1,"c6_cashflow_model_discussed":0|0.5|1,"c7_ssas_fic_fit_discussed":0|0.5|1,"c8_fees_explained":0|0.5|1,"c9_regulatory_disclosures_made":0|0.5|1,"c10_key_risks_explained":0|0.5|1,"c11_questions_addressed":0|0.5|1,"c12_next_steps_agreed":0|0.5|1,"c13_materials_promised":0|0.5|1,"c14_decision_criteria_logged":0|0.5|1,"c15_objections_summarised":0|0.5|1,"c16_stakeholders_identified":0|0.5|1,"c17_urgency_established":0|0.5|1,"c18_buyer_journey_stage":0|0.5|1,"c19_application_readiness":0|0.5|1,"c20_close_plan_started":0|0.5|1
   },
-  "consult_score_final": <integer 1..10>
+  "consult_score_final": <int 1..10>
 }
 `;
 
   const followupAsk = `
-If Call Type is "Follow up call", you MUST include:
+If "Follow up call", include:
 {
   "followup_metrics": {
-    "f1_recap_clear": 0|0.5|1,
-    "f2_objections_addressed": 0|0.5|1,
-    "f3_materials_reviewed": 0|0.5|1,
-    "f4_new_info_collected": 0|0.5|1,
-    "f5_decision_progressed": 0|0.5|1,
-    "f6_relationship_strengthened": 0|0.5|1,
-    "f7_next_steps_agreed": 0|0.5|1,
-    "f8_close_likelihood_discussed": 0|0.5|1,
-    "f9_timeframe_reconfirmed": 0|0.5|1,
-    "f10_overall_call_effectiveness": 0|0.5|1
+    "f1_recap_clear":0|0.5|1,"f2_objections_addressed":0|0.5|1,"f3_materials_reviewed":0|0.5|1,"f4_new_info_collected":0|0.5|1,"f5_decision_progressed":0|0.5|1,"f6_relationship_strengthened":0|0.5|1,"f7_next_steps_agreed":0|0.5|1,"f8_close_likelihood_discussed":0|0.5|1,"f9_timeframe_reconfirmed":0|0.5|1,"f10_overall_call_effectiveness":0|0.5|1
   },
-    "followup_score_final": <integer 1..10>
+  "followup_score_final": <int 1..10>
 }
 `;
 
   const existingAsk = `
-If Call Type is "Existing customer call", include:
+If "Existing customer call", include:
 {
   "customer_sentiment": "positive|neutral|negative",
   "complaint_detected": "yes|no|unclear",
   "escalation_required": "yes|no|monitor",
-  "escalation_notes": "<short text>"
+  "escalation_notes": "<short>"
 }
 `;
 
@@ -697,7 +637,7 @@ async function updateHubSpotCall(callId, properties) {
   if (r.status === 400 && text1.includes("PROPERTY_DOESNT_EXIST")) {
     const bad = Array.from(text1.matchAll(/"name":"([^"]+)"/g)).map(m => m[1]);
     if (bad.length) {
-      console.warn(`[retry] removing unknown properties and retrying once: ${bad.join(", ")}`);
+      console.warn(`[retry] removing unknown Call properties and retrying once: ${bad.join(", ")}`);
       for (const b of bad) delete properties[b];
       const r2 = await patch(properties);
       if (r2.ok) return;
@@ -707,11 +647,11 @@ async function updateHubSpotCall(callId, properties) {
         console.warn(`[skip] still unknown after prune; continuing. Response: ${text2}`);
         return;
       }
-      throw new Error(`HubSpot update failed after retry: ${r2.status} ${text2}`);
+      throw new Error(`HubSpot Call update failed after retry: ${r2.status} ${text2}`);
     }
   }
 
-  throw new Error(`HubSpot update failed: ${r.status} ${text1}`);
+  throw new Error(`HubSpot Call update failed: ${r.status} ${text1}`);
 }
 
 // Association helpers — Scorecard→Call only
@@ -750,42 +690,70 @@ async function findAssocType(from, to) {
   return null; // not found
 }
 
-// Create Scorecard -> associate to CALL only
 async function createSalesScorecardCallFirst(fields, { callId, effectiveType, callTimestampMs } = {}) {
+  // Build initial property set
   const activityName = `${callId} — ${effectiveType} — ${ymd(callTimestampMs || Date.now())}`;
-
-  const props = {
+  const propsInit = {
     [SCORECARD_TYPE_KEY]: effectiveType,
     [SCORECARD_NAME_KEY]: activityName,
     ...fields,
   };
 
-  const body = { properties: props };
-
-  // Association to CALL only
-  const assocBlocks = [];
+  // Build associations (optional)
+  const bodyInit = { properties: { ...propsInit } };
   if (callId) {
     const t = await findAssocType(SCORECARD_TYPE, "calls");
     if (t) {
-      assocBlocks.push({
+      bodyInit.associations = [{
         to: { id: String(callId) },
         types: [{ associationCategory: t.category, associationTypeId: t.typeId }],
-      });
+      }];
     } else {
       console.warn(`[assoc] no scorecard→call association type; creating scorecard without call link`);
     }
   }
-  if (assocBlocks.length) body.associations = assocBlocks;
 
-  const r = await fetch(`https://api.hubapi.com/crm/v3/objects/${encodeURIComponent(SCORECARD_TYPE)}`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}`, "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!r.ok) throw new Error(`scorecard create failed: ${r.status} ${await r.text()}`);
-  const j = await r.json();
-  console.log(`[assoc] scorecard ${j?.id} associated to call ${callId} (if type available)`);
-  return j?.id;
+  // Helper to POST with given props
+  async function postScorecard(propsObj) {
+    const r = await fetch(`https://api.hubapi.com/crm/v3/objects/${encodeURIComponent(SCORECARD_TYPE)}`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ ...bodyInit, properties: propsObj }),
+    });
+    return r;
+  }
+
+  // First attempt
+  let r = await postScorecard(bodyInit.properties);
+  if (r.ok) {
+    const j = await r.json();
+    console.log(`[assoc] scorecard ${j?.id} associated to call ${callId} (if type available)`);
+    return j?.id;
+  }
+
+  // If property doesn't exist, prune and retry once
+  const text1 = await r.text();
+  if (r.status === 400 && text1.includes("PROPERTY_DOESNT_EXIST")) {
+    const bad = Array.from(text1.matchAll(/"name":"([^"]+)"/g)).map(m => m[1]);
+    if (bad.length) {
+      const pruned = { ...bodyInit.properties };
+      for (const b of bad) {
+        delete pruned[b];
+      }
+      console.warn(`[scorecard] pruning unknown properties and retrying once: ${bad.join(", ")}`);
+      const r2 = await postScorecard(pruned);
+      if (r2.ok) {
+        const j2 = await r2.json();
+        console.log(`[scorecard] created ${j2?.id} after pruning unknown properties`);
+        return j2?.id;
+      }
+      const text2 = await r2.text();
+      console.warn(`[scorecard] still failed after prune (${r2.status}): ${text2}`);
+      throw new Error(`scorecard create failed after prune: ${r2.status} ${text2}`);
+    }
+  }
+
+  throw new Error(`scorecard create failed: ${r.status} ${text1}`);
 }
 
 // -------------------------------------------------------------
@@ -832,12 +800,12 @@ app.post("/process-call", async (req, res) => {
         // 4) Sales coaching (to be saved on Scorecard)
         const coachStart = Date.now();
         const [salesPerfScore, salesPerfSummary] = await Promise.all([
-          scoreSalesPerformance(transcript),          // NUMBER 1..10
-          summariseSalesPerformance(transcript),      // string
+          scoreSalesPerformance(transcript),
+          summariseSalesPerformance(transcript),
         ]);
         console.log(`[timing] coaching total ${Math.round((Date.now()-coachStart)/1000)}s`);
 
-        // 5) Call-level updates (common + type-specific)
+        // 5) Call-level updates
         const objections = analysis.objections || {};
         const callUpdates = {
           ai_objections_bullets: (objections.bullets || []).join(" • "),
@@ -867,14 +835,14 @@ app.post("/process-call", async (req, res) => {
 
         await updateHubSpotCall(callId, callUpdates);
 
-        // 6) Scorecards — only for the three call types (or if metrics present)
+        // 6) Scorecards — create for Qual/IC/Follow-up (or metrics present)
         const createQual    = (effectiveType === "Qualification call")    || (SCORECARD_BY_METRICS && analysis.qual_metrics);
         const createConsult = (effectiveType === "Initial Consultation")  || (SCORECARD_BY_METRICS && analysis.consult_metrics);
         const createFollow  = (effectiveType === "Follow up call")        || (SCORECARD_BY_METRICS && analysis.followup_metrics);
 
         const commonScorecardCoaching = {
-          [SCORECARD_RATING_KEY]: salesPerfScore,                 // NUMBER 1..10
-          [SCORECARD_SUMMARY_KEY]: salesPerfSummary,              // multiline text
+          [SCORECARD_RATING_KEY]: salesPerfScore,
+          [SCORECARD_SUMMARY_KEY]: salesPerfSummary,
         };
 
         if (createQual && analysis.qual_metrics) {
