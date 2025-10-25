@@ -1,7 +1,8 @@
 // =============================================================
-// TLPI – AI Call Worker  (v2.2)
-// - Fix 413 by compressing audio and chunking if needed
-// - Keeps call-type grace + inference, analysis skeleton, HS updates
+// TLPI – AI Call Worker  (v2.3)
+// - Testing mode: grace wait disabled (configurable via GRACE_MS)
+// - Normalise ai_objection_severity to [Low, Medium, High]
+// - Keeps: compression/chunking, type inference, analysis stub, HS updates
 // =============================================================
 
 import express from "express";
@@ -9,7 +10,6 @@ import fetch from "node-fetch";
 import fs from "fs";
 import path from "path";
 import os from "os";
-import { spawn } from "child_process";
 import FormData from "form-data";
 import ffmpegInstaller from "@ffmpeg-installer/ffmpeg";
 import ffmpeg from "fluent-ffmpeg";
@@ -18,9 +18,11 @@ import ffmpeg from "fluent-ffmpeg";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const HUBSPOT_TOKEN = process.env.HUBSPOT_TOKEN;
 const ZOOM_BEARER_TOKEN = process.env.ZOOM_BEARER_TOKEN || process.env.ZOOM_ACCESS_TOKEN; // optional
+// Testing: no grace by default; set GRACE_MS=120000 later to re-enable the 2-min wait
+const GRACE_MS = Number(process.env.GRACE_MS ?? 0);
 
 // ---- Constants ----
-const MAX_WHISPER_BYTES = 25 * 1024 * 1024; // 25 MB hard limit
+const MAX_WHISPER_BYTES = 25 * 1024 * 1024; // 25 MB limit
 const TMP_DIR = os.tmpdir();
 
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
@@ -73,7 +75,7 @@ async function downloadRecording(recordingUrl, callId) {
 }
 
 function transcodeToSpeechMp3(inPath, outPath) {
-  // Mono, 16kHz, ~24 kbps CBR MP3 (good enough for speech; tiny)
+  // Mono, 16 kHz, ~24 kbps MP3
   return new Promise((resolve, reject) => {
     ffmpeg(inPath)
       .audioCodec("libmp3lame")
@@ -88,21 +90,13 @@ function transcodeToSpeechMp3(inPath, outPath) {
   });
 }
 
-function segmentAudio(inPath, outPattern, seconds = 600 /* 10 min */) {
-  // Split by duration to keep each part small
+function segmentAudio(inPath, outPattern, seconds = 600) {
   return new Promise((resolve, reject) => {
-    const outFiles = [];
     ffmpeg(inPath)
-      .outputOptions([
-        "-f", "segment",
-        "-segment_time", String(seconds),
-        "-reset_timestamps", "1",
-      ])
+      .outputOptions(["-f", "segment", "-segment_time", String(seconds), "-reset_timestamps", "1"])
       .output(outPattern)
-      .on("start", (cmd) => console.log("[ffmpeg] segment cmd:", cmd))
       .on("error", reject)
       .on("end", () => {
-        // Enumerate produced files
         const dir = path.dirname(outPattern);
         const base = path.basename(outPattern).replace("%03d", "");
         const all = fs.readdirSync(dir)
@@ -116,32 +110,15 @@ function segmentAudio(inPath, outPattern, seconds = 600 /* 10 min */) {
 }
 
 async function ensureWhisperFriendlyAudio(srcPath, callId) {
-  // 1) If already under limit and readable by Whisper (we’ll force mp3 anyway)
-  const initialOut = tmpPath(`${callId}.mp3`);
-  await transcodeToSpeechMp3(srcPath, initialOut);
-  let size = fileSizeBytes(initialOut);
-  if (size <= MAX_WHISPER_BYTES) {
-    return { mode: "single", files: [initialOut] };
-  }
+  const firstMp3 = tmpPath(`${callId}.mp3`);
+  await transcodeToSpeechMp3(srcPath, firstMp3);
+  let size = fileSizeBytes(firstMp3);
+  if (size <= MAX_WHISPER_BYTES) return { mode: "single", files: [firstMp3] };
 
-  console.log(`[prep] compressed file still too large (${(size/1024/1024).toFixed(1)} MB). Segmenting...`);
-
-  // 2) Segment into 10-minute chunks after compression
+  console.log(`[prep] compressed file too large (${(size / 1048576).toFixed(1)} MB). Segmenting…`);
   const pattern = tmpPath(`${callId}_part_%03d.mp3`);
-  const parts = await segmentAudio(initialOut, pattern, 600);
-  // Optional: if any part > limit (very rare with our settings), re-compress tighter
-  const safeParts = [];
-  for (const p of parts) {
-    const s = fileSizeBytes(p);
-    if (s > MAX_WHISPER_BYTES) {
-      const tighter = tmpPath(`${path.basename(p, ".mp3")}_tight.mp3`);
-      await transcodeToSpeechMp3(p, tighter); // same settings; if it remains too big, duration is the cause
-      safeParts.push(tighter);
-    } else {
-      safeParts.push(p);
-    }
-  }
-  return { mode: "multi", files: safeParts };
+  const parts = await segmentAudio(firstMp3, pattern, 600);
+  return { mode: "multi", files: parts };
 }
 
 // -------------------------------------------------------------
@@ -156,10 +133,7 @@ async function transcribeFileWithOpenAI(filePath) {
     headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
     body: form,
   });
-  if (!r.ok) {
-    const t = await r.text();
-    throw new Error(`OpenAI transcription failed: ${r.status} ${t}`);
-  }
+  if (!r.ok) throw new Error(`OpenAI transcription failed: ${r.status} ${await r.text()}`);
   const j = await r.json();
   return j.text || "";
 }
@@ -174,17 +148,16 @@ async function transcribeAudioSmart(srcPath, callId) {
   }
 
   console.log(`[bg] Transcribing ${prep.files.length} chunks…`);
-  let all = [];
+  const pieces = [];
   for (let i = 0; i < prep.files.length; i++) {
     console.log(`[bg] Chunk ${i + 1}/${prep.files.length}`);
-    const text = await transcribeFileWithOpenAI(prep.files[i]);
-    all.push(text);
+    pieces.push(await transcribeFileWithOpenAI(prep.files[i]));
   }
-  return all.join("\n");
+  return pieces.join("\n");
 }
 
 // -------------------------------------------------------------
-// Call type inference with grace
+// Call type inference with (configurable) grace
 // -------------------------------------------------------------
 const CALL_TYPE_LABELS = [
   "Qualification call",
@@ -233,23 +206,26 @@ async function classifyCallTypeFromTranscript(transcript) {
   }
 }
 
-async function resolveCallTypeWithGrace(callId, transcript, graceMs = 120000) {
+async function resolveCallTypeWithGrace(callId, transcript, graceMs = GRACE_MS) {
   const first = await fetchCallProps(callId, ["hs_activity_type"]);
   if (first?.hs_activity_type) {
     console.log(`[type] using hs_activity_type immediately: ${first.hs_activity_type}`);
     return first.hs_activity_type;
   }
 
-  console.log(`[type] hs_activity_type blank — waiting ${graceMs / 1000}s`);
-  await sleep(graceMs);
-
-  const second = await fetchCallProps(callId, ["hs_activity_type"]);
-  if (second?.hs_activity_type) {
-    console.log(`[type] rep filled hs_activity_type during grace: ${second.hs_activity_type}`);
-    return second.hs_activity_type;
+  if (graceMs > 0) {
+    console.log(`[type] hs_activity_type blank — waiting ${graceMs / 1000}s`);
+    await sleep(graceMs);
+    const second = await fetchCallProps(callId, ["hs_activity_type"]);
+    if (second?.hs_activity_type) {
+      console.log(`[type] rep filled hs_activity_type during grace: ${second.hs_activity_type}`);
+      return second.hs_activity_type;
+    }
+  } else {
+    console.log("[type] grace wait disabled for testing");
   }
 
-  console.log("[type] inferring type from transcript...");
+  console.log("[type] inferring type from transcript…");
   const { typeLabel, confidence } = await classifyCallTypeFromTranscript(transcript);
   console.log(`[type] inferred=${typeLabel} confidence=${confidence}`);
 
@@ -332,6 +308,15 @@ async function analyseCall(typeLabel, transcript) {
 // -------------------------------------------------------------
 // HubSpot updates
 // -------------------------------------------------------------
+function normaliseSeverity(v) {
+  if (!v) return "";
+  const s = String(v).trim().toLowerCase();
+  if (s === "low") return "Low";
+  if (s === "medium") return "Medium";
+  if (s === "high") return "High";
+  return ""; // avoid INVALID_OPTION
+}
+
 async function updateHubSpotCall(callId, properties) {
   const url = `https://api.hubapi.com/crm/v3/objects/calls/${encodeURIComponent(callId)}`;
   const r = await fetch(url, {
@@ -368,7 +353,7 @@ app.post("/process-call", async (req, res) => {
         const srcPath = await downloadRecording(recordingUrl, callId);
         const transcript = await transcribeAudioSmart(srcPath, callId);
 
-        const effectiveType = await resolveCallTypeWithGrace(callId, transcript, 120000);
+        const effectiveType = await resolveCallTypeWithGrace(callId, transcript, GRACE_MS);
         console.log("[type] effectiveType:", effectiveType);
 
         const analysis = await analyseCall(effectiveType, transcript);
@@ -378,10 +363,10 @@ app.post("/process-call", async (req, res) => {
         const updates = {
           ai_objections_bullets: (objections.bullets || []).join(" • "),
           ai_primary_objection: objections.primary || "",
-          ai_objection_severity: objections.severity || "",
+          ai_objection_severity: normaliseSeverity(objections.severity),
         };
 
-        // Initial Consultation extras (support capturing application info present in that meeting)
+        // Initial Consultation extras (also capture app info if present in this meeting)
         if (effectiveType === "Initial Consultation") {
           if (Array.isArray(analysis.product_interest) && analysis.product_interest.length) {
             const v = analysis.product_interest.includes("Both") ? "Both" : analysis.product_interest[0];
