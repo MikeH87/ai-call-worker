@@ -3,7 +3,8 @@
 
 import express from "express";
 import { downloadRecording, ensureAudio } from "./ai/transcribe.js";
-import { aiAnalyse, getCombinedPrompt } from "./ai/analyse.js";
+import { analyseTranscript, transcribeFile } from "./ai/analyse.js";
+import { getCombinedPrompt } from "./ai/getCombinedPrompt.js";
 import { transcribeAudioParallel } from "./ai/parallelTranscribe.js";
 import { updateHubSpotObject, getHubSpotObject, getAssociations } from "./hubspot/hubspot.js";
 import { createScorecard } from "./hubspot/scorecard.js";
