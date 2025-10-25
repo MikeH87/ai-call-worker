@@ -1,13 +1,13 @@
 // =============================================================
-// TLPI – AI Call Worker (v3.3)
-// - Always create Sales Scorecards; associate to CALL only
-//   (Contact/Deal associations are skipped entirely so they cannot
-//    block creation; we log that we skipped them).
-// - IC fields: ai_data_points_captured / ai_missing_information
-// - Scorecards for Qualification / Initial Consultation / Follow up
-// - Strong call-type rules (Zoom vs phone; data capture vs DocuSign)
-// - Robust HubSpot updater (prunes unknown props; retry; continue)
-// - Whisper compression/chunking; grace for hs_activity_type
+// TLPI – AI Call Worker (v3.5)
+// - Scorecards: always create; associate to CALL only
+// - Fix: include required Sales Scorecard fields (activity_type + hs_name*)
+//   * hs_name is attempted; if schema doesn't have it, we retry without it
+// - Sales coaching now written to the Scorecard (not the Call):
+//     chat_gpt___sales_performance (1..10), sales_performance_summary
+// - IC fields: ai_data_points_captured / ai_missing_information (on Call)
+// - Call-type rules (Zoom vs phone; data capture vs DocuSign) + grace
+// - Robust updates; Whisper compression/chunking
 // =============================================================
 
 import express from "express";
@@ -26,12 +26,12 @@ const ZOOM_BEARER_TOKEN = process.env.ZOOM_BEARER_TOKEN || process.env.ZOOM_ACCE
 const GRACE_MS = Number(process.env.GRACE_MS ?? 0); // 0 during testing
 const SCORECARD_BY_METRICS = String(process.env.SCORECARD_BY_METRICS ?? "true").toLowerCase() === "true";
 
-// IC field keys in your portal
+// IC field keys in your portal (CALL properties)
 const IC_DATA_POINTS_KEY = "ai_data_points_captured";
 const IC_MISSING_INFO_KEY = "ai_missing_information";
 
 // ---- Constants ----
-const MAX_WHISPER_BYTES = 25 * 1024 * 1024; // Whisper limit
+const MAX_WHISPER_BYTES = 25 * 1024 * 1024;
 const TMP_DIR = os.tmpdir();
 
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
@@ -45,6 +45,7 @@ app.use(express.json({ limit: "50mb" }));
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const fileSizeBytes = (p) => { try { return fs.statSync(p).size; } catch { return 0; } };
 const tmpPath = (name) => path.join(TMP_DIR, name);
+const isZoomUrl = (u) => /\.zoom\.us\//i.test(String(u || ""));
 
 async function fetchWithRetry(url, opts = {}, retries = 3) {
   let last = null;
@@ -66,7 +67,12 @@ function authHeadersFor(url) {
   return headers;
 }
 
-const isZoomUrl = (u) => /\.zoom\.us\//i.test(String(u || ""));
+function ymd(date) {
+  const d = new Date(date);
+  if (Number.isNaN(d.getTime())) return "";
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
 
 // -------------------------------------------------------------
 // Download & Prepare Audio (compress + chunk if needed)
@@ -281,7 +287,7 @@ async function resolveCallTypeWithGrace(callId, transcript, recordingUrl, graceM
     console.log(`[type] overriding to heuristic due to low confidence: ${finalLabel}`);
   }
 
-  // Write AI fields
+  // Write AI fields on Call (inferred type)
   await fetch(`https://api.hubapi.com/crm/v3/objects/calls/${encodeURIComponent(callId)}`, {
     method: "PATCH",
     headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}`, "Content-Type": "application/json" },
@@ -303,6 +309,117 @@ async function resolveCallTypeWithGrace(callId, transcript, recordingUrl, graceM
   }
 
   return finalLabel;
+}
+
+// -------------------------------------------------------------
+// Sales performance coaching (to be saved on Scorecard)
+// -------------------------------------------------------------
+function enforceSSAS(text) {
+  if (typeof text !== "string") return "";
+  return text.replace(/\bsaas\b/gi, "SSAS");
+}
+
+// 1) Deterministic rubric -> integer 1..10
+async function scoreSalesPerformance(transcript) {
+  const system = "You are TLPI’s transcript analysis bot. Follow rubrics exactly. Output ONLY the requested format.";
+  const prompt =
+`EVALUATE THE CONSULTANT USING THIS DETERMINISTIC RUBRIC:
+
+For each of the 10 criteria below, assign:
+- 1 = clearly met (explicit evidence in transcript)
+- 0.5 = partially met (some evidence but incomplete)
+- 0 = not met / absent / ambiguous
+
+Criteria (same order):
+1) Clear, professional intro
+2) Early rapport/trust attempt
+3) At least one open-ended question for needs
+4) Pain/opportunity relevant to corp/business tax/IHT/funding identified
+5) Services explained clearly, simply
+6) Benefits connected to client’s specific needs
+7) Active listening & acknowledgment of concerns
+8) Clear, confident responses (or committed follow-up)
+9) Asked for a commitment (next meeting/docs/proposal)
+10) Confirmed clear next steps
+
+SCORE = sum of the 10 items (0..10 in 0.5 increments), then round to nearest integer (0.5 rounds up). If final <1, output 1.
+
+Output ONLY the integer 1..10 (no words).
+
+Transcript:
+${enforceSSAS(transcript)}
+`;
+  const r = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o-mini",
+      temperature: 0.1,
+      messages: [{ role: "system", content: system }, { role: "user", content: prompt }],
+    }),
+  });
+  const j = await r.json();
+  const text = (j?.choices?.[0]?.message?.content || "").trim();
+  const m = text.match(/\b(10|[1-9])\b/);
+  const score = m ? Math.max(1, Math.min(10, parseInt(m[1], 10))) : 5;
+  return String(score);
+}
+
+// 2) Short bullet summary (What went well / Areas to improve)
+async function summariseSalesPerformance(transcript) {
+  const system = 'You are TLPI’s transcript analysis bot. Always spell "SSAS" (Small Self-Administered Scheme).';
+  const prompt =
+`You are evaluating a sales call transcript against this scorecard:
+
+Opening & Rapport
+1. Clear, professional intro?
+2. Early rapport/trust attempt?
+
+Discovery & Qualification
+3. Open-ended question to understand needs?
+4. Identified pain/opportunity re: corp/business tax/inheritance tax or loaning money to prospect’s business?
+
+Value Positioning
+5. Explained firm’s services clearly and simply?
+6. Connected benefits to client’s specific needs?
+
+Handling Concerns
+7. Active listening and acknowledged concerns/questions?
+8. Clear, confident responses (follow-up if needed)?
+
+Closing & Next Steps
+9. Asked for a commitment (next meeting/docs/proposal)?
+10. Confirmed clear next steps?
+
+Return a short plain text summary in bullet points.
+
+Rules:
+- Maximum of 4 bullets total.
+- Prioritise "Areas to improve" if more important.
+- Each bullet ≤10 words.
+- Use this exact format (plain text, no JSON, no arrays):
+
+What went well:
+- [bullet(s)]
+
+Areas to improve:
+- [bullet(s)]
+
+Transcript:
+${enforceSSAS(transcript)}
+`;
+  const r = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o-mini",
+      temperature: 0.2,
+      messages: [{ role: "system", content: system }, { role: "user", content: prompt }],
+    }),
+  });
+  const j = await r.json();
+  const raw = (j?.choices?.[0]?.message?.content || "").trim();
+  return raw.replace(/^[\s"']+|[\s"']+$/g, "");
 }
 
 // -------------------------------------------------------------
@@ -429,7 +546,6 @@ If Call Type is "Existing customer call", include:
   catch { return {}; }
 }
 
-// Ensure metrics exist for IC/Follow-up (second pass if needed)
 async function ensureMetricsIfNeeded(typeLabel, transcript, analysis) {
   if (typeLabel !== "Initial Consultation" && typeLabel !== "Follow up call") return analysis;
   const missingIC = typeLabel === "Initial Consultation" && !analysis.consult_metrics;
@@ -496,7 +612,6 @@ const normaliseEscalation = (v) => {
 // -------------------------------------------------------------
 // HubSpot helpers
 // -------------------------------------------------------------
-// Safe updater: prune unknown props; retry once; if still unknowns, log and continue
 async function updateHubSpotCall(callId, properties) {
   const url = `https://api.hubapi.com/crm/v3/objects/calls/${encodeURIComponent(callId)}`;
 
@@ -533,7 +648,7 @@ async function updateHubSpotCall(callId, properties) {
   throw new Error(`HubSpot update failed: ${r.status} ${text1}`);
 }
 
-// Association helpers — fetch typeId + category for Scorecard→Call
+// Association helpers — Scorecard→Call only
 const assocCache = new Map(); // key: `${from}::${to}` -> { typeId, category }
 
 async function findAssocType(from, to) {
@@ -571,11 +686,23 @@ async function findAssocType(from, to) {
 
 const SCORECARD_TYPE = "p49487487_sales_scorecards";
 
-// Create a scorecard associated ONLY to the Call (never fail because of contact/deal)
-async function createSalesScorecardCallFirst(fields, { callId } = {}) {
-  const body = { properties: fields };
-  const assocBlocks = [];
+// Robust create: always attempt to include hs_name; if schema rejects unknown property,
+// retry without it. Never fail due to Contact/Deal associations (we don't add them here).
+async function createSalesScorecardCallFirst(fields, { callId, effectiveType, callTimestampMs } = {}) {
+  const baseName = `${callId} — ${effectiveType} — ${ymd(callTimestampMs || Date.now())}`;
 
+  // Required properties we know about:
+  // - activity_type (per your schema)
+  const props = {
+    activity_type: effectiveType,
+    ...fields,
+  };
+
+  // Try with hs_name first (friendly display)
+  let body = { properties: { ...props, hs_name: baseName } };
+
+  // Association to CALL only (if type available)
+  const assocBlocks = [];
   if (callId) {
     const t = await findAssocType(SCORECARD_TYPE, "calls");
     if (t) {
@@ -587,21 +714,41 @@ async function createSalesScorecardCallFirst(fields, { callId } = {}) {
       console.warn(`[assoc] no scorecard→call association type; creating scorecard without call link`);
     }
   }
-
   if (assocBlocks.length) body.associations = assocBlocks;
 
-  const r = await fetch(`https://api.hubapi.com/crm/v3/objects/${encodeURIComponent(SCORECARD_TYPE)}`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}`, "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!r.ok) throw new Error(`scorecard create failed: ${r.status} ${await r.text()}`);
-  const j = await r.json();
+  // Inner helper
+  async function tryCreate(withBody) {
+    const r = await fetch(`https://api.hubapi.com/crm/v3/objects/${encodeURIComponent(SCORECARD_TYPE)}`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}`, "Content-Type": "application/json" },
+      body: JSON.stringify(withBody),
+    });
+    return r;
+  }
 
-  // Intentionally skip Contact/Deal attachments here so they can NEVER block creation.
-  console.log(`[assoc] skipped optional Contact/Deal associations by design`);
+  // Attempt 1: with hs_name
+  let r = await tryCreate(body);
+  if (r.ok) {
+    const j = await r.json();
+    console.log(`[assoc] skipped optional Contact/Deal associations by design`);
+    return j?.id;
+  }
 
-  return j?.id;
+  const text1 = await r.text();
+  // If schema complains about an unknown/invalid property (e.g., hs_name not present), retry without it.
+  if (r.status === 400 && /PROPERTY_DOESNT_EXIST|invalid.*property/i.test(text1) && text1.includes("hs_name")) {
+    console.warn(`[scorecard] retrying without hs_name (schema may not include it)`);
+    delete body.properties.hs_name;
+    r = await tryCreate(body);
+    if (r.ok) {
+      const j = await r.json();
+      console.log(`[assoc] skipped optional Contact/Deal associations by design`);
+      return j?.id;
+    }
+  }
+
+  // If we get specific "Some required properties were not set" pointing to activity_type etc., surface it clearly.
+  throw new Error(`scorecard create failed: ${r.status} ${text1}`);
 }
 
 // -------------------------------------------------------------
@@ -613,6 +760,7 @@ app.post("/process-call", async (req, res) => {
     const props = body.properties || {};
     const callId = props.hs_object_id?.value || props.hs_object_id || body.objectId;
     const recordingUrl = props.hs_call_recording_url?.value || props.hs_call_recording_url;
+    const callTimestampMs = Number(props.hs_timestamp?.value || props.hs_timestamp || Date.now());
 
     if (!callId || !recordingUrl) return res.status(400).send("Missing recordingUrl or callId");
     console.log("resolved recordingUrl:", recordingUrl);
@@ -634,47 +782,59 @@ app.post("/process-call", async (req, res) => {
         let analysis = await analyseCall(effectiveType, transcript);
         analysis = await ensureMetricsIfNeeded(effectiveType, transcript, analysis);
 
-        // 4) Call-level updates (common + type-specific)
+        // 4) Sales coaching (to be saved on Scorecard)
+        const [salesPerfScore, salesPerfSummary] = await Promise.all([
+          scoreSalesPerformance(transcript),
+          summariseSalesPerformance(transcript),
+        ]);
+
+        // 5) Call-level updates (common + type-specific)
         const objections = analysis.objections || {};
-        const updates = {
+        const callUpdates = {
           ai_objections_bullets: (objections.bullets || []).join(" • "),
           ai_primary_objection: objections.primary || "",
           ai_objection_severity: normaliseSeverity(objections.severity),
         };
 
-        // Existing customer call → your portal field names
+        // Existing customer call → your portal field names (CALL)
         if (effectiveType === "Existing customer call") {
-          updates.ai_customer_sentiment  = normaliseSentiment(analysis.customer_sentiment);
-          updates.ai_complaint_detected  = normaliseYesNoUnclear(analysis.complaint_detected);
-          updates.ai_escalation_required = normaliseEscalation(analysis.escalation_required);
-          updates.ai_escalation_notes    = analysis.escalation_notes || "";
+          callUpdates.ai_customer_sentiment  = normaliseSentiment(analysis.customer_sentiment);
+          callUpdates.ai_complaint_detected  = normaliseYesNoUnclear(analysis.complaint_detected);
+          callUpdates.ai_escalation_required = normaliseEscalation(analysis.escalation_required);
+          callUpdates.ai_escalation_notes    = analysis.escalation_notes || "";
         }
 
-        // Initial Consultation → capture data points & missing info using your keys
+        // Initial Consultation → capture data points & missing info using your CALL keys
         if (effectiveType === "Initial Consultation") {
           if (Array.isArray(analysis.product_interest) && analysis.product_interest.length) {
             const v = analysis.product_interest.includes("Both") ? "Both" : analysis.product_interest[0];
-            updates.ai_product_interest = v || "";
+            callUpdates.ai_product_interest = v || "";
           }
           if (Array.isArray(analysis.application_data_points) && analysis.application_data_points.length) {
-            updates[IC_DATA_POINTS_KEY] = analysis.application_data_points.join(" • ");
+            callUpdates[IC_DATA_POINTS_KEY] = analysis.application_data_points.join(" • ");
           }
           if (Array.isArray(analysis.missing_information) && analysis.missing_information.length) {
-            updates[IC_MISSING_INFO_KEY] = analysis.missing_information.join(" • ");
+            callUpdates[IC_MISSING_INFO_KEY] = analysis.missing_information.join(" • ");
           }
         }
 
-        await updateHubSpotCall(callId, updates);
+        await updateHubSpotCall(callId, callUpdates);
 
-        // 5) Scorecards — only for the three call types (metrics fallback if enabled)
+        // 6) Scorecards — only for the three call types (or if metrics present)
         const createQual    = (effectiveType === "Qualification call")    || (SCORECARD_BY_METRICS && analysis.qual_metrics);
         const createConsult = (effectiveType === "Initial Consultation")  || (SCORECARD_BY_METRICS && analysis.consult_metrics);
         const createFollow  = (effectiveType === "Follow up call")        || (SCORECARD_BY_METRICS && analysis.followup_metrics);
 
-        // Single scorecard per call — priority: Qualification > Consultation > Follow up
+        const commonScorecardCoaching = {
+          // write the sales coaching onto the scorecard:
+          chat_gpt___sales_performance: salesPerfScore,
+          sales_performance_summary: salesPerfSummary,
+        };
+
         if (createQual && analysis.qual_metrics) {
           const m = analysis.qual_metrics || {};
           const fields = {
+            ...commonScorecardCoaching,
             qual_metrics_q1_need_clearly_stated:              String(m.q1_need_clearly_stated ?? 0),
             qual_metrics_q2_budget_discussed:                  String(m.q2_budget_discussed ?? 0),
             qual_metrics_q3_decision_maker_present:            String(m.q3_decision_maker_present ?? 0),
@@ -688,7 +848,7 @@ app.post("/process-call", async (req, res) => {
             qual_score_final:                                  String(analysis.qual_score_final ?? 0)
           };
           try {
-            const id = await createSalesScorecardCallFirst(fields, { callId });
+            const id = await createSalesScorecardCallFirst(fields, { callId, effectiveType, callTimestampMs });
             console.log(`[scorecard] created ${id} for Qualification call (call ${callId})`);
           } catch (e) {
             console.error(`[scorecard] creation failed (Qualification) but continuing: ${e.message}`);
@@ -696,6 +856,7 @@ app.post("/process-call", async (req, res) => {
         } else if (createConsult && analysis.consult_metrics) {
           const c = analysis.consult_metrics || {};
           const fields = {
+            ...commonScorecardCoaching,
             consult_metrics_c1_goal_alignment:              String(c.c1_goal_alignment ?? 0),
             consult_metrics_c2_current_state_captured:      String(c.c2_current_state_captured ?? 0),
             consult_metrics_c3_risk_tolerance_explored:     String(c.c3_risk_tolerance_explored ?? 0),
@@ -719,7 +880,7 @@ app.post("/process-call", async (req, res) => {
             consult_score_final:                             String(analysis.consult_score_final ?? 0)
           };
           try {
-            const id = await createSalesScorecardCallFirst(fields, { callId });
+            const id = await createSalesScorecardCallFirst(fields, { callId, effectiveType, callTimestampMs });
             console.log(`[scorecard] created ${id} for Initial Consultation (call ${callId})`);
           } catch (e) {
             console.error(`[scorecard] creation failed (Initial Consultation) but continuing: ${e.message}`);
@@ -727,6 +888,7 @@ app.post("/process-call", async (req, res) => {
         } else if (createFollow && analysis.followup_metrics) {
           const f = analysis.followup_metrics || {};
           const fields = {
+            ...commonScorecardCoaching,
             followup_metrics_f1_recap_clear:                 String(f.f1_recap_clear ?? 0),
             followup_metrics_f2_objections_addressed:        String(f.f2_objections_addressed ?? 0),
             followup_metrics_f3_materials_reviewed:          String(f.f3_materials_reviewed ?? 0),
@@ -740,7 +902,7 @@ app.post("/process-call", async (req, res) => {
             followup_score_final:                             String(analysis.followup_score_final ?? 0)
           };
           try {
-            const id = await createSalesScorecardCallFirst(fields, { callId });
+            const id = await createSalesScorecardCallFirst(fields, { callId, effectiveType, callTimestampMs });
             console.log(`[scorecard] created ${id} for Follow up call (call ${callId})`);
           } catch (e) {
             console.error(`[scorecard] creation failed (Follow up) but continuing: ${e.message}`);
