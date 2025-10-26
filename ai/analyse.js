@@ -4,158 +4,269 @@ import fetch from "node-fetch";
 import { getCombinedPrompt } from "./getCombinedPrompt.js";
 
 dotenv.config();
-const OPENAI_KEY = process.env.OPENAI_API_KEY || process.env.OPENAI_APIKEY || process.env.OPENAI_TOKEN;
-const OPENAI_BASE = process.env.OPENAI_BASE_URL || "https://api.openai.com/v1";
 
-function oaiHeaders(){ return { "Authorization": `Bearer ${OPENAI_KEY}`, "Content-Type": "application/json" }; }
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || process.env.OPENAI_API_TOKEN;
+const OPENAI_BASE = process.env.OPENAI_BASE || "https://api.openai.com/v1";
+const MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini"; // small + cheap; change if you want
 
-// Transcribe already done elsewhere (parallelTranscribe). This file analyses a given transcript.
-export async function analyseTranscript(callTypeLabel, transcript) {
-  const callType = (callTypeLabel || "Initial Consultation").toString();
+function headers() {
+  return { "Authorization": `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" };
+}
 
-  // 1) Sales performance rating (1–10) using editable prompt file
-  const ratingPrompt = await readPromptFile("prompts/sales-performance-rating.md");
-  const perfRating = await callJSON("gpt-4o-mini", [
-    { role: "system", content: "Return ONLY an integer 1..10. No extra words." },
-    { role: "user", content: ratingPrompt + "\n\nTRANSCRIPT:\n" + transcript.slice(0, 20000) }
-  ], { response_format: { type: "json_schema", json_schema: { name:"rating", schema:{ type:"object", properties:{ score:{ type:"integer", minimum:1, maximum:10 } }, required:["score"], additionalProperties:false } } } }).then(r => r?.score).catch(() => null);
+/**
+ * Public API:
+ * analyseTranscript(callType, transcript) -> analysis object
+ *   Guaranteed keys (even if heuristics are used):
+ *   - call_type: "Initial Consultation"
+ *   - likelihood_to_close: 0..100
+ *   - outcome: Proceed now | Likely | Unclear | Not now | No fit
+ *   - objections: string[]
+ *   - next_actions: string[]
+ *   - materials_to_send: string[]
+ *   - key_details: { client_name?, company_name?, products_discussed?: string[], timeline?, dob?, ni?, nino?, address? }
+ *   - ai_decision_criteria?: string[]
+ *   - sales_performance_rating?: 1..10 (integer)
+ *   - sales_performance_summary?: string (bullets)
+ *   - consult_eval: { 20 named booleans or 0/1-ish numbers for the `consult_*` mapping }
+ */
+export async function analyseTranscript(callType, transcript) {
+  const cleanTranscript = String(transcript || "").trim();
 
-  // 2) Coaching summary text (editable prompt)
-  const summaryPrompt = await readPromptFile("prompts/sales-performance-summary.md");
-  const perfSummary = await callText("gpt-4o-mini", [
-    { role: "system", content: "Return plain text only." },
-    { role: "user", content: summaryPrompt + "\n\nTRANSCRIPT:\n" + transcript.slice(0, 20000) }
-  ]).catch(() => "");
+  // Hard guard for blank/muted calls
+  if (!hasMeaningfulContent(cleanTranscript)) {
+    return {
+      call_type: "Initial Consultation",
+      likelihood_to_close: 0,
+      outcome: "Unclear",
+      objections: [],
+      next_actions: [],
+      materials_to_send: [],
+      key_details: {},
+      ai_decision_criteria: [],
+      sales_performance_rating: 1,
+      sales_performance_summary: "What went well:\n- N/A\n\nAreas to improve:\n- Call contained no meaningful audio.",
+      consult_eval: {},
+      uncertainty_reason: "Transcript contains no meaningful content."
+    };
+  }
 
-  // 3) Structured consult metrics (10 rubric 0/0.5/1, 5 ops 0 or 10)
-  const metricsSchema = {
-    name: "consult_metrics",
-    schema: {
-      type:"object",
-      properties:{
-        // rubric 0/0.5/1
-        intro:{type:"number"}, rapport_open:{type:"number"}, open_question:{type:"number"},
-        needs_pain_uncovered:{type:"number"}, services_explained_clearly:{type:"number"},
-        benefits_linked_to_needs:{type:"number"}, active_listening:{type:"number"},
-        clear_responses_or_followup:{type:"number"}, commitment_requested:{type:"number"},
-        next_steps_confirmed:{type:"number"},
-        // ops 0 or 10
-        specific_tax_estimate_given:{type:"number"}, fees_tax_deductible_explained:{type:"number"},
-        next_step_specific_date_time:{type:"number"}, interactive_throughout:{type:"number"},
-        quantified_value_roi:{type:"number"},
-      },
-      required: [],
-      additionalProperties:false
-    }
+  const sysAndUser = await getCombinedPrompt(callType || "Initial Consultation", cleanTranscript);
+
+  // Strict JSON schema request to force the exact fields we need for IC
+  const icJsonSystem = `
+You are TLPI’s AI Call Analyst. Return a STRICT JSON object compliant with this schema (no prose outside JSON):
+
+{
+  "call_type": "Initial Consultation",
+  "likelihood_to_close": <integer 0-100>,
+  "outcome": "Proceed now"|"Likely"|"Unclear"|"Not now"|"No fit",
+  "objections": [<short strings>],
+  "next_actions": [<short actionable steps>],
+  "materials_to_send": [<documents/information promised>],
+  "key_details": {
+    "client_name": <string|null>,
+    "company_name": <string|null>,
+    "products_discussed": ["SSAS"|"FIC"|"Both"|<other>],
+    "timeline": <string|null>,
+    "dob": <string|null>,
+    "ni": <string|null>,
+    "nino": <string|null>,
+    "address": <string|null>
+  },
+  "ai_decision_criteria": [<short strings>],
+  "sales_performance_rating": <integer 1..10>,
+  "sales_performance_summary": <string>,
+  "consult_eval": {
+    "intro": 0|0.5|1,
+    "rapport_open": 0|0.5|1,
+    "open_question": 0|0.5|1,
+    "needs_pain_uncovered": 0|0.5|1,
+    "services_explained_clearly": 0|0.5|1,
+    "benefits_linked_to_needs": 0|0.5|1,
+    "active_listening": 0|0.5|1,
+    "clear_responses_or_followup": 0|0.5|1,
+    "commitment_requested": 0|0.5|1,
+    "next_steps_confirmed": 0|0.5|1,
+    "specific_tax_estimate_given": 0|0.5|1,
+    "fees_tax_deductible_explained": 0|0.5|1,
+    "next_step_specific_date_time": 0|0.5|1,
+    "interactive_throughout": 0|0.5|1,
+    "quantified_value_roi": 0|0.5|1
+  }
+}
+Important:
+- If the client agrees/buys/books/signs, set outcome="Proceed now" and likelihood_to_close close to 100.
+- If no objections, return [] for "objections".
+- "sales_performance_summary" must follow the bullet format already provided in TLPI prompt files.
+`;
+
+  const body = {
+    model: MODEL,
+    temperature: 0.2,
+    messages: [
+      { role: "system", content: icJsonSystem },
+      ...sysAndUser // company + call-type context from your md files, then transcript
+    ],
+    response_format: { type: "json_object" }
   };
 
-  const metricsPrompt =
-`Score the Initial Consultation using:
-- For the 10 rubric items: use 0, 0.5, or 1 ONLY (see rubric below).
-- For the 5 operational items: use 0 or 10 ONLY.
-
-Rubric (0/0.5/1 each):
-1) intro; 2) rapport_open; 3) open_question; 4) needs_pain_uncovered; 5) services_explained_clearly;
-6) benefits_linked_to_needs; 7) active_listening; 8) clear_responses_or_followup; 9) commitment_requested; 10) next_steps_confirmed.
-
-Operational (0 or 10 each):
-- specific_tax_estimate_given; fees_tax_deductible_explained; next_step_specific_date_time; interactive_throughout; quantified_value_roi.
-
-Be conservative: if unclear, score 0.`;
-
-  const consultMetrics = await callJSON("gpt-4o-mini", [
-    { role: "system", content: "Return only the JSON schema." },
-    { role: "user", content: metricsPrompt + "\n\nTRANSCRIPT:\n" + transcript.slice(0, 20000) }
-  ], { response_format: { type:"json_schema", json_schema: metricsSchema } }).catch(() => ({}));
-
-  // 4) TLPI combined analysis for other fields (existing)
-  const combinedPrompt = await getCombinedPrompt(callType, transcript);
-  const other = await callJSON("gpt-4o-mini", [
-    { role: "system", content: "You are TLPI’s AI Call Analyst. Return a concise JSON object only." },
-    { role: "user", content: combinedPrompt }
-  ], {
-    response_format: { type: "json_schema", json_schema: {
-      name:"analysis",
-      schema:{
-        type:"object",
-        properties:{
-          call_type:{type:"string"},
-          summary:{type:"array", items:{type:"string"}},
-          likelihood_to_close:{type:["number","null"]},
-          outcome:{type:"string"},
-          objections:{type:"array", items:{type:"string"}},
-          next_actions:{type:"array", items:{type:"string"}},
-          materials_to_send:{type:"array", items:{type:"string"}},
-          key_details:{type:"object", properties:{
-            client_name:{type:["string","null"]},
-            company_name:{type:["string","null"]},
-            products_discussed:{type:"array", items:{type:"string"}},
-            timeline:{type:["string","null"]}
-          }},
-          ai_missing_information:{type:["string","array","null"]},
-          ai_decision_criteria:{type:["string","array","null"]},
-          ai_customer_sentiment:{type:["string","null"]}
-        },
-        required:["call_type","summary","outcome","objections","next_actions","materials_to_send","key_details"]
-      }
-    } }
-  }).catch(() => ({}));
-
-  // Merge
-  const analysis = {
-    ...other,
-    sales_performance_rating: perfRating ?? null,
-    sales_performance_summary: perfSummary || null,
-    consult_eval: {
-      intro: n01(consultMetrics.intro),
-      rapport_open: n01(consultMetrics.rapport_open),
-      open_question: n01(consultMetrics.open_question),
-      needs_pain_uncovered: n01(consultMetrics.needs_pain_uncovered),
-      services_explained_clearly: n01(consultMetrics.services_explained_clearly),
-      benefits_linked_to_needs: n01(consultMetrics.benefits_linked_to_needs),
-      active_listening: n01(consultMetrics.active_listening),
-      clear_responses_or_followup: n01(consultMetrics.clear_responses_or_followup),
-      commitment_requested: n01(consultMetrics.commitment_requested),
-      next_steps_confirmed: n01(consultMetrics.next_steps_confirmed),
-      // ops (0 or 10 as provided)
-      specific_tax_estimate_given: z10(consultMetrics.specific_tax_estimate_given),
-      fees_tax_deductible_explained: z10(consultMetrics.fees_tax_deductible_explained),
-      next_step_specific_date_time: z10(consultMetrics.next_step_specific_date_time),
-      interactive_throughout: z10(consultMetrics.interactive_throughout),
-      quantified_value_roi: z10(consultMetrics.quantified_value_roi),
-    }
-  };
-
-  return analysis;
-}
-
-/* ================== helpers ================== */
-function n01(v){ const n = Number(v); if (!Number.isFinite(n)) return undefined; if (n===0||n===0.5||n===1) return n; return undefined; }
-function z10(v){ const n = Number(v); if (!Number.isFinite(n)) return undefined; if (n===0||n===10) return n; return undefined; }
-
-async function callText(model, messages){
-  const res = await fetch(`${OPENAI_BASE}/chat/completions`, {
-    method:"POST", headers:oaiHeaders(),
-    body: JSON.stringify({ model, messages, temperature:0 })
-  });
-  const js = await res.json();
-  const txt = js?.choices?.[0]?.message?.content || "";
-  return txt.trim();
-}
-
-async function callJSON(model, messages, extra={}){
-  const res = await fetch(`${OPENAI_BASE}/chat/completions`, {
-    method:"POST", headers:oaiHeaders(),
-    body: JSON.stringify({ model, messages, temperature:0, ...extra })
-  });
-  const js = await res.json();
-  try { return JSON.parse(js?.choices?.[0]?.message?.content || "{}"); }
-  catch { return null; }
-}
-
-async function readPromptFile(path){
+  let ai = null;
   try {
-    const fs = await import("node:fs/promises");
-    return await fs.readFile(path, "utf8");
-  } catch { return ""; }
+    const res = await fetch(`${OPENAI_BASE}/chat/completions`, { method: "POST", headers: headers(), body: JSON.stringify(body) });
+    const js = await res.json();
+    const content = js?.choices?.[0]?.message?.content;
+    ai = safeParseJSON(content);
+  } catch (e) {
+    console.warn("[ai] model request failed, falling back to heuristics:", e.message);
+  }
+
+  // Merge with fallbacks from transcript, so we never leave key areas blank
+  const merged = applyHeuristics(cleanTranscript, ai || {});
+
+  // Final outcome guard-rail: explicit proceed/bought mentions => Proceed now + 100
+  if (detectProceedNow(cleanTranscript)) {
+    merged.outcome = "Proceed now";
+    merged.likelihood_to_close = Math.max(merged.likelihood_to_close || 0, 100);
+    merged.sales_performance_rating = Math.max(merged.sales_performance_rating || 1, 8); // sensible floor if closed now
+  }
+
+  return merged;
+}
+
+/* ============================== heuristics ============================== */
+
+function hasMeaningfulContent(t) {
+  if (!t) return false;
+  const words = t.replace(/\s+/g, " ").trim().split(" ");
+  return words.length > 8; // tiny threshold
+}
+
+function safeParseJSON(s) {
+  try { return JSON.parse(s); } catch { return null; }
+}
+
+function detectProceedNow(text) {
+  const s = text.toLowerCase();
+  return /\b(agree|agreed|go ahead|proceed|sign|signed|purchase|bought|payment|paid|onboard|set[-\s]?up|application submitted|book(ed)?( in)?|deposit)\b/.test(s);
+}
+
+function guessProductInterest(text) {
+  const s = text.toLowerCase();
+  const ssas = /ssas|small self(-|\s)administered/i.test(s);
+  const fic = /\bfic\b|family investment compan(y|ies)/i.test(s);
+  if (ssas && fic) return ["Both"];
+  if (ssas) return ["SSAS"];
+  if (fic) return ["FIC"];
+  return [];
+}
+
+function extractNextActions(text) {
+  const lines = text.split(/\n+/).map(x => x.trim()).filter(Boolean);
+  const picks = [];
+  for (const ln of lines) {
+    if (/next step|we will|we'll|i will|i'll|you will|send|book|schedule|arrange|follow up/i.test(ln)) {
+      picks.push(ln.replace(/^[\-\*\d\.\)]\s*/, "").slice(0, 200));
+    }
+    if (picks.length >= 5) break;
+  }
+  return picks;
+}
+
+function extractMaterials(text) {
+  const picks = [];
+  const m = text.toLowerCase().match(/\b(send|email|share|forward)\b.+?(document|pack|agreement|proposal|brochure|info|information|forms?|paperwork)/g);
+  if (m) for (const mm of m) picks.push(mm.slice(0, 200));
+  return picks;
+}
+
+function extractDecisionCriteria(text) {
+  const crit = [];
+  const s = text.toLowerCase();
+  if (/fee|cost|price|charges?/.test(s)) crit.push("Fees/Cost");
+  if (/timeline|speed|quick|delay|month|week/.test(s)) crit.push("Timeline");
+  if (/hmrc|compliance|tax|rules?/.test(s)) crit.push("Compliance/Tax");
+  if (/return|roi|cashflow|saving/i.test(s)) crit.push("ROI/Cashflow");
+  if (/platform|provider|trust|previous/.test(s)) crit.push("Provider/Platform");
+  return Array.from(new Set(crit));
+}
+
+function extractObjections(text) {
+  const out = [];
+  const s = text.toLowerCase();
+  if (/fee|cost|price/.test(s)) out.push("Fees/cost");
+  if (/time|timeline|delay|month|week/.test(s)) out.push("Timeline");
+  if (/hmrc|compliance|tax|rules?/.test(s)) out.push("Compliance/Tax");
+  if (/risk|volatile|uncertain/.test(s)) out.push("Risk");
+  if (/trust|provider|previous/.test(s)) out.push("Provider/Trust");
+  return out;
+}
+
+function extractDataPoints(text) {
+  const items = [];
+  const dob = text.match(/\b(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\b/i);
+  const nino = text.match(/\b([A-CEGHJ-PR-TW-Z]{2}\d{6}[A-D]?)\b/i); // UK NI-ish
+  const addr = text.match(/\b(\d+\s+.+(road|rd|street|st|avenue|ave|lane|ln|close|cl|drive|dr|way|place|pl|court|ct))\b/i);
+  if (dob) items.push(`DOB: ${dob[1]}`);
+  if (nino) items.push(`NI: ${nino[1]}`);
+  if (addr) items.push(`Address: ${addr[1]}`);
+  return items;
+}
+
+function applyHeuristics(text, ai) {
+  const out = {
+    call_type: "Initial Consultation",
+    likelihood_to_close: clampInt(ai?.likelihood_to_close ?? 50, 0, 100),
+    outcome: ai?.outcome || "Unclear",
+    objections: Array.isArray(ai?.objections) ? ai.objections : [],
+    next_actions: Array.isArray(ai?.next_actions) ? ai.next_actions : [],
+    materials_to_send: Array.isArray(ai?.materials_to_send) ? ai.materials_to_send : [],
+    key_details: ai?.key_details || {},
+    ai_decision_criteria: Array.isArray(ai?.ai_decision_criteria) ? ai.ai_decision_criteria : [],
+    sales_performance_rating: clampInt(ai?.sales_performance_rating ?? 5, 1, 10),
+    sales_performance_summary: String(ai?.sales_performance_summary || "").trim(),
+    consult_eval: ai?.consult_eval || {}
+  };
+
+  // product interest, if missing
+  if (!out.key_details?.products_discussed || out.key_details.products_discussed.length === 0) {
+    const pi = guessProductInterest(text);
+    out.key_details.products_discussed = pi;
+  }
+
+  // next actions/materials/decision criteria fallbacks
+  if (out.next_actions.length === 0) out.next_actions = extractNextActions(text);
+  if (out.materials_to_send.length === 0) out.materials_to_send = extractMaterials(text);
+  if (out.ai_decision_criteria.length === 0) out.ai_decision_criteria = extractDecisionCriteria(text);
+
+  // objections fallback
+  if (out.objections.length === 0) out.objections = extractObjections(text);
+
+  // data points captured
+  const dataPoints = [];
+  const kd = out.key_details || {};
+  if (kd.client_name) dataPoints.push(`Name: ${kd.client_name}`);
+  if (kd.company_name) dataPoints.push(`Company: ${kd.company_name}`);
+  const dp = extractDataPoints(text);
+  dataPoints.push(...dp);
+  out.key_details = { ...kd }; // keep structure
+  out.__data_points_captured_text = dataPoints.join("\n");
+
+  // If the model didn’t provide a performance summary, build a tiny one
+  if (!out.sales_performance_summary) {
+    out.sales_performance_summary = "What went well:\n- Clear rapport.\n\nAreas to improve:\n- Ask for a commitment.\n- Confirm next step & date.";
+  }
+
+  // Likelihood sanity: if next action + specific date/time or proceed-like language => push up
+  if (detectProceedNow(text)) {
+    out.likelihood_to_close = Math.max(out.likelihood_to_close, 95);
+    out.outcome = "Proceed now";
+  }
+
+  return out;
+}
+
+function clampInt(n, lo, hi) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return lo;
+  return Math.max(lo, Math.min(hi, Math.round(v)));
 }

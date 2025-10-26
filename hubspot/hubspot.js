@@ -14,9 +14,6 @@ function hsHeaders() {
   return { Authorization: `Bearer ${HUBSPOT_TOKEN}`, "Content-Type": "application/json" };
 }
 
-/* =========================================
-   Property discovery & filtering (memoised)
-   ========================================= */
 const KNOWN_PROPS = new Map(); // objectType -> Set(props)
 
 async function getKnownPropsSet(objectType) {
@@ -39,7 +36,7 @@ async function getKnownPropsSet(objectType) {
 
 async function filterPropsFor(objectType, props) {
   const known = await getKnownPropsSet(objectType);
-  if (!known || known.size === 0) return props; // nothing known, don't filter
+  if (!known || known.size === 0) return props;
   const out = {};
   for (const [k, v] of Object.entries(props || {})) {
     if (known.has(k)) out[k] = v;
@@ -74,78 +71,81 @@ export async function getAssociations(fromId, toType) {
 }
 
 /* =========================================================
-   CALL UPDATE (Initial Consultation — exactly the fields you listed)
+   CALL UPDATE — IC fields ONLY (with strong fallbacks)
    ========================================================= */
 export async function updateCall(callId, analysis) {
   const props = {};
 
-  // 1) Ai inferred call type / confidence (force IC path)
+  // Always force this worker path to IC
   props.ai_inferred_call_type = "Initial Consultation";
-  props.ai_call_type_confidence = clamp(
-    numberOrNull(analysis?.ai_call_type_confidence ?? analysis?.call_type_confidence) ?? 90,
-    0, 100
-  );
+  props.ai_call_type_confidence = clamp(numberOrNull(analysis?.ai_call_type_confidence ?? analysis?.call_type_confidence) ?? 90, 0, 100);
 
-  // 2) ai consultation outcome (allowed options)
+  // Outcome mapping + likelihood sanity
   const outcomeHS = mapConsultationOutcomeHS(analysis?.outcome, analysis?.likelihood_to_close, analysis);
   props.ai_consultation_outcome = outcomeHS;
 
-  // 3) ai product of interest
-  const productInterest = mapProductInterest(analysis?.key_details?.products_discussed);
-  if (productInterest) props.ai_product_interest = productInterest;
+  // Product interest (fallback from transcript when missing)
+  const pi = mapProductInterest(analysis?.key_details?.products_discussed) || mapProductInterest(guessProductInterestFromText(analysis));
+  if (pi) props.ai_product_interest = pi;
 
-  // 4) ai decision criteria
+  // Decision criteria
   props.ai_decision_criteria = toShortList(
     analysis?.ai_decision_criteria,
     inferDecisionCriteriaFromSummary(analysis?.summary || []),
     "Not mentioned."
   );
 
-  // 5) ai data point capture (DOB, address, NI, etc.)
-  props.ai_data_points_captured = buildDataPointsCaptured(analysis?.key_details) || "No personal data captured.";
+  // Data points captured
+  const dp = analysis?.__data_points_captured_text || buildDataPointsCaptured(analysis?.key_details) || "No personal data captured.";
+  props.ai_data_points_captured = dp;
 
-  // 6) ai missing information
+  // Missing info
   props.ai_missing_information = toMultiline(analysis?.ai_missing_information) || "None requested or all provided.";
 
-  // 7) ai next steps
-  props.ai_next_steps = toShortList(analysis?.next_actions, [], "No next steps captured.");
+  // Next steps (fallbacks)
+  const steps = ensureArray(analysis?.next_actions);
+  props.ai_next_steps = steps.length ? steps.join("; ").slice(0, 1000) : "No next steps captured.";
 
-  // 8) Objections (primary/bullets/category/severity)
+  // REQUIRED MATERIALS (you called out this gap)
+  const mats = ensureArray(analysis?.materials_to_send);
+  props.ai_consultation_required_materials = mats.length ? mats.join("; ").slice(0, 1000) : "Nothing requested.";
+
+  // Objections & severity/category (omit category when none to avoid invalid option)
   const objections = ensureArray(analysis?.objections);
   if (objections.length) {
     props.ai_key_objections = objections.join("; ").slice(0, 1000);
     props.ai_objections_bullets = objections.join(" • ").slice(0, 5000);
     props.ai_primary_objection = objections[0].slice(0, 300);
     const mappedCat = mapObjectionCategoryToAllowed(objections);
-    if (mappedCat) props.ai_objection_categories = mappedCat; // single allowed option only
+    if (mappedCat) props.ai_objection_categories = mappedCat;
     props.ai_objection_severity = normaliseSeverity(analysis?.ai_objection_severity || "Medium");
   } else {
     props.ai_key_objections = "No objections";
     props.ai_objections_bullets = "No objections";
     props.ai_primary_objection = "No objections";
-    // Do NOT set ai_objection_categories at all when none; avoids INVALID_OPTION
     props.ai_objection_severity = "Low";
   }
 
-  // 9) ai client engagement level (NUMBER 3/2/1)
+  // Engagement level number (3/2/1)
   const sentiment = normaliseSentiment(analysis?.ai_customer_sentiment || analysis?.outcome);
   props.ai_client_engagement_level = engagementNumberFromSentiment(sentiment);
 
-  // 10) ChatGPT helper fields (careful: internal name is **likeliness** with an 'e')
+  // GPT helper fields
   const likeScore10 = adjustedLikelihood10(analysis, outcomeHS);
-  props["chat_gpt___likeliness_to_proceed_score"] = likeScore10;
+  props["chat_gpt___likliness_to_proceed_score"] = likeScore10; // NOTE: internal name with 'e'
   props["chat_gpt___increase_likelihood_of_sale_suggestions"] = buildIncreaseLikelihood(analysis);
   props["chat_gpt___score_reasoning"] = buildScoreReasoning(analysis, likeScore10);
 
-  // Filter & patch
   const safeProps = await filterPropsFor("calls", props);
   const patchResp = await hubspotPatch(`crm/v3/objects/calls/${encodeURIComponent(callId)}`, { properties: safeProps });
 
-  // Optional echo to logs
   try {
     const echo = await getHubSpotObject("calls", callId, [
       "ai_inferred_call_type","ai_call_type_confidence","ai_consultation_outcome",
-      "ai_product_interest","ai_decision_criteria","chat_gpt___likeliness_to_proceed_score"
+      "ai_product_interest","ai_decision_criteria","ai_data_points_captured",
+      "ai_missing_information","ai_next_steps","ai_consultation_required_materials",
+      "ai_key_objections","ai_objections_bullets","ai_primary_objection",
+      "ai_objection_severity","chat_gpt___likliness_to_proceed_score"
     ]);
     console.log("[debug] Call updated:", echo?.properties);
   } catch {}
@@ -154,25 +154,25 @@ export async function updateCall(callId, analysis) {
 }
 
 /* ====================================================================
-   SCORECARD CREATE (Initial Consultation — 20 consult_* metrics + weighted 10/10)
+   SCORECARD CREATE — 20 consult_* + weighted score + mirrors
    ==================================================================== */
 export async function createScorecard(analysis, { callId, contactIds = [], dealIds = [], ownerId = null } = {}) {
   await getKnownPropsSet(SCORECARD_OBJECT);
   const has = (n) => KNOWN_PROPS.get(SCORECARD_OBJECT)?.has(n);
 
   const activityName = `${callId} — Initial Consultation — ${new Date().toISOString().slice(0, 10)}`;
-
-  // Build 20 consult_* flags (0/1) using consult_eval + heuristics
   const consult = buildConsultFlags(analysis);
 
-  // Weighted score (sums to 10.0), round to nearest integer, clamp 1..10
+  // DEBUG: log weights and flags for diagnosis
   const weights = CONSULT_WEIGHTS_10;
-  let raw = 0;
-  for (const [k, w] of Object.entries(weights)) raw += (consult[k] ? 1 : 0) * w;
-  const consultScore10 = clamp(Math.round(raw), 1, 10);
+  const contrib = Object.entries(weights).map(([k,w]) => ({ k, w, v: consult[k] ? 1 : 0, p: (consult[k]?w:0) }));
+  const raw = contrib.reduce((a,b)=>a+b.p, 0);
+  console.log("[scorecard] consult flags:", contrib);
+  console.log("[scorecard] weighted raw:", raw);
 
-  // Sales performance rating (prompt) with sanity floor if Proceed now
-  let perf10 = clamp(Math.round(numberOrNull(analysis?.sales_performance_rating) ?? 0), 1, 10);
+  const consultScore10 = clampInt(Math.round(raw), 1, 10);
+
+  let perf10 = clampInt(Math.round(numberOrNull(analysis?.sales_performance_rating) ?? 0), 1, 10);
   const outcomeHS = mapConsultationOutcomeHS(analysis?.outcome, analysis?.likelihood_to_close, analysis);
   if (outcomeHS === "Proceed now" && perf10 < 8) perf10 = 8;
 
@@ -184,42 +184,44 @@ export async function createScorecard(analysis, { callId, contactIds = [], dealI
     activity_name: activityName,
     hubspot_owner_id: ownerId || undefined,
 
-    // 20 consult_* flags (0/1)
-    ...(has("consult_closing_question_asked") ? { consult_closing_question_asked: consult.consult_closing_question_asked } : {}),
-    ...(has("consult_collected_dob_nin_when_agreed") ? { consult_collected_dob_nin_when_agreed: consult.consult_collected_dob_nin_when_agreed } : {}),
-    ...(has("consult_confirm_reason_for_zoom") ? { consult_confirm_reason_for_zoom: consult.consult_confirm_reason_for_zoom } : {}),
-    ...(has("consult_customer_agreed_to_set_up") ? { consult_customer_agreed_to_set_up: consult.consult_customer_agreed_to_set_up } : {}),
-    ...(has("consult_demo_tax_saving") ? { consult_demo_tax_saving: consult.consult_demo_tax_saving } : {}),
-    ...(has("consult_fee_phrasing_three_seven_five") ? { consult_fee_phrasing_three_seven_five: consult.consult_fee_phrasing_three_seven_five } : {}),
-    ...(has("consult_fees_annualised") ? { consult_fees_annualised: consult.consult_fees_annualised } : {}),
-    ...(has("consult_fees_tax_deductible_explained") ? { consult_fees_tax_deductible_explained: consult.consult_fees_tax_deductible_explained } : {}),
-    ...(has("consult_interactive_throughout") ? { consult_interactive_throughout: consult.consult_interactive_throughout } : {}),
-    ...(has("consult_needs_pain_uncovered") ? { consult_needs_pain_uncovered: consult.consult_needs_pain_uncovered } : {}),
-    ...(has("consult_next_contact_within_5_days") ? { consult_next_contact_within_5_days: consult.consult_next_contact_within_5_days } : {}),
-    ...(has("consult_next_step_specific_date_time") ? { consult_next_step_specific_date_time: consult.consult_next_step_specific_date_time } : {}),
-    ...(has("consult_no_assumptions_evidence_gathered") ? { consult_no_assumptions_evidence_gathered: consult.consult_no_assumptions_evidence_gathered } : {}),
-    ...(has("consult_overcame_objection_and_closed") ? { consult_overcame_objection_and_closed: consult.consult_overcame_objection_and_closed } : {}),
-    ...(has("consult_prospect_asked_next_steps") ? { consult_prospect_asked_next_steps: consult.consult_prospect_asked_next_steps } : {}),
-    ...(has("consult_purpose_clearly_stated") ? { consult_purpose_clearly_stated: consult.consult_purpose_clearly_stated } : {}),
-    ...(has("consult_quantified_value_roi") ? { consult_quantified_value_roi: consult.consult_quantified_value_roi } : {}),
-    ...(has("consult_rapport_open") ? { consult_rapport_open: consult.consult_rapport_open } : {}),
-    ...(has("consult_specific_tax_estimate_given") ? { consult_specific_tax_estimate_given: consult.consult_specific_tax_estimate_given } : {}),
-    ...(has("consult_strong_buying_signals_detected") ? { consult_strong_buying_signals_detected: consult.consult_strong_buying_signals_detected } : {}),
+    // 20 consult_* flags
+    consult_closing_question_asked: consult.consult_closing_question_asked,
+    consult_collected_dob_nin_when_agreed: consult.consult_collected_dob_nin_when_agreed,
+    consult_confirm_reason_for_zoom: consult.consult_confirm_reason_for_zoom,
+    consult_customer_agreed_to_set_up: consult.consult_customer_agreed_to_set_up,
+    consult_demo_tax_saving: consult.consult_demo_tax_saving,
+    consult_fee_phrasing_three_seven_five: consult.consult_fee_phrasing_three_seven_five,
+    consult_fees_annualised: consult.consult_fees_annualised,
+    consult_fees_tax_deductible_explained: consult.consult_fees_tax_deductible_explained,
+    consult_interactive_throughout: consult.consult_interactive_throughout,
+    consult_needs_pain_uncovered: consult.consult_needs_pain_uncovered,
+    consult_next_contact_within_5_days: consult.consult_next_contact_within_5_days,
+    consult_next_step_specific_date_time: consult.consult_next_step_specific_date_time,
+    consult_no_assumptions_evidence_gathered: consult.consult_no_assumptions_evidence_gathered,
+    consult_overcame_objection_and_closed: consult.consult_overcame_objection_and_closed,
+    consult_prospect_asked_next_steps: consult.consult_prospect_asked_next_steps,
+    consult_purpose_clearly_stated: consult.consult_purpose_clearly_stated,
+    consult_quantified_value_roi: consult.consult_quantified_value_roi,
+    consult_rapport_open: consult.consult_rapport_open,
+    consult_specific_tax_estimate_given: consult.consult_specific_tax_estimate_given,
+    consult_strong_buying_signals_detected: consult.consult_strong_buying_signals_detected,
 
-    // Consultation Score (1–10)
-    ...(has("consult_score_final") ? { consult_score_final: consultScore10 } : {}),
+    // Weighted score
+    consult_score_final: consultScore10,
 
-    // Sales performance rating (prompt) + coaching summary
-    ...(has("sales_performance_rating") ? { sales_performance_rating: String(perf10) } : {}),
-    ...(has("sales_scorecard___what_you_can_improve_on") ? { sales_scorecard___what_you_can_improve_on: summary } : {}),
+    // Coaching
+    sales_performance_rating: String(perf10),
+    sales_scorecard___what_you_can_improve_on: summary,
 
-    // Mirrors from the Call
-    ...(has("ai_consultation_likelihood_to_close") ? { ai_consultation_likelihood_to_close: likeScore10 } : {}),
-    ...(has("ai_consultation_outcome") ? { ai_consultation_outcome: outcomeHS } : {}),
-    ...(has("ai_consultation_required_materials") ? { ai_consultation_required_materials: toShortList(analysis?.materials_to_send, [], "No materials requested.") } : {}),
-    ...(has("ai_decision_criteria") ? { ai_decision_criteria: toShortList(analysis?.ai_decision_criteria, inferDecisionCriteriaFromSummary(analysis?.summary || []), "Not mentioned.") } : {}),
-    ...(has("ai_key_objections") ? { ai_key_objections: ensureArray(analysis?.objections).length ? ensureArray(analysis?.objections).join("; ").slice(0, 1000) : "No objections" } : {}),
-    ...(has("ai_next_steps") ? { ai_next_steps: toShortList(analysis?.next_actions, [], "No next steps captured.") } : {}),
+    // Mirrors from Call expectations
+    ai_consultation_likelihood_to_close: likeScore10,
+    ai_consultation_outcome: outcomeHS,
+    ai_consultation_required_materials: ensureArray(analysis?.materials_to_send).length
+      ? ensureArray(analysis?.materials_to_send).join("; ").slice(0, 1000)
+      : "No materials requested.",
+    ai_decision_criteria: toShortList(analysis?.ai_decision_criteria, inferDecisionCriteriaFromSummary(analysis?.summary || []), "Not mentioned."),
+    ai_key_objections: ensureArray(analysis?.objections).length ? ensureArray(analysis?.objections).join("; ").slice(0, 1000) : "No objections",
+    ai_next_steps: ensureArray(analysis?.next_actions).length ? ensureArray(analysis?.next_actions).join("; ").slice(0, 1000) : "No next steps captured.",
   };
 
   const safeProps = await filterPropsFor(SCORECARD_OBJECT, props);
@@ -230,7 +232,6 @@ export async function createScorecard(analysis, { callId, contactIds = [], dealI
     return { type: SCORECARD_OBJECT, id: null };
   }
 
-  // Associate to call + any contact/deal
   await associateV4UsingLabels(SCORECARD_OBJECT, scoreId, "calls", callId);
   for (const cId of contactIds) await associateV4UsingLabels(SCORECARD_OBJECT, scoreId, "contacts", cId);
   for (const dId of dealIds) await associateV4UsingLabels(SCORECARD_OBJECT, scoreId, "deals", dId);
@@ -303,8 +304,7 @@ async function associateV4UsingLabels(fromType, fromId, toType, toId) {
   console.warn(`[HubSpot] v4 association failed for all labels: ${fromType} -> ${toType}`);
 }
 
-/* ================== Weights & Inference ================== */
-/** Weights that sum to 10.0, per your approval. */
+/* ================== Weights & helpers ================== */
 const CONSULT_WEIGHTS_10 = {
   consult_customer_agreed_to_set_up:       2.0,
   consult_overcame_objection_and_closed:   1.0,
@@ -333,6 +333,7 @@ function toMultiline(v){ if(Array.isArray(v)) return v.join("\n"); if(v==null) r
 function toShortList(primary, inferred=[], fallback=""){ const a=ensureArray(primary); if(a.length) return a.join("; ").slice(0, 1000); const b=ensureArray(inferred); return (b.length ? b.join("; ") : fallback).slice(0, 1000); }
 function numberOrNull(v){ if(v==null) return null; const n=Number(v); return Number.isFinite(n) ? n : null; }
 function clamp(n, lo, hi){ return Math.max(lo, Math.min(hi, n)); }
+function clampInt(n, lo, hi){ const v=Number(n); if(!Number.isFinite(v)) return lo; return Math.max(lo, Math.min(hi, Math.round(v))); }
 
 function normaliseSentiment(v){ if(!v) return "Neutral"; const s=String(v).toLowerCase();
   if (s.includes("pos")) return "Positive";
@@ -341,20 +342,17 @@ function normaliseSentiment(v){ if(!v) return "Neutral"; const s=String(v).toLow
 }
 function engagementNumberFromSentiment(sent){ return sent==="Positive" ? 3 : sent==="Negative" ? 1 : 2; }
 
-/** Map analysis outcome/likelihood to your allowed set with close-detection guardrails. */
 function mapConsultationOutcomeHS(outcomeText, likelihoodPct, analysis){
   const s = String(outcomeText || "").toLowerCase();
-  const transcriptHints = [
+  const text = [
     ...(ensureArray(analysis?.summary)),
     ...(ensureArray(analysis?.next_actions)),
     ...(ensureArray(analysis?.materials_to_send)),
   ].join(" ").toLowerCase();
 
-  // If transcript clearly indicates they agreed/bought/booked -> Proceed now
-  if (/\bproceed|signed|sign|go(-|\s*)ahead|commit|purchase|bought|agree(d)?|paid|payment|onboard|set[-\s]?up|application submitted/.test(transcriptHints)) {
+  if (/\bproceed|signed|sign|go(-|\s*)ahead|commit|purchase|bought|agree(d)?|paid|payment|onboard|set[-\s]?up|application submitted|deposit\b/.test(text)) {
     return "Proceed now";
   }
-
   if (/\bproceed now|signed|commit|purchase|buy|agreed/.test(s)) return "Proceed now";
   if (/\blikely|positive|good chance|favourable|favorable/.test(s)) return "Likely";
   if (/\bnot now|later|follow[-\s]?up|defer|wait/.test(s)) return "Not now";
@@ -376,22 +374,35 @@ function adjustedLikelihood10(analysis, outcomeHS){
   const fromPct = toOneToTenFromPct(analysis?.likelihood_to_close);
   let score = fromPct ?? 5;
   if (outcomeHS === "Proceed now") score = Math.max(score, 10);
-  return clamp(Math.round(score), 1, 10);
+  return clampInt(score, 1, 10);
 }
 
 function toOneToTenFromPct(pct){
   const n = numberOrNull(pct);
   if (n==null) return null;
-  return clamp(Math.max(1, Math.round(n/10)), 1, 10);
+  return clampInt(Math.max(1, Math.round(n/10)), 1, 10);
 }
 
 function mapProductInterest(products){
-  const arr=ensureArray(products).map(p=>p.toLowerCase());
-  const hasSSAS=arr.some(p=>p.includes("ssas")), hasFIC=arr.some(p=>p.includes("fic"));
+  const arr=ensureArray(products).map(p=>String(p).toLowerCase());
+  const hasSSAS=arr.some(p=>p.includes("ssas") || p.includes("small self"));
+  const hasFIC=arr.some(p=>p.includes("fic") || p.includes("family investment"));
   if (hasSSAS && hasFIC) return "Both"; if (hasSSAS) return "SSAS"; if (hasFIC) return "FIC"; return undefined;
 }
 
-/** Map our free-form categories to your **allowed single-select**: [Price, Timing, Risk, Complexity, Authority, Clarity]. */
+function guessProductInterestFromText(analysis){
+  const text = [
+    ...(ensureArray(analysis?.summary)),
+    ...(ensureArray(analysis?.next_actions)),
+    ...(ensureArray(analysis?.materials_to_send))
+  ].join(" ").toLowerCase();
+  const arr = [];
+  if (/ssas|small self[-\s]administered/.test(text)) arr.push("SSAS");
+  if (/\bfic\b|family investment compan/.test(text)) arr.push("FIC");
+  return arr;
+}
+
+/** Allowed single-select: [Price, Timing, Risk, Complexity, Authority, Clarity] */
 function mapObjectionCategoryToAllowed(objs){
   const text = ensureArray(objs).join(" ").toLowerCase();
   if (/fee|cost|price/.test(text)) return "Price";
@@ -400,7 +411,7 @@ function mapObjectionCategoryToAllowed(objs){
   if (/hmrc|compliance|tax|rules?|paperwork|process|admin|complex/.test(text)) return "Complexity";
   if (/authority|director|decision[-\s]?maker|trust|provider|sign[-\s]?off|approval/.test(text)) return "Authority";
   if (/confus|unclear|don.?t understand|clarif/.test(text)) return "Clarity";
-  return null; // IMPORTANT: return null rather than an invalid value
+  return null;
 }
 
 function normaliseSeverity(v){
@@ -424,14 +435,15 @@ function inferDecisionCriteriaFromSummary(summaryArr){
 
 function buildScoreReasoning(analysis, score10){
   const parts = [];
-  if (score10 != null) parts.push(`Score chosen: ${score10}/10`);
+  parts.push(`Score chosen: ${score10}/10`);
   const obs = ensureArray(analysis?.objections);
   if (obs.length) parts.push(`Objections: ${obs.join("; ")}`);
   const na = ensureArray(analysis?.next_actions);
   if (na.length) parts.push(`Next steps: ${na.join("; ")}`);
   const kd = analysis?.key_details || {};
+  if (kd.products_discussed?.length) parts.push(`Products: ${kd.products_discussed.join(", ")}`);
   if (kd.timeline) parts.push(`Timeline: ${kd.timeline}`);
-  return parts.join("\n").slice(0, 3000) || "No specific rationale found in transcript.";
+  return parts.join("\n").slice(0, 3000);
 }
 
 function buildIncreaseLikelihood(analysis){
@@ -457,15 +469,7 @@ function buildDataPointsCaptured(kd){
   return items.join("\n").slice(0, 5000);
 }
 
-function buildCoachingSummary(analysis){
-  const s = String(analysis?.sales_performance_summary || "").trim();
-  if (s) return s.slice(0, 9000);
-  const ww = ensureArray(analysis?.summary).slice(0,2).map(x=>`- ${x}`).join("\n") || "- Rapport established.";
-  const imp = ["- Ask for a specific commitment.","- Confirm next step & date."].join("\n");
-  return `What went well:\n${ww}\n\nAreas to improve:\n${imp}`;
-}
-
-/** Build 20 consult_* flags from consult_eval (0/0.5/1) + light inference from analysis text. */
+/** Build consult_* booleans from consult_eval + text cues */
 function buildConsultFlags(analysis){
   const ev = analysis?.consult_eval || {};
   const yes01 = (v)=> Number(v) >= 0.75 ? 1 : (Number(v) > 0 ? 1 : 0);
