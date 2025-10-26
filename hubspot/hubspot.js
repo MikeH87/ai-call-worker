@@ -22,7 +22,6 @@ const HS = {
   },
 };
 
-// ---------- Generic fetch wrapper ----------
 async function hsFetch(url, init = {}) {
   const res = await fetch(url, {
     ...init,
@@ -30,12 +29,17 @@ async function hsFetch(url, init = {}) {
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw new Error(`HubSpot ${init.method || "GET"} ${url} failed: ${res.status} ${text}`);
+    throw new Error(`${init.method || "GET"} ${url} -> ${res.status} ${text}`);
   }
-  return res.json().catch(() => ({}));
+  // some assoc endpoints return 204/empty
+  try {
+    return await res.json();
+  } catch {
+    return {};
+  }
 }
 
-// ---------- Read helpers ----------
+// ---------- READ HELPERS ----------
 export async function getHubSpotObject(objectType, objectId, properties = []) {
   const qs = properties.length ? `?properties=${encodeURIComponent(properties.join(","))}` : "";
   const url = `${HS.base}/crm/v3/objects/${objectType}/${objectId}${qs}`;
@@ -46,9 +50,8 @@ export async function getHubSpotObject(objectType, objectId, properties = []) {
   }
 }
 
-export async function getAssociations(objectId, toType) {
-  // Returns array of associated IDs (simple helper for calls -> contacts/deals)
-  const url = `${HS.base}/crm/v4/objects/calls/${objectId}/associations/${toType}`;
+export async function getAssociations(callId, toType) {
+  const url = `${HS.base}/crm/v4/objects/calls/${callId}/associations/${toType}`;
   try {
     const data = await hsFetch(url);
     const ids =
@@ -57,69 +60,92 @@ export async function getAssociations(objectId, toType) {
       [];
     return ids.map((x) => (/\d+/.test(x) ? Number(x) : x));
   } catch (e) {
-    console.warn(`[warn] getAssociations calls/${objectId} -> ${toType} failed:`, e.message);
+    console.warn(`[warn] getAssociations calls/${callId} -> ${toType} failed:`, e.message);
     return [];
   }
 }
 
-// ---------- Association helpers (v4) ----------
-// Fallback IDs you confirmed earlier (keep them here)
-const FALLBACK_ASSOC_IDS = {
-  "p49487487_sales_scorecards->calls": 395,
-  "p49487487_sales_scorecards->contacts": 421,
-  "p49487487_sales_scorecards->deals": 423,
-};
-
-// Try to discover a valid associationTypeId, then fall back to known IDs.
-async function getAssociationTypeId(fromType, toType) {
-  const key = `${fromType}->${toType}`;
+// ---------- ASSOCIATION DISCOVERY ----------
+async function discoverAssocMeta(fromType, toType) {
+  // returns { list: [{typeId, id, label, category}], preferred }
   try {
     const url = `${HS.base}/crm/v4/associations/${fromType}/${toType}/labels`;
     const data = await hsFetch(url);
     const list = data?.results || [];
-    // Prefer HUBSPOT_DEFINED if present; otherwise take the first label
     const preferred =
-      list.find((x) => x?.category === "HUBSPOT_DEFINED") ||
-      list[0];
-    const id =
-      preferred?.typeId || preferred?.id || FALLBACK_ASSOC_IDS[key] || null;
-    if (!id) console.warn(`[warn] No associationTypeId discovered for ${key}; will rely on fallback if present.`);
-    return id;
-  } catch {
-    return FALLBACK_ASSOC_IDS[key] || null;
+      list.find((x) => x?.category === "HUBSPOT_DEFINED") || list[0] || null;
+    return { list, preferred };
+  } catch (e) {
+    console.warn(`[warn] labels discovery failed for ${fromType} -> ${toType}:`, e.message);
+    return { list: [], preferred: null };
   }
 }
 
-/**
- * ✅ Correct single-association call:
- * PUT /crm/v4/objects/{fromType}/{fromId}/associations/{toType}/{toId}/{associationTypeId}
- * Body: (none)
- */
-async function associateOnceV4(fromType, fromId, toType, toId) {
-  const typeId = await getAssociationTypeId(fromType, toType);
-  if (!typeId) {
-    console.warn(`[warn] No association typeId for ${fromType} -> ${toType}`);
+// ---------- ASSOCIATION ATTEMPTS (3 strategies) ----------
+async function assocTryV4Single(fromType, fromId, toType, toId, typeId) {
+  const url = `${HS.base}/crm/v4/objects/${fromType}/${fromId}/associations/${toType}/${toId}/${typeId}`;
+  await hsFetch(url, { method: "PUT" }); // no body
+  return "v4-single";
+}
+
+async function assocTryV4BatchTypeId(fromType, fromId, toType, toId, typeId) {
+  const url = `${HS.base}/crm/v4/associations/${fromType}/${toType}/batch/create`;
+  const body = { inputs: [{ from: { id: String(fromId) }, to: { id: String(toId) }, type: String(typeId) }] };
+  await hsFetch(url, { method: "POST", body: JSON.stringify(body) });
+  return "v4-batch-typeId";
+}
+
+async function assocTryV3BatchLabel(fromType, fromId, toType, toId, label) {
+  const url = `${HS.base}/crm/v3/associations/${fromType}/${toType}/batch/create`;
+  const body = { inputs: [{ from: { id: String(fromId) }, to: { id: String(toId) }, type: String(label) }] };
+  await hsFetch(url, { method: "POST", body: JSON.stringify(body) });
+  return "v3-batch-label";
+}
+
+async function associateSmart(fromType, fromId, toType, toId) {
+  const { list, preferred } = await discoverAssocMeta(fromType, toType);
+  if (!preferred) {
+    console.warn(`[warn] No association types returned for ${fromType} -> ${toType}`);
     return false;
   }
 
-  const url = `${HS.base}/crm/v4/objects/${fromType}/${fromId}/associations/${toType}/${toId}/${typeId}`;
-  try {
-    // NB: No body is required here for single create
-    await hsFetch(url, { method: "PUT" });
-    console.log(`[assoc] Linked ${fromType}:${fromId} -> ${toType}:${toId} (typeId=${typeId})`);
-    return true;
-  } catch (e) {
-    console.warn(
-      `[HubSpot] v4 associate ${fromType}:${fromId} -> ${toType}:${toId} failed:`,
-      e.message
-    );
-    return false;
+  // Try with preferred first; if needed, try others.
+  const candidates = [preferred, ...list.filter((x) => x !== preferred)];
+
+  for (const c of candidates) {
+    const typeId = c.typeId || c.id;
+    const label = c.label || String(typeId);
+
+    // 1) v4 single (typeId in path)
+    try {
+      const how = await assocTryV4Single(fromType, fromId, toType, toId, typeId);
+      console.log(`[assoc] Linked ${fromType}:${fromId} -> ${toType}:${toId} via ${how} (typeId=${typeId}, label=${label})`);
+      return true;
+    } catch (_) {}
+
+    // 2) v4 batch (typeId in "type")
+    try {
+      const how = await assocTryV4BatchTypeId(fromType, fromId, toType, toId, typeId);
+      console.log(`[assoc] Linked ${fromType}:${fromId} -> ${toType}:${toId} via ${how} (typeId=${typeId}, label=${label})`);
+      return true;
+    } catch (_) {}
+
+    // 3) v3 batch (label string)
+    try {
+      const how = await assocTryV3BatchLabel(fromType, fromId, toType, toId, label);
+      console.log(`[assoc] Linked ${fromType}:${fromId} -> ${toType}:${toId} via ${how} (typeId=${typeId}, label=${label})`);
+      return true;
+    } catch (e) {
+      // keep looping to next candidate
+    }
   }
+
+  console.warn(`[warn] Association attempts exhausted for ${fromType}:${fromId} -> ${toType}:${toId}`);
+  return false;
 }
 
 // ---------- CALL UPDATE ----------
 export async function updateCall(callId, analysis) {
-  // Robust defaults on the CALL side
   const callType = analysis?.call_type || "Initial Consultation";
   const conf =
     typeof analysis?.ai_call_type_confidence === "number"
@@ -148,7 +174,6 @@ export async function updateCall(callId, analysis) {
       ? analysis.__data_points_captured_text
       : "No personal data captured.";
 
-  // product interest -> SSAS | FIC | Both
   let productInterest = "";
   const pd = analysis?.key_details?.products_discussed || [];
   if (pd.length === 2) productInterest = "Both";
@@ -160,7 +185,6 @@ export async function updateCall(callId, analysis) {
       ? Math.max(1, Math.min(10, Math.round(analysis.likelihood_to_close / 10)))
       : 1;
 
-  // objection category limited set (portal list: Price, Timing, Risk, Complexity, Authority, Clarity)
   const allowedCategories = new Set(["Price","Timing","Risk","Complexity","Authority","Clarity"]);
   let aiCat = "Clarity";
   if (objections.some(o => /price|fee|cost/i.test(o))) aiCat = "Price";
@@ -170,7 +194,6 @@ export async function updateCall(callId, analysis) {
   else if (objections.some(o => /authority|sign off|decision/i.test(o))) aiCat = "Authority";
   if (!allowedCategories.has(aiCat)) aiCat = "Clarity";
 
-  // Coaching / guidance on the CALL
   const increaseLikely = Array.isArray(analysis?.increase_likelihood)
     ? analysis.increase_likelihood.join("; ")
     : (analysis?.increase_likelihood || "No suggestions.");
@@ -179,20 +202,16 @@ export async function updateCall(callId, analysis) {
     typeof analysis?.sales_performance_rating === "number"
       ? String(analysis.sales_performance_rating)
       : "";
-
   const scoreReason = analysis?.score_reasoning || "No reasoning provided.";
 
-  // Missing info & materials (guaranteed)
   const missingInfo =
-    typeof analysis?.ai_missing_information === "string" &&
-    analysis.ai_missing_information.trim().length
+    typeof analysis?.ai_missing_information === "string" && analysis.ai_missing_information.trim()
       ? analysis.ai_missing_information
       : "Nothing requested or all information provided.";
 
   const requestedMaterials =
     materials.length > 0 ? materials.join("; ") : "Nothing requested";
 
-  // Build request body for the CALL update
   const props = {
     ai_inferred_call_type: callType,
     ai_call_type_confidence: conf,
@@ -209,8 +228,6 @@ export async function updateCall(callId, analysis) {
     ai_primary_objection: objections[0] || "No objection",
     ai_objection_severity: analysis?.ai_objection_severity || "Medium",
     ai_objection_categories: aiCat,
-
-    // Guidance
     chat_gpt___increase_likelihood_of_sale_suggestions: increaseLikely,
     chat_gpt___sales_performance: perfScore,
     chat_gpt___score_reasoning: scoreReason,
@@ -227,7 +244,6 @@ export async function updateCall(callId, analysis) {
     console.warn("[HubSpot] PATCH", url, "failed:", e.message);
   }
 
-  // Log a projection to verify
   try {
     const after = await getHubSpotObject("calls", callId, [
       "ai_inferred_call_type",
@@ -254,7 +270,7 @@ export async function updateCall(callId, analysis) {
   } catch {}
 }
 
-// ---------- SCORECARD CREATE ----------
+// ---------- SCORECARD CREATE + ASSOC ----------
 export async function createScorecard(analysis, ctx) {
   const { callId, contactIds = [], dealIds = [], ownerId } = ctx || {};
   const objectType = "p49487487_sales_scorecards";
@@ -262,7 +278,6 @@ export async function createScorecard(analysis, ctx) {
   const ce = analysis?.consult_eval || {};
   const fv = (v) => (v === 1 ? 1 : 0);
 
-  // Likelihood-to-close (1..10) mirrored on Scorecard too
   const tenScale =
     typeof analysis?.likelihood_to_close === "number"
       ? Math.max(1, Math.min(10, Math.round(analysis.likelihood_to_close / 10)))
@@ -273,13 +288,11 @@ export async function createScorecard(analysis, ctx) {
     activity_name: `${callId} — Initial Consultation — ${new Date().toISOString().slice(0, 10)}`,
     hubspot_owner_id: ownerId || undefined,
 
-    // Coaching
     sales_performance_rating_: Number(analysis?.sales_performance_rating || 1),
     sales_scorecard___what_you_can_improve_on:
       analysis?.sales_performance_summary ||
       "What went well:\n- \n\nAreas to improve:\n- ",
 
-    // Mirrors for reviewer convenience
     ai_next_steps: (analysis?.next_actions || []).join("; "),
     ai_consultation_required_materials:
       (Array.isArray(analysis?.materials_to_send) && analysis.materials_to_send.length
@@ -290,9 +303,8 @@ export async function createScorecard(analysis, ctx) {
     ai_consultation_outcome: analysis?.outcome || "Unclear",
     ai_consultation_likelihood_to_close: String(tenScale),
 
-    // Consult metrics (0/1 projection)
     consult_closing_question_asked: fv(ce.commitment_requested),
-    consult_collected_dob_nin_when_agreed: fv(ce.specific_tax_estimate_given), // proxy; adjust if you prefer
+    consult_collected_dob_nin_when_agreed: fv(ce.specific_tax_estimate_given),
     consult_confirm_reason_for_zoom: fv(ce.intro),
     consult_customer_agreed_to_set_up: fv(analysis?.outcome === "Proceed now" ? 1 : ce.commitment_requested),
     consult_demo_tax_saving: fv(ce.quantified_value_roi),
@@ -313,7 +325,6 @@ export async function createScorecard(analysis, ctx) {
     consult_strong_buying_signals_detected: fv(ce.benefits_linked_to_needs),
   };
 
-  // Weighted score calculation (weights sum to 10)
   const weights = {
     consult_customer_agreed_to_set_up: 2,
     consult_overcame_objection_and_closed: 1,
@@ -343,37 +354,34 @@ export async function createScorecard(analysis, ctx) {
   }
   props["consult_score_final"] = Math.max(1, Math.min(10, Math.round(weighted * 10) / 10));
 
-  // Create the Scorecard
+  // Create scorecard
   const createUrl = `${HS.base}/crm/v3/objects/${objectType}`;
-  let createdId = null;
+  let scorecardId = null;
   try {
     const created = await hsFetch(createUrl, {
       method: "POST",
       body: JSON.stringify({ properties: props }),
     });
-    createdId = created?.id;
-    console.log("[scorecard] created id:", createdId);
+    scorecardId = created?.id;
+    console.log("[scorecard] created id:", scorecardId);
   } catch (e) {
     console.warn("[HubSpot] create scorecard failed:", e.message);
     return null;
   }
 
-  if (!createdId) return null;
+  if (!scorecardId) return null;
 
-  // Always associate to the Call
-  const assocResults = [];
-  assocResults.push(await associateOnceV4(objectType, createdId, "calls", String(callId)));
-
-  // Optionally associate to Contacts and Deals (skip if none)
-  for (const cid of (contactIds || [])) {
-    assocResults.push(await associateOnceV4(objectType, createdId, "contacts", String(cid)));
+  // Always associate to the Call; optionally to contacts/deals
+  const assocOK = await associateSmart(objectType, scorecardId, "calls", String(callId));
+  for (const cid of (ctx?.contactIds || [])) {
+    await associateSmart(objectType, scorecardId, "contacts", String(cid));
   }
-  for (const did of (dealIds || [])) {
-    assocResults.push(await associateOnceV4(objectType, createdId, "deals", String(did)));
+  for (const did of (ctx?.dealIds || [])) {
+    await associateSmart(objectType, scorecardId, "deals", String(did));
   }
 
-  if (!assocResults[0]) {
+  if (!assocOK) {
     console.warn("[warn] scorecard was created but not linked to the Call (will still exist).");
   }
-  return createdId;
+  return scorecardId;
 }
