@@ -63,30 +63,38 @@ export async function getAssociations(objectId, toType) {
 }
 
 // ---------- Association helpers (v4) ----------
+// Fallback IDs you confirmed earlier (keep them here)
+const FALLBACK_ASSOC_IDS = {
+  "p49487487_sales_scorecards->calls": 395,
+  "p49487487_sales_scorecards->contacts": 421,
+  "p49487487_sales_scorecards->deals": 423,
+};
 
-// Try to discover a valid associationTypeId, then fall back to known IDs you gave me.
+// Try to discover a valid associationTypeId, then fall back to known IDs.
 async function getAssociationTypeId(fromType, toType) {
-  const fallback = {
-    "p49487487_sales_scorecards->calls": 395,
-    "p49487487_sales_scorecards->contacts": 421,
-    "p49487487_sales_scorecards->deals": 423,
-  };
   const key = `${fromType}->${toType}`;
-
   try {
     const url = `${HS.base}/crm/v4/associations/${fromType}/${toType}/labels`;
     const data = await hsFetch(url);
     const list = data?.results || [];
+    // Prefer HUBSPOT_DEFINED if present; otherwise take the first label
     const preferred =
       list.find((x) => x?.category === "HUBSPOT_DEFINED") ||
       list[0];
-    return preferred?.typeId || preferred?.id || fallback[key] || null;
+    const id =
+      preferred?.typeId || preferred?.id || FALLBACK_ASSOC_IDS[key] || null;
+    if (!id) console.warn(`[warn] No associationTypeId discovered for ${key}; will rely on fallback if present.`);
+    return id;
   } catch {
-    return fallback[key] || null;
+    return FALLBACK_ASSOC_IDS[key] || null;
   }
 }
 
-// Correct v4 association: PUT + { types: [ { associationCategory, associationTypeId } ] }
+/**
+ * ✅ Correct single-association call:
+ * PUT /crm/v4/objects/{fromType}/{fromId}/associations/{toType}/{toId}/{associationTypeId}
+ * Body: (none)
+ */
 async function associateOnceV4(fromType, fromId, toType, toId) {
   const typeId = await getAssociationTypeId(fromType, toType);
   if (!typeId) {
@@ -94,19 +102,11 @@ async function associateOnceV4(fromType, fromId, toType, toId) {
     return false;
   }
 
-  const url = `${HS.base}/crm/v4/objects/${fromType}/${fromId}/associations/${toType}/${toId}`;
-  const body = {
-    types: [
-      {
-        associationCategory: "HUBSPOT_DEFINED",
-        associationTypeId: Number(typeId),
-      },
-    ],
-  };
-
+  const url = `${HS.base}/crm/v4/objects/${fromType}/${fromId}/associations/${toType}/${toId}/${typeId}`;
   try {
-    await hsFetch(url, { method: "PUT", body: JSON.stringify(body) });
-    console.log(`[assoc] Linked ${fromType}:${fromId} -> ${toType}:${toId}`);
+    // NB: No body is required here for single create
+    await hsFetch(url, { method: "PUT" });
+    console.log(`[assoc] Linked ${fromType}:${fromId} -> ${toType}:${toId} (typeId=${typeId})`);
     return true;
   } catch (e) {
     console.warn(
@@ -119,7 +119,7 @@ async function associateOnceV4(fromType, fromId, toType, toId) {
 
 // ---------- CALL UPDATE ----------
 export async function updateCall(callId, analysis) {
-  // ------- robust defaults on the CALL side (so we don't rely on analyse.js for these) -------
+  // Robust defaults on the CALL side
   const callType = analysis?.call_type || "Initial Consultation";
   const conf =
     typeof analysis?.ai_call_type_confidence === "number"
@@ -182,7 +182,7 @@ export async function updateCall(callId, analysis) {
 
   const scoreReason = analysis?.score_reasoning || "No reasoning provided.";
 
-  // Missing info & materials (now guaranteed)
+  // Missing info & materials (guaranteed)
   const missingInfo =
     typeof analysis?.ai_missing_information === "string" &&
     analysis.ai_missing_information.trim().length
