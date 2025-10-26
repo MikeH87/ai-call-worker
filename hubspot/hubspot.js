@@ -72,7 +72,8 @@ async function getAssociationTypeId(fromType, toType) {
     const preferred =
       list.find((x) => x?.category === "HUBSPOT_DEFINED") ||
       list[0];
-    return preferred?.typeId || preferred?.id; // API uses typeId
+    // v4 uses 'typeId'
+    return preferred?.typeId || preferred?.id || null;
   } catch (e) {
     console.warn(
       `[warn] could not fetch association labels for ${fromType} -> ${toType}:`,
@@ -82,28 +83,29 @@ async function getAssociationTypeId(fromType, toType) {
   }
 }
 
-// Create a single association using v4 (with discovered typeId)
+// Create a single association using v4 (correct body-based endpoint)
 async function associateOnceV4(fromType, fromId, toType, toId) {
   const typeId = await getAssociationTypeId(fromType, toType);
   if (!typeId) {
-    throw new Error(`No association typeId for ${fromType} -> ${toType}`);
+    console.warn(`[warn] No association typeId for ${fromType} -> ${toType}`);
+    return false;
   }
-  const url = `${HS.base}/crm/v4/objects/${fromType}/${fromId}/associations/${toType}/${toId}/${typeId}`;
+
+  // Correct v4 endpoint + PUT + types payload
+  const url = `${HS.base}/crm/v4/objects/${fromType}/${fromId}/associations/${toType}/${toId}`;
+  const body = {
+    types: [{ associationCategory: "HUBSPOT_DEFINED", associationTypeId: Number(typeId) }],
+  };
+
   try {
-    await hsFetch(url, { method: "PUT" }); // v4 uses PUT to set association
+    await hsFetch(url, { method: "PUT", body: JSON.stringify(body) });
     return true;
   } catch (e) {
-    // Some portals still expect POST or return 405; try POST as fallback
-    try {
-      await hsFetch(url, { method: "POST" });
-      return true;
-    } catch (e2) {
-      console.warn(
-        `[HubSpot] v4 associate ${fromType}:${fromId} -> ${toType}:${toId} failed:`,
-        e2.message
-      );
-      return false;
-    }
+    console.warn(
+      `[HubSpot] v4 associate ${fromType}:${fromId} -> ${toType}:${toId} failed:`,
+      e.message
+    );
+    return false;
   }
 }
 
@@ -112,37 +114,34 @@ export async function updateCall(callId, analysis) {
   // Build safe, minimal properties map
   const props = {};
 
-  // Required core set (already working in your runs)
+  // Core set
   if (analysis.call_type) props["ai_inferred_call_type"] = String(analysis.call_type);
+
+  // Likelihood (map 0..100 → 1..10)
   if (typeof analysis.likelihood_to_close === "number") {
-    // also map to 1..10 scale for call-level likelihood
     const tenScale = Math.max(1, Math.min(10, Math.round(analysis.likelihood_to_close / 10)));
     props["ai_consultation_likelihood_to_close"] = String(tenScale);
   }
+
   if (analysis.outcome) props["ai_consultation_outcome"] = String(analysis.outcome);
+
+  // Product interest
   if (Array.isArray(analysis.key_details?.products_discussed)) {
     const pd = analysis.key_details.products_discussed;
     if (pd.length === 2) props["ai_product_interest"] = "Both";
     else if (pd[0]) props["ai_product_interest"] = pd[0];
   }
+
   // Decision criteria (semicolon list)
   if (analysis.ai_decision_criteria?.length) {
     props["ai_decision_criteria"] = analysis.ai_decision_criteria.join("; ");
   }
 
   // Data points captured (prebuilt compact text)
-  if (analysis.__data_points_captured_text) {
-    props["ai_data_points_captured"] = analysis.__data_points_captured_text;
-  } else {
-    props["ai_data_points_captured"] = "Not mentioned.";
-  }
+  props["ai_data_points_captured"] =
+    analysis.__data_points_captured_text || "Not mentioned.";
 
   // Missing info / Next steps
-  props["ai_missing_information"] =
-    analysis?.materials_to_send?.length || analysis?.next_actions?.length
-      ? "None requested or all provided."
-      : (analysis?.ai_missing_information || "Not mentioned.");
-
   if (analysis?.next_actions?.length) {
     props["ai_next_steps"] = analysis.next_actions.join("; ");
   } else {
@@ -156,24 +155,33 @@ export async function updateCall(callId, analysis) {
     ? analysis.objections.join(" • ")
     : "No objections";
   props["ai_primary_objection"] = analysis?.objections?.[0] || "No objection";
-  props["ai_objection_severity"] = analysis?.ai_objection_severity || "Medium"; // safe default
-  // If you have a dropdown for categories, pick one if present; else default
-  // Valid options in your portal: Price, Timing, Risk, Complexity, Authority, Clarity
+  props["ai_objection_severity"] = analysis?.ai_objection_severity || "Medium";
+  // Allowed categories in your portal: Price, Timing, Risk, Complexity, Authority, Clarity
   const allowedCategories = new Set(["Price","Timing","Risk","Complexity","Authority","Clarity"]);
   const catGuess =
     (analysis?.objections || []).find((o) =>
       ["price","cost","fee"].some((k) => o.toLowerCase().includes(k))
-    ) ? "Price" : "";
-  props["ai_objection_categories"] = allowedCategories.has(catGuess) ? catGuess : "Price";
+    ) ? "Price" : "Clarity";
+  props["ai_objection_categories"] = allowedCategories.has(catGuess) ? catGuess : "Clarity";
 
-  // Sales Performance Summary (now always written)
-  if (analysis?.sales_performance_summary) {
-    props["sales_performance_summary"] = analysis.sales_performance_summary;
-  } else {
-    props["sales_performance_summary"] = "No specific coaching available.";
+  // NEW — Sales performance & guidance on the CALL
+  props["sales_performance_summary"] =
+    analysis?.sales_performance_summary || "No specific coaching available.";
+  if (typeof analysis?.sales_performance_rating === "number") {
+    props["chat_gpt___sales_performance"] = String(analysis.sales_performance_rating);
+  }
+  if (analysis?.increase_likelihood) {
+    // Save as compact bullets
+    const bullets = Array.isArray(analysis.increase_likelihood)
+      ? analysis.increase_likelihood.join("; ")
+      : String(analysis.increase_likelihood);
+    props["chat_gpt___increase_likelihood_of_sale_suggestions"] = bullets || "No suggestions.";
+  }
+  if (analysis?.score_reasoning) {
+    props["chat_gpt___score_reasoning"] = String(analysis.score_reasoning);
   }
 
-  // Finally PATCH the Call
+  // PATCH the Call
   const url = `${HS.base}/crm/v3/objects/calls/${callId}`;
   try {
     await hsFetch(url, {
@@ -184,7 +192,7 @@ export async function updateCall(callId, analysis) {
     console.warn("[HubSpot] PATCH", url, "failed:", e.message);
   }
 
-  // Return a small projection to print in logs
+  // Log a projection to help verify
   try {
     const after = await getHubSpotObject("calls", callId, [
       "ai_inferred_call_type",
@@ -201,6 +209,9 @@ export async function updateCall(callId, analysis) {
       "ai_primary_objection",
       "sales_performance_summary",
       "ai_consultation_likelihood_to_close",
+      "chat_gpt___increase_likelihood_of_sale_suggestions",
+      "chat_gpt___sales_performance",
+      "chat_gpt___score_reasoning",
     ]);
     console.log("[debug] Call updated:", after?.properties || after);
   } catch {}
@@ -232,7 +243,7 @@ export async function createScorecard(analysis, ctx) {
       analysis?.sales_performance_summary ||
       "What went well:\n- \n\nAreas to improve:\n- ",
 
-    // Mirrored data points the reviewers want on one record
+    // Mirrors for reviewer convenience
     ai_next_steps: (analysis?.next_actions || []).join("; "),
     ai_consultation_required_materials: (analysis?.materials_to_send || []).join("; "),
     ai_decision_criteria: (analysis?.ai_decision_criteria || []).join("; "),
@@ -242,7 +253,7 @@ export async function createScorecard(analysis, ctx) {
 
     // Consult metrics (0/1)
     consult_closing_question_asked: fv(ce.commitment_requested),
-    consult_collected_dob_nin_when_agreed: fv(ce.specific_tax_estimate_given), // if you want a different mapping, say so
+    consult_collected_dob_nin_when_agreed: fv(ce.specific_tax_estimate_given), // adjust if you prefer another mapping
     consult_confirm_reason_for_zoom: fv(ce.intro),
     consult_customer_agreed_to_set_up: fv(analysis?.outcome === "Proceed now" ? 1 : ce.commitment_requested),
     consult_demo_tax_saving: fv(ce.quantified_value_roi),
@@ -263,8 +274,7 @@ export async function createScorecard(analysis, ctx) {
     consult_strong_buying_signals_detected: fv(ce.benefits_linked_to_needs),
   };
 
-  // Weighted score calculation (must match your weights in index.js)
-  // If you centralised weights elsewhere, keep them in sync.
+  // Weighted score calculation (weights sum to 10)
   const weights = {
     consult_customer_agreed_to_set_up: 2,
     consult_overcame_objection_and_closed: 1,
@@ -292,7 +302,6 @@ export async function createScorecard(analysis, ctx) {
     const v = Number(props[k]) || 0;
     weighted += v * w;
   }
-  // Clamp to 1..10 (show 1 even if 0)
   props["consult_score_final"] = Math.max(1, Math.min(10, Math.round(weighted * 10) / 10));
 
   // Create the Scorecard
