@@ -13,7 +13,22 @@ async function ensureDir(dir) {
   await fsp.mkdir(dir, { recursive: true });
 }
 
+function validateHttpUrl(u) {
+  try {
+    const url = new URL(String(u));
+    if (!/^https?:$/i.test(url.protocol)) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function downloadToFile(sourceUrl, destPath) {
+  if (!validateHttpUrl(sourceUrl)) {
+    const t = typeof sourceUrl;
+    throw Object.assign(new Error(`Invalid recording URL (${t})`), { code: "INVALID_URL", input: sourceUrl });
+  }
+
   const res = await fetch(sourceUrl);
   if (!res.ok) {
     const text = await res.text().catch(() => "");
@@ -21,7 +36,6 @@ async function downloadToFile(sourceUrl, destPath) {
   }
   await ensureDir(path.dirname(destPath));
 
-  // stream to file
   await new Promise((resolve, reject) => {
     const file = fs.createWriteStream(destPath);
     res.body.pipe(file);
@@ -30,7 +44,6 @@ async function downloadToFile(sourceUrl, destPath) {
     file.on("error", reject);
   });
 
-  // sanity check
   const stat = await fsp.stat(destPath).catch(() => null);
   if (!stat || stat.size < 1024) {
     throw new Error(`Downloaded file too small or missing: ${destPath}`);
@@ -47,41 +60,30 @@ function ffprobePromise(filePath) {
   });
 }
 
-// Stub: your real Whisper chunking/transcription should replace this.
-// Here we just return a dummy string to keep the pipeline running.
+// TODO: replace this stub with your real Whisper parallel chunking
 async function transcribeSegmentsMock(filePath) {
-  // Replace with your real parallel Whisper logic using segmentSeconds/concurrency.
   return "Transcription placeholder (replace with Whisper output).";
 }
 
-/**
- * Main entry:
- * - Ensures dest dir
- * - Downloads MP3 from sourceUrl -> destPath
- * - ffprobe to confirm media
- * - Runs (your) parallel transcription & returns final transcript string
- */
 export async function transcribeAudioParallel(destPath, callId, opts = {}) {
-  const { sourceUrl, segmentSeconds = 120, concurrency = 4 } = opts;
+  const { sourceUrl } = opts;
+  const segmentSeconds = Number(opts.segmentSeconds) || 120;
+  const concurrency = Number(opts.concurrency) || 4;
 
   if (!sourceUrl) {
     throw new Error("transcribeAudioParallel: sourceUrl is required");
   }
 
-  // Download first
   await downloadToFile(sourceUrl, destPath);
 
-  // Probe to confirm we have audio
   try {
     await ffprobePromise(destPath);
   } catch (err) {
     throw new Error(`ffprobe failed for ${destPath}: ${err.message || err}`);
   }
 
-  // TODO: replace mock with your real chunking Whisper implementation
   const transcript = await transcribeSegmentsMock(destPath);
 
-  // Guard: if the transcript is obviously empty (e.g., blank recording), bail early
   const trimmed = (transcript || "").trim();
   if (!trimmed || trimmed.length < 10) {
     const msg = "Transcript appears empty/meaningless — skipping AI analysis.";

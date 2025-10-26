@@ -20,40 +20,86 @@ app.get("/env-check", (req, res) => {
   const keys = Object.keys(process.env).filter(k => k.toUpperCase().startsWith("HUBSPOT")).sort();
   const hasAccess = !!process.env.HUBSPOT_ACCESS_TOKEN;
   const hasPrivate = !!process.env.HUBSPOT_PRIVATE_APP_TOKEN;
-  const tokenSource = hasAccess ? "HUBSPOT_ACCESS_TOKEN" : (hasPrivate ? "HUBSPOT_PRIVATE_APP_TOKEN" : (process.env.HUBSPOT_TOKEN ? "HUBSPOT_TOKEN" : "NONE"));
-  res.json({ ok: true, tokenSource, hasHubSpotToken: hasAccess || hasPrivate || !!process.env.HUBSPOT_TOKEN, seenHubSpotEnvKeys: keys, node: process.version, now: Date.now() });
+  const hasLegacy = !!process.env.HUBSPOT_TOKEN;
+  const tokenSource = hasAccess ? "HUBSPOT_ACCESS_TOKEN" : (hasPrivate ? "HUBSPOT_PRIVATE_APP_TOKEN" : (hasLegacy ? "HUBSPOT_TOKEN" : "NONE"));
+  res.json({ ok: true, tokenSource, hasHubSpotToken: hasAccess || hasPrivate || hasLegacy, seenHubSpotEnvKeys: keys, node: process.version, now: Date.now() });
 });
 
-// Helper: robust extractor for HubSpot webhook shapes
+// ----- helpers: safe extraction & URL coercion -----
+function getPath(obj, path) {
+  return path.split(".").reduce((a, k) => (a && a[k] != null ? a[k] : undefined), obj);
+}
+function firstDefined(...vals) {
+  for (const v of vals) {
+    if (v !== undefined && v !== null) return v;
+  }
+  return undefined;
+}
+function urlify(val) {
+  if (!val) return "";
+  if (Array.isArray(val)) return urlify(val[0]);
+  if (typeof val === "object") {
+    // Common shapes: { url }, { href }, { link }, { value }, nested arrays, etc.
+    return urlify(val.url || val.href || val.link || val.value || val.src || val.source || val.toString?.());
+  }
+  const s = String(val).trim();
+  return /^https?:\/\//i.test(s) ? s : "";
+}
+function idify(val) {
+  if (!val) return "";
+  if (Array.isArray(val)) return idify(val[0]);
+  if (typeof val === "object") return idify(val.id || val.hs_object_id || val.value || val.toString?.());
+  const s = String(val).trim();
+  // Must be non-empty and mostly digits (but allow string ids from tests)
+  return s.length ? s : "";
+}
+
 function extractFromWebhook(body = {}) {
   const b = body || {};
-  // Common locations
   const input = b.inputFields || {};
-  const props = b.properties || b.objectProperties || {};
-  // Candidates for call id
-  const candidatesId = [
-    b.callId, b.objectId, b.id, b.hs_object_id,
-    input.hs_object_id, input.objectId,
-    props.hs_object_id
-  ].filter(Boolean);
+  const props = b.properties || b.objectProperties || b.object?.properties || {};
 
-  // Candidates for recordingUrl
-  const candidatesUrl = [
+  // Try lots of shapes for call id
+  const callId = idify(firstDefined(
+    b.callId, b.objectId, b.id, b.hs_object_id,
+    input.hs_object_id, input.objectId, input.id,
+    props.hs_object_id,
+    getPath(b, "object.id")
+  ));
+
+  // Try lots of shapes for recording URL
+  const recordingUrl = urlify(firstDefined(
     b.recordingUrl,
     input.recordingUrl,
     props.hs_call_video_recording_url,
     props.hs_call_recording_url,
     input.hs_call_video_recording_url,
-    input.hs_call_recording_url
-  ].filter(Boolean);
+    input.hs_call_recording_url,
+    // Super-defensive: sometimes nested objects/arrays inside input/properties
+    getPath(b, "recording.url"),
+    getPath(b, "properties.recordingUrl"),
+    getPath(b, "inputFields.recording.url")
+  ));
 
-  const callId = String(candidatesId[0] || "").trim();
-  const recordingUrl = String(candidatesUrl[0] || "").trim();
+  const candidatesId = [
+    b.callId, b.objectId, b.id, b.hs_object_id,
+    input.hs_object_id, input.objectId, input.id,
+    props.hs_object_id, getPath(b, "object.id")
+  ].filter(v => v !== undefined);
+
+  const candidatesUrl = [
+    b.recordingUrl, input.recordingUrl,
+    props.hs_call_video_recording_url, props.hs_call_recording_url,
+    input.hs_call_video_recording_url, input.hs_call_recording_url,
+    getPath(b, "recording.url"),
+    getPath(b, "properties.recordingUrl"),
+    getPath(b, "inputFields.recording.url")
+  ].filter(v => v !== undefined);
 
   return { callId, recordingUrl, seen: { candidatesId, candidatesUrl } };
 }
 
-// Optional: check a call’s recording URL using the configured token
+// Optional: debug call recording props
 app.get("/debug/call-recording", async (req, res) => {
   try {
     const { callId } = req.query;
@@ -83,16 +129,16 @@ app.post("/process-call", async (req, res) => {
     // 1) Parse webhook
     let { callId, recordingUrl, chunkSeconds, concurrency } = req.body || {};
     const parsed = extractFromWebhook(req.body);
-    callId = String(callId || parsed.callId || "").trim();
-    recordingUrl = String(recordingUrl || parsed.recordingUrl || "").trim();
+    callId = idify(callId) || parsed.callId;
+    recordingUrl = urlify(recordingUrl) || parsed.recordingUrl;
 
-    // Log what we saw
     if (!callId || !recordingUrl) {
       console.log("[webhook] raw keys:", Object.keys(req.body || {}));
-      console.log("[webhook] parsed candidates:", parsed.seen);
+      console.log("[webhook] parsed candidates (IDs):", parsed.seen.candidatesId);
+      console.log("[webhook] parsed candidates (URLs):", parsed.seen.candidatesUrl);
     }
 
-    // 2) If recordingUrl not provided, try to fetch from HubSpot
+    // 2) If URL still missing but we have callId, fetch from HubSpot
     if (callId && !recordingUrl) {
       console.log("[info] recordingUrl missing — fetching from HubSpot Call…");
       try {
@@ -102,9 +148,8 @@ app.post("/process-call", async (req, res) => {
           "hs_call_recording_duration",
           "hs_call_status"
         ]);
-        recordingUrl = call?.properties?.hs_call_video_recording_url
-          || call?.properties?.hs_call_recording_url
-          || null;
+        const p = call?.properties || {};
+        recordingUrl = urlify(p.hs_call_video_recording_url) || urlify(p.hs_call_recording_url) || "";
         if (recordingUrl) console.log("[info] Found recording URL on Call.");
       } catch (err) {
         console.warn("[warn] Could not fetch call to find recording URL:", err.message);
@@ -137,6 +182,7 @@ app.post("/process-call", async (req, res) => {
         console.warn("[bg] Empty/blank recording detected — skipping AI analysis to save tokens.");
         return;
       }
+      console.error("[bg] Transcription error:", err.message || err);
       throw err;
     }
 
