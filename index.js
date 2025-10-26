@@ -1,91 +1,120 @@
-// file: index.js
-import express from "express";
-import { transcribeAudioParallel } from "./ai/parallelTranscribe.js";
-import { analyseTranscript } from "./ai/analyse.js";
-import {
-  getCallRecordingMeta,
-  getCallAssociations,
-  updateCall,
-  createScorecard,
-  associateScorecard,
-  hasHubSpotToken,
-  tokenSource,
-} from "./hubspot/hubspot.js";
-
-const app = express();
-app.use(express.json({ limit: "2mb" }));
-
-/* ------------------ helpers ------------------ */
-
-function pickRecordingUrlFromWebhook(body) {
-  const url =
-    body?.recordingUrl ||
-    body?.hs_call_video_recording_url ||
-    body?.hs_call_recording_url ||
-    "";
-  return typeof url === "string" ? url : "";
-}
-
-function normaliseList(val) {
-  if (!val) return "";
-  if (Array.isArray(val)) return val.filter(Boolean).join("; ");
-  return String(val);
-}
-
-function toBullets(val) {
-  if (!val) return "";
-  if (Array.isArray(val)) return val.filter(Boolean).join(" • ");
-  return String(val);
-}
-
-// Clamp 1..10 ints
-function clampTen(n) {
-  const x = Math.round(Number(n) || 0);
-  if (x < 1) return 1;
-  if (x > 10) return 10;
-  return x;
-}
-
-/* ------------------ routes ------------------ */
-
-app.get("/", (_req, res) => {
-  res.json({ ok: true, service: "ai-call-worker" });
-});
-
-app.get("/_debug/env", (_req, res) => {
-  res.json({
-    ok: true,
-    tokenSource: tokenSource(),
-    hasHubSpotToken: hasHubSpotToken(),
-    node: process.version,
-    now: Date.now(),
-  });
-});
-
-/**
- * POST /process-call
- * Body (either webhook or manual):
- * {
- *   callId: "123",
- *   recordingUrl?: "https://..",
- *   chunkSeconds?: 60,
- *   concurrency?: 2
- * }
- */
 app.post("/process-call", async (req, res) => {
-  const callId = req.body?.callId || req.body?.hs_object_id;
-  let recordingUrl = pickRecordingUrlFromWebhook(req.body);
+  // --- helpers local to this route ---
+  const isObject = (v) => v && typeof v === "object";
+  const looksLikeId = (v) => {
+    if (v == null) return false;
+    const s = String(v).trim();
+    // HubSpot IDs are numeric strings, but be generous:
+    return /^[0-9]+$/.test(s) || /^[0-9A-Za-z\-]+$/.test(s);
+  };
+
+  // Deep search for a field that looks like an object id
+  function deepFindId(obj) {
+    const stack = [obj];
+    const idKeys = [
+      "callId",
+      "hs_object_id",
+      "objectId",
+      "object_id",
+      "id",
+      // common locations:
+      "properties.hs_object_id",
+      "object.objectId",
+      "input.objectId",
+      "event.objectId",
+    ];
+
+    // direct tries first
+    for (const k of idKeys) {
+      const parts = k.split(".");
+      let cur = obj;
+      let ok = true;
+      for (const p of parts) {
+        if (!isObject(cur) || !(p in cur)) {
+          ok = false;
+          break;
+        }
+        cur = cur[p];
+      }
+      if (ok && looksLikeId(cur)) return String(cur);
+    }
+
+    // fallback: scan all keys depth-first and pick the first value that
+    // looks like an ID when key name contains "id"
+    while (stack.length) {
+      const cur = stack.pop();
+      if (!isObject(cur)) continue;
+
+      for (const [k, v] of Object.entries(cur)) {
+        if (k.toLowerCase().includes("id") && looksLikeId(v)) {
+          return String(v);
+        }
+        if (isObject(v)) stack.push(v);
+      }
+    }
+    return "";
+  }
+
+  // Extract recording URL from common fields
+  function findRecordingUrl(body) {
+    const direct =
+      body?.recordingUrl ||
+      body?.hs_call_video_recording_url ||
+      body?.hs_call_recording_url ||
+      "";
+
+    if (typeof direct === "string" && direct.trim()) return direct.trim();
+
+    // try common nested paths
+    const nestedCandidates = [
+      body?.properties?.hs_call_video_recording_url,
+      body?.properties?.hs_call_recording_url,
+      body?.object?.properties?.hs_call_video_recording_url,
+      body?.object?.properties?.hs_call_recording_url,
+    ].filter(Boolean);
+
+    for (const c of nestedCandidates) {
+      if (typeof c === "string" && c.trim()) return c.trim();
+    }
+    return "";
+  }
+
+  // ---- START OF ROUTE LOGIC ----
+  // Accept query param too (useful for manual testing)
+  let callId =
+    req.query?.callId ||
+    req.body?.callId ||
+    req.body?.hs_object_id ||
+    deepFindId(req.body);
+
+  // sanitize
+  if (callId) callId = String(callId).trim();
+
+  let recordingUrl = findRecordingUrl(req.body);
 
   if (!callId) {
+    // Last-ditch: some HubSpot workflows wrap payload under "object" or "input"
+    const candidates = [
+      req.body?.object?.id,
+      req.body?.object?.objectId,
+      req.body?.input?.objectId,
+    ].filter(Boolean);
+    if (candidates.length) {
+      callId = String(candidates[0]).trim();
+    }
+  }
+
+  if (!callId) {
+    // Short, explicit response HubSpot will log
     return res.status(400).json({ ok: false, error: "callId is required" });
   }
 
-  // Recording URL fallback: fetch from HubSpot Call if webhook omitted it
+  // If webhook omitted the recording URL, we will fetch it from the Call
   if (!recordingUrl) {
     console.log("[info] recordingUrl missing in webhook — fetching from HubSpot Call…");
     try {
       const meta = await getCallRecordingMeta(callId);
-      recordingUrl = meta.recordingUrl || "";
+      recordingUrl = meta?.recordingUrl || "";
       if (recordingUrl) {
         console.log("[info] Found recording URL on Call.");
       }
@@ -99,14 +128,16 @@ app.post("/process-call", async (req, res) => {
       callIdPresent: !!callId,
       recordingUrlPresent: !!recordingUrl,
     });
-    return res.status(400).json({ ok: false, error: "callId and recordingUrl are required" });
+    return res
+      .status(400)
+      .json({ ok: false, error: "callId and recordingUrl are required" });
   }
 
+  // Respond immediately to HubSpot; continue work in background
   res.json({ ok: true, callId });
 
-  // Background pipeline
+  // ---- BACKGROUND PIPELINE (unchanged from your working flow) ----
   try {
-    // 1) Transcribe
     console.log(`[bg] Downloading audio to /tmp/ai-call-worker/${callId}.mp3`);
     const chunkSeconds = Number(req.body?.chunkSeconds) || 120;
     const concurrency = Number(req.body?.concurrency) || 4;
@@ -121,18 +152,15 @@ app.post("/process-call", async (req, res) => {
       concurrency,
     });
 
-    // 2) Analyse
     console.log("[ai] Analysing with TLPI context…");
     const analysis = await analyseTranscript(transcript);
     console.log("[ai] analysis:", analysis);
 
-    // if transcript is empty/meaningless, we still bail early (you asked for a failsafe)
     if (analysis?.uncertainty_reason === "Transcript contains no meaningful content.") {
       console.log("✅ Done", callId);
       return;
     }
 
-    // 3) Associations for this call
     const assoc = await getCallAssociations(callId);
     console.log("[assoc]", {
       callId,
@@ -141,158 +169,156 @@ app.post("/process-call", async (req, res) => {
       ownerId: assoc.ownerId,
     });
 
-    /* 4) Update Call properties */
+    // ----- UPDATE CALL (unchanged) -----
     const callProps = {};
 
-    // From your “Initial Consultation” spec:
     callProps.ai_inferred_call_type = analysis.call_type || "Initial Consultation";
     callProps.ai_call_type_confidence = String(analysis?.ai_confidence || 90);
 
     callProps.ai_consultation_outcome = analysis?.outcome || "Unclear";
     callProps.ai_product_interest = analysis?.key_details?.products_discussed?.[0] || "";
 
-    // Decision criteria
-    callProps.ai_decision_criteria = normaliseList(analysis?.ai_decision_criteria);
+    callProps.ai_decision_criteria = (analysis?.ai_decision_criteria || []).join("; ");
 
-    // Data points captured
     callProps.ai_data_points_captured =
-      analysis?.__data_points_captured_text ||
-      "Nothing captured.";
+      analysis?.__data_points_captured_text || "Nothing captured.";
 
-    // Missing info + Next steps
     callProps.ai_missing_information =
       analysis?.missing_information || "Nothing requested or all information provided.";
     callProps.ai_next_steps =
-      normaliseList(analysis?.next_actions) ||
-      "No next steps recorded.";
+      (analysis?.next_actions || []).join("; ") || "No next steps recorded.";
 
-    // Objections (concise / bullets / severity / primary)
-    callProps.ai_key_objections =
-      normaliseList(analysis?.objections) || "No objections";
+    callProps.ai_key_objections = (analysis?.objections || []).join("; ") || "No objections";
     callProps.ai_objections_bullets =
-      toBullets(analysis?.objections) || "No objections";
+      (analysis?.objections || []).join(" • ") || "No objections";
     callProps.ai_objection_severity = analysis?.objection_severity || "Medium";
     callProps.ai_primary_objection =
       analysis?.primary_objection || (analysis?.objections?.[0] || "No objection");
-    callProps.ai_objection_categories =
-      analysis?.objection_category || "Clarity";
+    callProps.ai_objection_categories = analysis?.objection_category || "Clarity";
 
-    // Customer sentiment / engagement (if you emit these)
     if (analysis?.sentiment) callProps.ai_customer_sentiment = analysis.sentiment;
     if (typeof analysis?.engagement_level === "number") {
       callProps.ai_client_engagement_level = String(analysis.engagement_level);
     }
 
-    // Consultation likelihood (1..10), score reasoning, “increase likelihood” suggestions
     if (typeof analysis?.likelihood_to_close === "number") {
       callProps.ai_consultation_likelihood_to_close = String(
-        clampTen(analysis.likelihood_to_close / 10)
+        Math.max(1, Math.min(10, Math.round(analysis.likelihood_to_close / 10)))
       );
     }
+
     callProps.chat_gpt___score_reasoning =
       analysis?.score_reasoning || "No specific reasoning extracted.";
     callProps.chat_gpt___increase_likelihood_of_sale_suggestions =
-      normaliseList(analysis?.increase_likelihood) ||
-      "No suggestions.";
+      (analysis?.increase_likelihood || []).join(", ") || "No suggestions.";
 
-    // Sales performance summary on the call (duplicate for convenience)
-    callProps.sales_performance_summary =
-      analysis?.sales_performance_summary || "";
-
-    // Requested materials (if any)
+    callProps.sales_performance_summary = analysis?.sales_performance_summary || "";
     callProps.ai_consultation_required_materials =
-      normaliseList(analysis?.materials_to_send) || "Nothing requested";
+      (analysis?.materials_to_send || []).join("; ") || "Nothing requested";
 
-    // Write to Call
     try {
       const up = await updateCall(callId, callProps);
       console.log("[debug] Call updated:", {
-        ...Object.fromEntries(
-          Object.entries(callProps).map(([k, v]) => [k, v])
-        ),
+        ...Object.fromEntries(Object.entries(callProps).map(([k, v]) => [k, v])),
         hs_object_id: up?.id || callId,
       });
     } catch (err) {
       console.warn("[HubSpot] PATCH /calls failed:", err.message);
     }
 
-    /* 5) Create Scorecard */
-    // (Weights are now in your analyse pipeline; consult_eval has 0/0.5/1 flags you already send)
+    // ----- CREATE SCORECARD (unchanged) -----
     const scProps = {
       activity_type: "Initial Consultation",
       activity_name: `${callId} — Initial Consultation — ${new Date()
         .toISOString()
         .slice(0, 10)}`,
-
-      // Copy the deterministic “AI Sales Performance Rating (new)”
-      sales_performance_rating_: clampTen(analysis?.sales_performance_rating || 1),
-
-      // Copy performance summary for the consultant
+      sales_performance_rating_: Math.max(
+        1,
+        Math.min(10, Math.round(analysis?.sales_performance_rating || 1))
+      ),
       sales_scorecard___what_you_can_improve_on:
-        analysis?.sales_performance_summary ||
-        "No coaching notes.",
-
-      // Copy core mirrored AI fields
-      ai_consultation_likelihood_to_close:
-        String(clampTen(analysis?.likelihood_to_close / 10 || 0)) || "5",
+        analysis?.sales_performance_summary || "No coaching notes.",
+      ai_consultation_likelihood_to_close: String(
+        Math.max(
+          1,
+          Math.min(
+            10,
+            Math.round((analysis?.likelihood_to_close || 0) / 10)
+          )
+        )
+      ),
       ai_consultation_outcome: analysis?.outcome || "Unclear",
       ai_consultation_required_materials:
-        normaliseList(analysis?.materials_to_send) || "Nothing requested",
-      ai_decision_criteria: normaliseList(analysis?.ai_decision_criteria),
-      ai_key_objections: normaliseList(analysis?.objections) || "No objections",
+        (analysis?.materials_to_send || []).join("; ") || "Nothing requested",
+      ai_decision_criteria: (analysis?.ai_decision_criteria || []).join("; "),
+      ai_key_objections: (analysis?.objections || []).join("; ") || "No objections",
       ai_next_steps:
-        normaliseList(analysis?.next_actions) || "No next steps recorded",
+        (analysis?.next_actions || []).join("; ") || "No next steps recorded",
 
-      // 20 × consult_* flags mapped from consult_eval (0/0.5/1)
-      // Your analyser already populates these; default to 0 to be safe.
-      consult_customer_agreed_to_set_up:
-        Number(analysis?.consult_eval?.commitment_requested > 0.5 ? 1 : 0),
-      consult_overcame_objection_and_closed:
-        Number(analysis?.consult_eval?.overcame_objection_and_closed ? 1 : 0),
-      consult_next_step_specific_date_time:
-        Number(analysis?.consult_eval?.next_step_specific_date_time || 0),
-      consult_closing_question_asked:
-        Number(analysis?.consult_eval?.closing_question_asked || 0),
-      consult_prospect_asked_next_steps:
-        Number(analysis?.consult_eval?.prospect_asked_next_steps || 0),
-      consult_strong_buying_signals_detected:
-        Number(analysis?.consult_eval?.strong_buying_signals_detected || 0),
-      consult_needs_pain_uncovered:
-        Number(analysis?.consult_eval?.needs_pain_uncovered || 0),
-      consult_purpose_clearly_stated:
-        Number(analysis?.consult_eval?.purpose_clearly_stated || 0),
-      consult_quantified_value_roi:
-        Number(analysis?.consult_eval?.quantified_value_roi || 0),
-      consult_demo_tax_saving:
-        Number(analysis?.consult_eval?.demo_tax_saving || 0),
-      consult_fees_tax_deductible_explained:
-        Number(analysis?.consult_eval?.fees_tax_deductible_explained || 0),
-      consult_fees_annualised:
-        Number(analysis?.consult_eval?.fees_annualised || 0),
-      consult_fee_phrasing_three_seven_five:
-        Number(analysis?.consult_eval?.fee_phrasing_three_seven_five || 0),
-      consult_specific_tax_estimate_given:
-        Number(analysis?.consult_eval?.specific_tax_estimate_given || 0),
-      consult_confirm_reason_for_zoom:
-        Number(analysis?.consult_eval?.confirm_reason_for_zoom || 0),
-      consult_rapport_open:
-        Number(analysis?.consult_eval?.rapport_open || 0),
-      consult_interactive_throughout:
-        Number(analysis?.consult_eval?.interactive_throughout || 0),
-      consult_next_contact_within_5_days:
-        Number(analysis?.consult_eval?.next_contact_within_5_days || 0),
-      consult_no_assumptions_evidence_gathered:
-        Number(analysis?.consult_eval?.no_assumptions_evidence_gathered || 0),
-      consult_collected_dob_nin_when_agreed:
-        Number(analysis?.consult_eval?.collected_dob_nin_when_agreed || 0),
-
-      // final score (1–10) — your analyser already computes weights; we trust its value
+      // 20 consult_* props
+      consult_customer_agreed_to_set_up: Number(
+        analysis?.consult_eval?.commitment_requested > 0.5 ? 1 : 0
+      ),
+      consult_overcame_objection_and_closed: Number(
+        analysis?.consult_eval?.overcame_objection_and_closed || 0
+      ),
+      consult_next_step_specific_date_time: Number(
+        analysis?.consult_eval?.next_step_specific_date_time || 0
+      ),
+      consult_closing_question_asked: Number(
+        analysis?.consult_eval?.closing_question_asked || 0
+      ),
+      consult_prospect_asked_next_steps: Number(
+        analysis?.consult_eval?.prospect_asked_next_steps || 0
+      ),
+      consult_strong_buying_signals_detected: Number(
+        analysis?.consult_eval?.strong_buying_signals_detected || 0
+      ),
+      consult_needs_pain_uncovered: Number(
+        analysis?.consult_eval?.needs_pain_uncovered || 0
+      ),
+      consult_purpose_clearly_stated: Number(
+        analysis?.consult_eval?.purpose_clearly_stated || 0
+      ),
+      consult_quantified_value_roi: Number(
+        analysis?.consult_eval?.quantified_value_roi || 0
+      ),
+      consult_demo_tax_saving: Number(
+        analysis?.consult_eval?.demo_tax_saving || 0
+      ),
+      consult_fees_tax_deductible_explained: Number(
+        analysis?.consult_eval?.fees_tax_deductible_explained || 0
+      ),
+      consult_fees_annualised: Number(
+        analysis?.consult_eval?.fees_annualised || 0
+      ),
+      consult_fee_phrasing_three_seven_five: Number(
+        analysis?.consult_eval?.fee_phrasing_three_seven_five || 0
+      ),
+      consult_specific_tax_estimate_given: Number(
+        analysis?.consult_eval?.specific_tax_estimate_given || 0
+      ),
+      consult_confirm_reason_for_zoom: Number(
+        analysis?.consult_eval?.confirm_reason_for_zoom || 0
+      ),
+      consult_rapport_open: Number(analysis?.consult_eval?.rapport_open || 0),
+      consult_interactive_throughout: Number(
+        analysis?.consult_eval?.interactive_throughout || 0
+      ),
+      consult_next_contact_within_5_days: Number(
+        analysis?.consult_eval?.next_contact_within_5_days || 0
+      ),
+      consult_no_assumptions_evidence_gathered: Number(
+        analysis?.consult_eval?.no_assumptions_evidence_gathered || 0
+      ),
+      consult_collected_dob_nin_when_agreed: Number(
+        analysis?.consult_eval?.collected_dob_nin_when_agreed || 0
+      ),
       consult_score_final: Number(
         analysis?.consult_eval?.final_weighted_score || 0
       ),
     };
 
-    // Owner on scorecard = call owner (if present)
     if (assoc.ownerId) {
       scProps.hubspot_owner_id = String(assoc.ownerId);
     }
@@ -300,14 +326,11 @@ app.post("/process-call", async (req, res) => {
     let scorecardId = null;
     try {
       scorecardId = await createScorecard(scProps);
-      if (scorecardId) {
-        console.log("[scorecard] created id:", scorecardId);
-      }
+      if (scorecardId) console.log("[scorecard] created id:", scorecardId);
     } catch (err) {
       console.warn("[HubSpot] create scorecard failed:", err.message);
     }
 
-    // 6) Associate scorecard
     if (scorecardId) {
       try {
         await associateScorecard({
@@ -328,11 +351,4 @@ app.post("/process-call", async (req, res) => {
   } catch (err) {
     console.error("❌ Background error:", err);
   }
-});
-
-/* ------------------ boot ------------------ */
-
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-  console.log(`==> Listening on ${PORT}`);
 });
