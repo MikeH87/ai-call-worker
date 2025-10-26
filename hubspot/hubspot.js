@@ -6,9 +6,19 @@ dotenv.config();
 
 const HUBSPOT_BASE = "https://api.hubapi.com";
 const HS = process.env.HUBSPOT_ACCESS_TOKEN || process.env.HUBSPOT_PRIVATE_APP_TOKEN;
+const HS_SRC = process.env.HUBSPOT_ACCESS_TOKEN ? "HUBSPOT_ACCESS_TOKEN"
+             : (process.env.HUBSPOT_PRIVATE_APP_TOKEN ? "HUBSPOT_PRIVATE_APP_TOKEN" : "NONE");
+console.log(`[hs] token source: ${HS_SRC}`);
+
+function assertToken() {
+  if (!HS) {
+    throw new Error("HubSpot token missing: set HUBSPOT_ACCESS_TOKEN or HUBSPOT_PRIVATE_APP_TOKEN in Render.");
+  }
+}
 
 // ------------------------- helpers -------------------------
 function hsHeaders() {
+  assertToken();
   return {
     "Authorization": `Bearer ${HS}`,
     "Content-Type": "application/json",
@@ -72,7 +82,6 @@ export async function getHubSpotObject(objectType, id, properties = []) {
 }
 
 export async function getAssociations(id, toType) {
-  // calls -> contacts/deals associations
   const url = `${HUBSPOT_BASE}/crm/v4/objects/calls/${id}/associations/${toType}`;
   try {
     const js = await hsGet(url);
@@ -84,15 +93,10 @@ export async function getAssociations(id, toType) {
   }
 }
 
-/**
- * Update a Call with AI fields (only those we’re certain about).
- * Uses your “Initial Consultation” set.
- */
 export async function updateCall(callId, analysis) {
   const outcomeAllowed = ["Proceed now", "Likely", "Unclear", "Not now", "No fit"];
   const severities = ["Low", "Medium", "High"];
 
-  // Compose call props safely
   const props = {
     ai_inferred_call_type: "Initial Consultation",
     ai_call_type_confidence: analysis?.likelihood_to_close != null ? String(analysis.likelihood_to_close) : "90",
@@ -111,13 +115,12 @@ export async function updateCall(callId, analysis) {
     ai_primary_objection: nonEmptyText(analysis?.primary_objection, Array.isArray(analysis?.objections) && analysis.objections.length ? analysis.objections[0] : "No objection"),
     ai_consultation_required_materials: joinList(analysis?.materials_to_send),
     chat_gpt___likliness_to_proceed_score: (typeof analysis?.likelihood_to_close === "number")
-      ? String(Math.round((analysis.likelihood_to_close / 10)))  // 0..100 -> 0..10
+      ? String(Math.round((analysis.likelihood_to_close / 10)))
       : null,
     chat_gpt___score_reasoning: nonEmptyText(analysis?.score_reasoning, ""),
     chat_gpt___increase_likelihood_of_sale_suggestions: nonEmptyText(analysis?.increase_likelihood, ""),
   };
 
-  // Drop unknown/empty keys:
   const clean = Object.fromEntries(Object.entries(props).filter(([_, v]) => v !== null && v !== undefined && v !== ""));
 
   try {
@@ -127,7 +130,6 @@ export async function updateCall(callId, analysis) {
     console.warn(`[HubSpot] PATCH https://api.hubapi.com/crm/v3/objects/calls/${callId} failed: ${e.message}`);
   }
 
-  // Debug readback (safe subset)
   try {
     const debug = await getHubSpotObject("calls", callId, [
       "ai_inferred_call_type",
@@ -150,31 +152,24 @@ export async function updateCall(callId, analysis) {
   } catch { /* ignore */ }
 }
 
-/**
- * Create a Sales Scorecard and associate it with Call, Contact(s), Deal(s).
- * Owner is copied from the original Call (if provided in assoc.ownerId).
- */
 export async function createScorecard(analysis, assoc) {
   const objectType = "p49487487_sales_scorecards";
   const props = {};
 
-  // Activity identity
   props.activity_type = "Initial Consultation";
   props.activity_name = `${assoc.callId} — Initial Consultation — ${new Date().toISOString().slice(0,10)}`;
 
-  // Sales performance (use model output; no missing helper calls!)
   if (typeof analysis?.sales_performance_rating === "number") {
-    props.sales_performance_rating_ = analysis.sales_performance_rating; // numeric field
-    props.sales_performance_rating = String(analysis.sales_performance_rating); // text mirror if you keep it
+    props.sales_performance_rating_ = analysis.sales_performance_rating;
+    props.sales_performance_rating = String(analysis.sales_performance_rating);
   }
   if (analysis?.sales_performance_summary) {
     props.sales_scorecard___what_you_can_improve_on = analysis.sales_performance_summary;
   }
 
-  // Consultation behaviour flags (0/1 as numbers)
   const ce = analysis?.consult_eval || {};
   const to01 = v => (v === 1 || v === 0.5) ? 1 : (v === 0 ? 0 : (Number(v) > 0 ? 1 : 0));
-  // Map every consult_* known property present in your portal:
+
   props.consult_customer_agreed_to_set_up = to01(ce.commitment_requested || ce.next_steps_confirmed) || 0;
   props.consult_overcame_objection_and_closed = to01(ce.clear_responses_or_followup) || 0;
   props.consult_next_step_specific_date_time = to01(ce.next_step_specific_date_time) || 0;
@@ -196,7 +191,6 @@ export async function createScorecard(analysis, assoc) {
   props.consult_no_assumptions_evidence_gathered = to01(ce.active_listening) || 0;
   props.consult_collected_dob_nin_when_agreed = to01(ce.open_question) || 0;
 
-  // Weighted sum -> consult_score_final (max 10)
   const weights = {
     consult_customer_agreed_to_set_up: 2.0,
     consult_overcame_objection_and_closed: 1.0,
@@ -228,11 +222,10 @@ export async function createScorecard(analysis, assoc) {
     flagsDebug.push({ k, w, v, p });
     weighted += p;
   }
-  props.consult_score_final = Math.round(weighted * 10) / 10; // one decimal
+  props.consult_score_final = Math.round(weighted * 10) / 10;
   console.log("[scorecard] consult flags:", flagsDebug);
   console.log("[scorecard] weighted raw:", weighted);
 
-  // Copy-through fields from Call-level AI
   props.ai_consultation_likelihood_to_close = (typeof analysis?.likelihood_to_close === "number")
     ? String(Math.round(analysis.likelihood_to_close / 10))
     : null;
@@ -242,10 +235,8 @@ export async function createScorecard(analysis, assoc) {
   props.ai_key_objections = joinList(analysis?.objections);
   props.ai_next_steps = joinList(analysis?.next_actions);
 
-  // Copy owner from Call if provided
   if (assoc?.ownerId) props.hubspot_owner_id = String(assoc.ownerId);
 
-  // Create the scorecard
   let createdId = null;
   try {
     const url = `${HUBSPOT_BASE}/crm/v3/objects/${objectType}`;
@@ -259,10 +250,9 @@ export async function createScorecard(analysis, assoc) {
     return null;
   }
 
-  // Associations (v4) — scorecard -> call/contact/deal
   async function assocOne(fromType, fromId, toType, toId) {
     const url = `${HUBSPOT_BASE}/crm/v4/objects/${fromType}/${fromId}/associations/${toType}/${toId}`;
-    const body = [{ associationCategory: "HUBSPOT_DEFINED", associationTypeId: 398 }]; // generic "Associated with"
+    const body = [{ associationCategory: "HUBSPOT_DEFINED", associationTypeId: 398 }];
     try {
       await hsPost(url, body);
     } catch (e) {
