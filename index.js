@@ -16,8 +16,11 @@ app.get("/", (req, res) => {
   res.send("AI Call Worker v4.x modular running ✅");
 });
 
-// NEW: quick env visibility (no secrets shown)
+// Enhanced env check: shows which HUBSPOT* keys exist (names only, never values)
 app.get("/env-check", (req, res) => {
+  const keys = Object.keys(process.env)
+    .filter(k => k.toUpperCase().startsWith("HUBSPOT"))
+    .sort();
   const hasAccess = !!process.env.HUBSPOT_ACCESS_TOKEN;
   const hasPrivate = !!process.env.HUBSPOT_PRIVATE_APP_TOKEN;
   const tokenSource = hasAccess ? "HUBSPOT_ACCESS_TOKEN" : (hasPrivate ? "HUBSPOT_PRIVATE_APP_TOKEN" : "NONE");
@@ -25,6 +28,7 @@ app.get("/env-check", (req, res) => {
     ok: true,
     tokenSource,
     hasHubSpotToken: hasAccess || hasPrivate,
+    seenHubSpotEnvKeys: keys, // names only
     node: process.version,
     now: Date.now()
   });
@@ -88,7 +92,6 @@ app.post("/process-call", async (req, res) => {
 
     const dest = `/tmp/ai-call-worker/${callId}.mp3`;
     console.log(`[bg] Downloading audio to ${dest}`);
-    // transcribeAudioParallel downloads internally from recordingUrl -> dest
     const transcript = await transcribeAudioParallel(dest, callId, {
       sourceUrl: recordingUrl,
       segmentSeconds: Number(chunkSeconds) || 120,
@@ -111,7 +114,6 @@ app.post("/process-call", async (req, res) => {
     console.log("[assoc]", { callId, contactIds, dealIds, ownerId });
 
     await updateCall(callId, analysis);
-
     const newId = await createScorecard(analysis, { callId, contactIds, dealIds, ownerId });
     if (newId) console.log("[scorecard] created id:", newId);
 
