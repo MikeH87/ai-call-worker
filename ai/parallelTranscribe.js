@@ -12,7 +12,7 @@ ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-// ---------- helpers ----------
+// -------------------- helpers --------------------
 async function ensureDir(dir) {
   await fsp.mkdir(dir, { recursive: true });
 }
@@ -63,32 +63,75 @@ function ffprobePromise(filePath) {
   });
 }
 
-async function splitAudio(filePath, outDir, segmentSeconds) {
+// Transcode to a known-good audio format for segmenting and Whisper
+async function transcodeToWorkingAudio(inputPath, outBase) {
+  // First try MP3 (libmp3lame mono 16kHz 96kbps)
+  const mp3Path = `${outBase}.mp3`;
+  try {
+    await new Promise((resolve, reject) => {
+      ffmpeg(inputPath)
+        .noVideo()
+        .audioCodec("libmp3lame")
+        .audioChannels(1)
+        .audioFrequency(16000)
+        .audioBitrate(96)
+        .format("mp3")
+        .on("end", resolve)
+        .on("error", reject)
+        .save(mp3Path);
+    });
+    const st = await fsp.stat(mp3Path);
+    if (st.size > 2048) return { path: mp3Path, ext: ".mp3" };
+  } catch (e) {
+    console.warn("[warn] MP3 transcode failed, will try WAV fallback:", e.message || e);
+  }
+
+  // Fallback to WAV (PCM s16le mono 16kHz)
+  const wavPath = `${outBase}.wav`;
+  await new Promise((resolve, reject) => {
+    ffmpeg(inputPath)
+      .noVideo()
+      .audioCodec("pcm_s16le")
+      .audioChannels(1)
+      .audioFrequency(16000)
+      .format("wav")
+      .on("end", resolve)
+      .on("error", reject)
+      .save(wavPath);
+  });
+  const st2 = await fsp.stat(wavPath);
+  if (!st2 || st2.size <= 2048) {
+    throw new Error("Transcode produced an invalid file.");
+  }
+  return { path: wavPath, ext: ".wav" };
+}
+
+async function splitAudio(inputPath, outDir, segmentSeconds, extForParts) {
   await ensureDir(outDir);
-  // Clear old parts if any
+  // Clean old parts
   try {
     const entries = await fsp.readdir(outDir);
-    await Promise.all(
-      entries.map((e) => fsp.unlink(path.join(outDir, e)).catch(() => {}))
-    );
+    await Promise.all(entries.map(e => fsp.unlink(path.join(outDir, e)).catch(() => {})));
   } catch {}
-  return new Promise((resolve, reject) => {
-    const pattern = path.join(outDir, "part-%03d.mp3");
-    ffmpeg(filePath)
+
+  const pattern = path.join(outDir, `part-%03d${extForParts}`);
+  // We can segment without re-encoding now
+  await new Promise((resolve, reject) => {
+    ffmpeg(inputPath)
+      .addOptions(["-f", "segment", "-segment_time", String(segmentSeconds), "-reset_timestamps", "1"])
       .audioCodec("copy")
-      .format("mp3")
-      .outputOptions(["-f segment", `-segment_time ${segmentSeconds}`, "-reset_timestamps 1"])
       .output(pattern)
-      .on("end", async () => {
-        const files = (await fsp.readdir(outDir))
-          .filter((f) => f.startsWith("part-") && f.endsWith(".mp3"))
-          .map((f) => path.join(outDir, f))
-          .sort();
-        resolve(files);
-      })
-      .on("error", (err) => reject(err))
+      .on("end", resolve)
+      .on("error", reject)
       .run();
   });
+
+  const files = (await fsp.readdir(outDir))
+    .filter(f => f.startsWith("part-") && f.endsWith(extForParts))
+    .map(f => path.join(outDir, f))
+    .sort();
+
+  return files;
 }
 
 async function whisperTranscribe(filePath) {
@@ -101,7 +144,7 @@ async function whisperTranscribe(filePath) {
   form.append("language", "en");
   form.append("file", fs.createReadStream(filePath), {
     filename: path.basename(filePath),
-    contentType: "audio/mpeg",
+    contentType: filePath.endsWith(".wav") ? "audio/wav" : "audio/mpeg",
   });
 
   const resp = await fetch("https://api.openai.com/v1/audio/transcriptions", {
@@ -121,53 +164,58 @@ async function whisperTranscribe(filePath) {
   return (text || "").trim();
 }
 
-// ---------- main ----------
+// -------------------- main --------------------
 export async function transcribeAudioParallel(destPath, callId, opts = {}) {
   const sourceUrl = opts.sourceUrl;
-  const segmentSeconds = Number(opts.segmentSeconds) || 120;
+  const segmentSeconds = Math.max(20, Number(opts.segmentSeconds) || 120);
   const concurrency = Math.max(1, Number(opts.concurrency) || 4);
 
   if (!sourceUrl) throw new Error("transcribeAudioParallel: sourceUrl is required");
   if (!OPENAI_API_KEY) console.warn("[warn] OPENAI_API_KEY missing — Whisper will fail.");
 
-  // 1) Download
+  // 1) Download original
   await downloadToFile(sourceUrl, destPath);
 
-  // 2) Verify media
+  // 2) Probe original (not strictly required, useful for early failure)
   await ffprobePromise(destPath).catch((err) => {
     throw new Error(`ffprobe failed for ${destPath}: ${err.message || err}`);
   });
 
-  // 3) Split into chunks
-  const tmpDir = path.join(os.tmpdir(), `ai-call-worker-${callId}`);
-  const parts = await splitAudio(destPath, tmpDir, segmentSeconds);
+  // 3) Transcode to working format (mp3 → fallback wav)
+  const workBase = path.join(os.tmpdir(), `ai-call-worker-${callId}`, "work");
+  await ensureDir(path.dirname(workBase));
+  const { path: workingPath, ext } = await transcodeToWorkingAudio(destPath, workBase);
+
+  // 4) Segment the working file
+  const partsDir = path.join(os.tmpdir(), `ai-call-worker-${callId}`, "parts");
+  const parts = await splitAudio(workingPath, partsDir, segmentSeconds, ext);
   if (!parts.length) {
     const err = new Error("No audio segments produced");
     err.code = "EMPTY_TRANSCRIPT";
     throw err;
   }
 
-  // 4) Transcribe with modest concurrency
+  // 5) Transcribe parts with modest concurrency
   const queue = parts.slice();
   const results = [];
-  async function worker(i) {
+  async function worker() {
     while (queue.length) {
       const file = queue.shift();
       try {
         const text = await whisperTranscribe(file);
         results.push({ file, text });
       } catch (e) {
-        console.warn("[warn] Whisper failed for", path.basename(file), e.message);
+        console.warn("[warn] Whisper failed for", path.basename(file), e.message || e);
         results.push({ file, text: "" });
       }
     }
   }
-  const workers = Array.from({ length: concurrency }, (_, i) => worker(i));
+  const workers = Array.from({ length: concurrency }, () => worker());
   await Promise.all(workers);
 
-  // 5) Join
+  // 6) Join transcript
   results.sort((a, b) => a.file.localeCompare(b.file));
-  const joined = results.map((r) => (r.text || "").trim()).filter(Boolean).join("\n\n");
+  const joined = results.map(r => (r.text || "").trim()).filter(Boolean).join("\n\n");
   const trimmed = (joined || "").trim();
 
   if (!trimmed || trimmed.length < 16) {
