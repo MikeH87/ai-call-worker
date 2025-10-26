@@ -1,3 +1,19 @@
+// --- express bootstrap (must come before any app.get/app.post) ---
+import express from "express";
+import cors from "cors";
+
+const app = express();
+app.disable("x-powered-by");
+app.use(cors());
+app.use(express.json({ limit: "25mb" }));
+app.use(express.urlencoded({ extended: true, limit: "25mb" }));
+
+// Helpful: version banner for troubleshooting
+const APP_VERSION = process.env.APP_VERSION || (await import("./package.json", { assert: { type: "json" } })).default.version || "dev";
+const STARTED_AT = new Date().toISOString();
+
+// Expose app & version if other modules import index.js (optional)
+export { app, APP_VERSION, STARTED_AT };
 app.post("/process-call", async (req, res) => {
   // --- helpers local to this route ---
   const isObject = (v) => v && typeof v === "object";
@@ -352,3 +368,31 @@ app.post("/process-call", async (req, res) => {
     console.error("❌ Background error:", err);
   }
 });
+// --- health/info endpoints (safe to keep even if they already exist) ---
+app.get("/", (_req, res) => {
+  res.json({ ok: true, service: "ai-call-worker", appVersion: APP_VERSION, startedAt: STARTED_AT });
+});
+
+app.get("/info", (_req, res) => {
+  res.json({
+    ok: true,
+    service: "ai-call-worker",
+    appVersion: APP_VERSION,
+    startedAt: STARTED_AT,
+    node: process.version,
+    now: Date.now(),
+    tokenSource: process.env.HUBSPOT_PRIVATE_APP_TOKEN
+      ? "HUBSPOT_PRIVATE_APP_TOKEN"
+      : process.env.HUBSPOT_TOKEN
+      ? "HUBSPOT_TOKEN"
+      : "NONE",
+    hasHubSpotToken: !!(process.env.HUBSPOT_PRIVATE_APP_TOKEN || process.env.HUBSPOT_TOKEN),
+  });
+});
+
+// --- start server (ensure only one listen) ---
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => {
+  console.log(`[boot] ai-call-worker ${APP_VERSION} started at ${STARTED_AT} on port ${PORT}`);
+});
+
