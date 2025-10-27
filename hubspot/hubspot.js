@@ -1,4 +1,4 @@
-// hubspot/hubspot.js — v1.12 (normalised + fixed enum + scorecard activity_type)
+// hubspot/hubspot.js — v1.12a (normalised + fixed enum + scorecard activity_type)
 import fetch from "node-fetch";
 import dotenv from "dotenv";
 dotenv.config();
