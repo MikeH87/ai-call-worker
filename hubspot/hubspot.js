@@ -1,4 +1,4 @@
-// hubspot/hubspot.js — v1.11 (normalised strings/numbers + forced types[] assoc + verification GETs)
+// hubspot/hubspot.js — v1.12 (normalised + fixed enum + scorecard activity_type)
 import fetch from "node-fetch";
 import dotenv from "dotenv";
 dotenv.config();
@@ -40,7 +40,7 @@ async function hsFetch(url, init = {}) {
   }
 }
 
-// ---------- Normalisers (textify arrays/objects safely) ----------
+// ---------- Normalisers ----------
 const toText = (v, fb = "") => {
   if (v == null) return fb;
   if (Array.isArray(v)) return v.map((x) => toText(x, "")).filter(Boolean).join("; ");
@@ -105,7 +105,6 @@ async function assocTryV4Single(fromType, fromId, toType, toId, typeId) {
   return "v4-single";
 }
 
-// v4 batch with types[] (correct JSON)
 async function assocTryV4BatchTypeId(fromType, fromId, toType, toId, typeId) {
   const url = `${HS.base}/crm/v4/associations/${fromType}/${toType}/batch/create`;
   const body = {
@@ -163,7 +162,7 @@ async function associateSmart(fromType, fromId, toType, toId) {
   return false;
 }
 
-// ---------- HARDENED types[] CALLS↔SCORECARDS + CONTACTS/DEALS (with verification) ----------
+// ---------- HARDENED types[] CALLS↔SCORECARDS + CONTACTS/DEALS ----------
 export async function associateScorecardAllViaTypes({ scorecardId, callId, contactIds = [], dealIds = [] }) {
   console.log(`[assoc] FORCED entry scorecardId=${scorecardId}, callId=${callId}, contacts=${contactIds.join(",")}, deals=${dealIds.join(",")}`);
 
@@ -177,7 +176,6 @@ export async function associateScorecardAllViaTypes({ scorecardId, callId, conta
     return;
   }
 
-  // helper: verify function
   async function verifyAssoc(fromObjectType, fromId, toObjectType) {
     const url = `${HS.base}/crm/v4/objects/${fromObjectType}/${fromId}/associations/${toObjectType}?limit=100`;
     try {
@@ -192,7 +190,6 @@ export async function associateScorecardAllViaTypes({ scorecardId, callId, conta
   }
 
   try {
-    // A) CALL -> SCORECARD
     await hsFetch(`${HS.base}/crm/v4/associations/calls/p49487487_sales_scorecards/batch/create`, {
       method: "POST",
       body: JSON.stringify({
@@ -206,7 +203,6 @@ export async function associateScorecardAllViaTypes({ scorecardId, callId, conta
     console.log(`[assoc] FORCED calls:${callId} -> scorecards:${scorecardId} (typeId=${TYPE_CALLS_TO_SCORECARDS})`);
     await verifyAssoc("calls", String(callId), "p49487487_sales_scorecards");
 
-    // B) SCORECARD -> CALL
     await hsFetch(`${HS.base}/crm/v4/associations/p49487487_sales_scorecards/calls/batch/create`, {
       method: "POST",
       body: JSON.stringify({
@@ -220,7 +216,6 @@ export async function associateScorecardAllViaTypes({ scorecardId, callId, conta
     console.log(`[assoc] FORCED scorecards:${scorecardId} -> calls:${callId} (typeId=${TYPE_SCORECARDS_TO_CALLS})`);
     await verifyAssoc("p49487487_sales_scorecards", String(scorecardId), "calls");
 
-    // C) SCORECARD -> CONTACTS
     if (contactIds.length) {
       const inputs = contactIds.map((cid) => ({
         from: { id: String(scorecardId) },
@@ -235,7 +230,6 @@ export async function associateScorecardAllViaTypes({ scorecardId, callId, conta
       await verifyAssoc("p49487487_sales_scorecards", String(scorecardId), "contacts");
     }
 
-    // D) SCORECARD -> DEALS
     if (dealIds.length) {
       const inputs = dealIds.map((did) => ({
         from: { id: String(scorecardId) },
@@ -361,7 +355,7 @@ export async function updateCall(callId, analysis) {
   } catch {}
 }
 
-// ---------- Qualification Call updater (normalised) ----------
+// ---------- Qualification Call updater (enum fixed) ----------
 export async function updateQualificationCall(callId, data) {
   const token = HUBSPOT_TOKEN;
   if (!callId || !token) {
@@ -370,8 +364,10 @@ export async function updateQualificationCall(callId, data) {
   }
 
   const url = `${HS.base}/crm/v3/objects/calls/${callId}`;
+
   const props = {
-    ai_inferred_call_type: "Qualification Call",
+    // EXACT option label as defined in your HubSpot property (note the lowercase "c"):
+    ai_inferred_call_type: "Qualification call",
     ai_call_type_confidence: 90,
 
     ai_product_interest: toText(data?.ai_product_interest, "Unclear"),
@@ -404,7 +400,7 @@ export async function updateQualificationCall(callId, data) {
   }
 }
 
-// ---------- Qualification Scorecard creator (normalised; associations handled in index.js) ----------
+// ---------- Qualification Scorecard creator (now sets required activity_type) ----------
 export async function createQualificationScorecard({ callId, contactIds = [], data }) {
   const token = HUBSPOT_TOKEN;
   if (!token) {
@@ -414,12 +410,17 @@ export async function createQualificationScorecard({ callId, contactIds = [], da
 
   const url = `${HS.base}/crm/v3/objects/p49487487_sales_scorecards`;
 
+  const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+
   const props = {
+    // REQUIRED by your custom object:
+    activity_type: "Qualification call",
+    activity_name: `${callId} — Qualification call — ${today}`,
+
     sales_scorecard_summary: toLines(data?.sales_performance_summary),
     sales_performance_rating: toNumberOrNull(data?.chat_gpt_sales_performance),
     qualification_score: toNumberOrNull(data?.qualification_score),
 
-    // Qualification-specific fields on the Scorecard
     ai_qualification_likelihood_to_proceed: toNumberOrNull(data?.ai_consultation_likelihood_to_close),
     ai_qualification_outcome: toText(data?.ai_qualification_outcome, ""),
     ai_qualification_required_materials: toLines(data?.ai_consultation_required_materials),
@@ -427,7 +428,6 @@ export async function createQualificationScorecard({ callId, contactIds = [], da
     ai_qualification_key_objections: toLines(data?.ai_key_objections),
     ai_qualification_next_steps: toLines(data?.ai_next_steps),
 
-    // Ten scored behaviours
     qual_active_listening: toNumberOrNull(data?.qualification_eval?.qual_active_listening) ?? 0,
     qual_benefits_linked_to_needs: toNumberOrNull(data?.qualification_eval?.qual_benefits_linked_to_needs) ?? 0,
     qual_clear_responses_or_followup: toNumberOrNull(data?.qualification_eval?.qual_clear_responses_or_followup) ?? 0,
@@ -450,7 +450,7 @@ export async function createQualificationScorecard({ callId, contactIds = [], da
     return null;
   }
 
-  // We now do associations centrally in index.js via associateScorecardAllViaTypes
+  // Associations are handled in index.js via associateScorecardAllViaTypes
   return scorecardId;
 }
 
