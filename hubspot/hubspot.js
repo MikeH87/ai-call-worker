@@ -1,4 +1,8 @@
-// hubspot/hubspot.js — v1.14 (fix: do NOT write ai_qualification_* on Call; keep owner on scorecard; coaching summary)
+// hubspot/hubspot.js — v1.15
+// - Qualification scorecard now writes ai_qualification_* props explicitly
+// - Coaching summary is constructive feedback (not a call recap)
+// - Owner carried from call → scorecard
+// - Existing functionality retained (IC path unchanged; forced associations util kept)
 import fetch from "node-fetch";
 import dotenv from "dotenv";
 dotenv.config();
@@ -42,6 +46,38 @@ const toText = (v, fb = "") => {
 };
 const toLines = (v) => Array.isArray(v) ? v.map(x => toText(x, "")).filter(Boolean).join("\n") : toText(v, "");
 const toNumberOrNull = (v) => Number.isFinite(Number(v)) ? Number(v) : null;
+
+// Build a coaching summary (not a recap)
+function buildCoachingSummary(data = {}) {
+  const inc = Array.isArray(data?.chat_gpt_increase_likelihood_of_sale)
+    ? data.chat_gpt_increase_likelihood_of_sale
+    : (toText(data?.chat_gpt_increase_likelihood_of_sale) ? [toText(data?.chat_gpt_increase_likelihood_of_sale)] : []);
+
+  const q = data?.qualification_eval || {};
+  const flags = [
+    ["Introduced clearly", q?.qual_intro],
+    ["Asked open questions", q?.qual_open_question],
+    ["Linked benefits to needs", q?.qual_benefits_linked_to_needs],
+    ["Identified relevant pain", q?.qual_relevant_pain_identified],
+    ["Provided clear responses or follow-up", q?.qual_clear_responses_or_followup],
+    ["Explained services clearly", q?.qual_services_explained_clearly],
+    ["Built rapport", q?.qual_rapport],
+    ["Confirmed next steps", q?.qual_next_steps_confirmed],
+    ["Requested commitment to book IC", q?.qual_commitment_requested],
+    ["Active listening", q?.qual_active_listening],
+  ];
+
+  const wentWell = flags.filter(([_, v]) => v === 1).map(([label]) => `- ${label}`);
+  const improve = [
+    ...flags.filter(([_, v]) => v !== 1).map(([label]) => `- ${label}`),
+    ...inc.map((s) => `- ${toText(s)}`),
+  ];
+
+  const ww = wentWell.length ? wentWell.join("\n") : "- —";
+  const imp = improve.length ? improve.join("\n") : "- —";
+
+  return `What went well:\n${ww}\n\nAreas to improve:\n${imp}`;
+}
 
 // ---------- READ ----------
 export async function getHubSpotObject(objectType, objectId, properties = []) {
@@ -277,15 +313,13 @@ export async function updateCall(callId, analysis) {
   } catch {}
 }
 
-// ---------- Qualification Call updater (write ONLY existing/generic Call props) ----------
+// ---------- Qualification Call updater (Call record: generic props only) ----------
 export async function updateQualificationCall(callId, data) {
   const token = HUBSPOT_TOKEN;
   if (!callId || !token) { console.warn("[qual] Missing callId or HubSpot token"); return; }
 
   const url = `${HS.base}/crm/v3/objects/calls/${callId}`;
 
-  // We DO NOT set ai_qualification_* here (those live on the scorecard).
-  // We set generic/consultation-named props that exist on Calls.
   const decisionCriteria = toLines(data?.ai_decision_criteria);
   const nextSteps = toLines(data?.ai_next_steps);
   const objectionsText = toLines(data?.ai_key_objections);
@@ -307,10 +341,7 @@ export async function updateQualificationCall(callId, data) {
     ai_consultation_outcome: outcome,
     ai_consultation_likelihood_to_close: toNumberOrNull(likelihood) ?? 1,
 
-    // coaching on the call (optional but useful)
-    sales_performance_summary: toLines(
-      data?.sales_performance_summary || data?.coaching_summary || "What went well:\n- \n\nAreas to improve:\n- "
-    ),
+    sales_performance_summary: buildCoachingSummary(data),
     chat_gpt___sales_performance: toNumberOrNull(data?.chat_gpt_sales_performance),
     chat_gpt___score_reasoning: toText(data?.chat_gpt_score_reasoning, ""),
     chat_gpt___increase_likelihood_of_sale_suggestions: toLines(data?.chat_gpt_increase_likelihood_of_sale),
@@ -324,7 +355,7 @@ export async function updateQualificationCall(callId, data) {
   }
 }
 
-// ---------- Qualification Scorecard creator (carries owner + coaching summary + qual_* fields) ----------
+// ---------- Qualification Scorecard creator (writes ai_qualification_* on scorecard) ----------
 export async function createQualificationScorecard({ callId, contactIds = [], ownerId, data }) {
   const token = HUBSPOT_TOKEN;
   if (!token) { console.error("Missing HubSpot token"); return null; }
@@ -350,34 +381,32 @@ export async function createQualificationScorecard({ callId, contactIds = [], ow
   for (const [k, w] of Object.entries(weights)) weighted += fv(q?.[k]) * w;
   const qualScore = Math.max(0, Math.min(10, Math.round(weighted * 10) / 10));
 
+  // Normalised values
+  const qualNext = toLines(data?.ai_qualification_next_steps ?? data?.ai_next_steps);
+  const qualMaterials = toLines(data?.ai_qualification_required_materials ?? data?.ai_consultation_required_materials);
+  const qualCriteria = toLines(data?.ai_qualification_decision_criteria ?? data?.ai_decision_criteria);
+  const qualObjections = toLines(data?.ai_qualification_key_objections ?? data?.ai_key_objections);
+  const qualOutcome = toText(data?.ai_qualification_outcome ?? data?.outcome ?? "Unclear");
+  const qualLikelihood = toNumberOrNull(
+    data?.ai_qualification_likelihood_to_proceed ?? data?.ai_consultation_likelihood_to_close
+  );
+
   const props = {
     activity_type: "Qualification call",
     activity_name: `${callId} — Qualification call — ${today}`,
     hubspot_owner_id: ownerId || undefined, // carry owner
 
-    // Coaching/feedback (not a plain recap)
-    sales_scorecard___what_you_can_improve_on: toLines(
-      data?.sales_performance_summary || data?.coaching_summary || "What went well:\n- \n\nAreas to improve:\n- "
-    ),
+    // Coaching/feedback
+    sales_scorecard___what_you_can_improve_on: buildCoachingSummary(data),
     sales_performance_rating_: toNumberOrNull(data?.chat_gpt_sales_performance),
 
-    // Scorecard stores the qualification-specific outputs:
-    ai_next_steps: toLines(data?.ai_qualification_next_steps ?? data?.ai_next_steps),
-    ai_consultation_required_materials: toLines(
-      data?.ai_qualification_required_materials ?? data?.ai_consultation_required_materials
-    ),
-    ai_decision_criteria: toLines(
-      data?.ai_qualification_decision_criteria ?? data?.ai_decision_criteria
-    ),
-    ai_key_objections: toLines(
-      data?.ai_qualification_key_objections ?? data?.ai_key_objections
-    ),
-    ai_consultation_outcome: toText(
-      data?.ai_qualification_outcome ?? data?.outcome ?? "Unclear"
-    ),
-    ai_consultation_likelihood_to_close: toNumberOrNull(
-      data?.ai_qualification_likelihood_to_proceed ?? data?.ai_consultation_likelihood_to_close
-    ),
+    // —— Qualification-specific fields (EXPLICIT ai_qualification_* on SCORECARD) ——
+    ai_qualification_next_steps: qualNext,
+    ai_qualification_required_materials: qualMaterials,
+    ai_qualification_decision_criteria: qualCriteria,
+    ai_qualification_key_objections: qualObjections,
+    ai_qualification_outcome: qualOutcome,
+    ai_qualification_likelihood_to_proceed: qualLikelihood,
 
     // Ten scored behaviours
     qual_active_listening: toNumberOrNull(q?.qual_active_listening) ?? 0,
@@ -487,7 +516,6 @@ export async function createScorecard(analysis, ctx) {
   for (const [k, w] of Object.entries(weights)) weighted += (Number(props[k]) || 0) * w;
   props["consult_score_final"] = Math.max(1, Math.min(10, Math.round(weighted * 10) / 10));
 
-  // Create
   const createUrl = `${HS.base}/crm/v3/objects/${objectType}`;
   let scorecardId = null;
   try {
@@ -502,7 +530,5 @@ export async function createScorecard(analysis, ctx) {
     return null;
   }
   if (!scorecardId) return null;
-
-  // Caller handles associations
   return scorecardId;
 }
