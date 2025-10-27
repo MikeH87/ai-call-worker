@@ -1,11 +1,13 @@
-// ai/analyse.js — v2.1 deterministic
+// ai/analyse.js — v2.1-stable (deterministic, minimal change)
+// Keeps original shapes/fields; reduces run-to-run variance.
+
 import fetch from "node-fetch";
 import dotenv from "dotenv";
 dotenv.config();
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-/* ----------------- helpers ----------------- */
+// --- helpers ---
 const clamp = (n, min, max, fallback = null) => {
   const v = typeof n === "number" ? n : Number(n);
   if (Number.isFinite(v)) return Math.min(max, Math.max(min, v));
@@ -19,6 +21,7 @@ const asList = (v) => {
   if (Array.isArray(v)) return v.map((x) => asText(x)).filter(Boolean);
   const s = asText(v);
   if (!s) return [];
+  // split on common separators
   return s.split(/[\n,;•|-]+/).map((t) => t.trim()).filter(Boolean);
 };
 const uniq = (arr) => {
@@ -38,7 +41,7 @@ const OUTCOME_ALLOWED = ["Proceed now", "Likely", "Unclear", "Not now", "No fit"
 function normaliseOutcome(s) {
   const t = asText(s).toLowerCase();
   if (!t) return "Unclear";
-  if (/(proceed|sign(ed)?|go ahead|agreed|commit(ed)?)/.test(t)) return "Proceed now";
+  if (/(proceed|sign|signed|go ahead|agreed|commit)/.test(t)) return "Proceed now";
   if (/(likely|positive|leaning|keen|interested)/.test(t)) return "Likely";
   if (/(not\s+now|pause|later|defer)/.test(t)) return "Not now";
   if (/(no\s+fit|not\s+interested|decline)/.test(t)) return "No fit";
@@ -48,29 +51,27 @@ function normaliseOutcome(s) {
 function inferProduct(transcript) {
   const t = transcript.toLowerCase();
   const hasSSAS = /\bssas\b/.test(t);
-  const hasFIC  = /\bfic\b|family investment compan(y|ies)/.test(t);
+  const hasFIC  = /\bfic\b|family investment company|family investment companies/.test(t);
   if (hasSSAS && hasFIC) return "Both";
   if (hasSSAS) return "SSAS";
   if (hasFIC)  return "FIC";
   return "";
 }
 
-function requireOpenAI() {
+function raiseIfMissingKey() {
   if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
 }
 
-/* ----------------- OpenAI call ----------------- */
+// --- OpenAI call with robust system+user prompt ---
 async function callOpenAI_JSON(prompt, transcript) {
-  requireOpenAI();
+  raiseIfMissingKey();
 
   const sys = [
     "You are TLPI’s AI Call Analyst.",
-    "Analyse **Initial Consultation** calls only and return STRICT JSON.",
-    "Determinism rules:",
-    "- Use only the provided transcript; never invent data.",
-    "- When unsure, leave fields empty ('', []) rather than guessing.",
-    "- Apply consistent tie-breaks: prefer fewer, clearer bullets; prefer stable ordering (alphabetical).",
-    "- If a field is absent, output '' or [] as appropriate.",
+    "Task: Analyse **Initial Consultation** calls only.",
+    "Be precise, UK English, and NEVER guess.",
+    "If information isn’t present, output an empty string or empty array as appropriate.",
+    "Return STRICTLY valid JSON matching the schema."
   ].join(" ");
 
   const user = [
@@ -78,37 +79,38 @@ async function callOpenAI_JSON(prompt, transcript) {
     "- TLPI helps UK company directors with SSAS pensions or Family Investment Companies (FIC).",
     "- Objective of Initial Consultation: explain benefits, surface objections, agree concrete next steps, ideally gain agreement to sign the client agreement (‘Proceed now’).",
     "",
-    "RULES:",
-    "- 'Proceed now' ONLY if there is explicit commitment (e.g., agree to sign, go ahead).",
-    "- If explicit commitment is clear: sales_performance_rating >= 8.",
-    "- Use UK English, be concise.",
+    "EVALUATION NOTES:",
+    "- Use the transcript only; do not invent data.",
+    "- Product interest: SSAS, FIC, or Both (if both discussed).",
+    "- ‘Proceed now’ means they agreed to sign the client agreement (or equivalent explicit commitment).",
+    "- If commitment language is clear, set sales_performance_rating >= 8.",
     "",
     "TRANSCRIPT:",
     transcript,
     "",
     "INSTRUCTIONS:",
-    prompt,
+    prompt
   ].join("\n");
 
   const body = {
     model: "gpt-4o-mini",
     response_format: { type: "json_object" },
-    temperature: 0,
+    temperature: 0,        // deterministic
     top_p: 1,
-    seed: 12345, // fixed seed for repeatability
+    seed: 12345,           // fixed seed for repeatability
     messages: [
       { role: "system", content: sys },
-      { role: "user", content: user },
-    ],
+      { role: "user", content: user }
+    ]
   };
 
   const res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
+      "Authorization": `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json"
     },
-    body: JSON.stringify(body),
+    body: JSON.stringify(body)
   });
   if (!res.ok) {
     const t = await res.text().catch(() => "");
@@ -120,25 +122,20 @@ async function callOpenAI_JSON(prompt, transcript) {
   try {
     return JSON.parse(text);
   } catch {
-    // one retry ultra-strict
+    // retry once with stricter instruction
     const retry = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "Content-Type": "application/json",
+        "Authorization": `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json"
       },
       body: JSON.stringify({
         ...body,
         messages: [
           { role: "system", content: sys },
-          {
-            role: "user",
-            content:
-              user +
-              "\nReturn ONLY a valid JSON object. Do not include commentary or code fences.",
-          },
-        ],
-      }),
+          { role: "user", content: user + "\nReturn ONLY valid JSON object. Do not wrap in code fences." }
+        ]
+      })
     });
     const d2 = await retry.json();
     const t2 = d2?.choices?.[0]?.message?.content ?? "{}";
@@ -146,7 +143,7 @@ async function callOpenAI_JSON(prompt, transcript) {
   }
 }
 
-/* ----------------- Master prompt (Initial Consultation) ----------------- */
+// --- master prompt (Initial Consultation) ---
 const PROMPT_INITIAL_CONSULTATION = `
 Return JSON with these keys:
 - call_type: string ("Initial Consultation")
@@ -179,12 +176,11 @@ Return JSON with these keys:
     specific_tax_estimate_given, fees_tax_deductible_explained,
     next_step_specific_date_time, interactive_throughout, quantified_value_roi
 Rules:
-- If the client explicitly agrees to proceed/sign on the call, set outcome="Proceed now" and sales_performance_rating>=8.
-- If information is not present, use "" or [] (not "N/A").
-- Prefer stable, concise phrasing; avoid redundancy.
+- If the client **explicitly agrees to proceed/sign** on the call, set outcome="Proceed now" and sales_performance_rating>=8.
+- If any field is not present in transcript, use "" or [] appropriately (not "N/A").
 `;
 
-/* ----------------- analyseTranscript ----------------- */
+// --- export: analyseTranscript ---
 export async function analyseTranscript(callTypeLabel, transcript) {
   // 1) Basic sanity on transcript
   const t = asText(transcript);
@@ -205,14 +201,14 @@ export async function analyseTranscript(callTypeLabel, transcript) {
       increase_likelihood:
         "- Reschedule a proper consultation\n- Ensure clear agenda\n- Confirm next steps",
       consult_eval: {},
-      uncertainty_reason: "Transcript contains no meaningful content.",
+      uncertainty_reason: "Transcript contains no meaningful content."
     };
   }
 
-  // 2) OpenAI
+  // 2) Call OpenAI
   let js = await callOpenAI_JSON(PROMPT_INITIAL_CONSULTATION, t);
 
-  // 3) Normalise + safe defaults + determinism
+  // 3) Normalise + safe defaults (deterministic tweaks)
   const call_type = "Initial Consultation";
 
   // Likelihood: clamp then round to nearest 10 to reduce jitter
@@ -221,27 +217,18 @@ export async function analyseTranscript(callTypeLabel, transcript) {
 
   let outcome = normaliseOutcome(js.outcome);
 
-  // Arrays -> canonicalize: trim, dedupe (case-insensitive), stable sort
-  let objections = uniq(asList(js.objections));
-  objections = stableSort(objections);
+  // Arrays: trim + dedupe (case-insensitive) + stable sort
+  let objections = stableSort(uniq(asList(js.objections)));
+  let next_actions = stableSort(uniq(asList(js.next_actions)));
+  let materials_to_send = stableSort(uniq(asList(js.materials_to_send)));
+  let ai_decision_criteria = stableSort(uniq(asList(js.ai_decision_criteria)));
 
-  let next_actions = uniq(asList(js.next_actions));
-  next_actions = stableSort(next_actions);
-
-  let materials_to_send = uniq(asList(js.materials_to_send));
-  materials_to_send = stableSort(materials_to_send);
-
-  let ai_decision_criteria = uniq(asList(js.ai_decision_criteria));
-  ai_decision_criteria = stableSort(ai_decision_criteria);
-
-  // key details
+  // key_details
   const kd = js.key_details || {};
   const key_details = {
     client_name: asText(kd.client_name, ""),
     company_name: asText(kd.company_name, ""),
-    products_discussed: uniq(asList(kd.products_discussed)).filter((v) =>
-      ["SSAS", "FIC"].includes(v)
-    ),
+    products_discussed: asList(kd.products_discussed).filter((v) => ["SSAS", "FIC"].includes(v)),
     timeline: asText(kd.timeline, ""),
     dob: asText(kd.dob, ""),
     ni: asText(kd.ni, ""),
@@ -249,34 +236,23 @@ export async function analyseTranscript(callTypeLabel, transcript) {
     address: asText(kd.address, ""),
     nationality: asText(kd.nationality, ""),
     pension_refs: asText(kd.pension_refs, ""),
-    company_details: asText(kd.company_details, ""),
+    company_details: asText(kd.company_details, "")
   };
 
   // product fallback from transcript
   if (!key_details.products_discussed?.length) {
     const pi = inferProduct(t);
-    if (pi === "Both") key_details.products_discussed = ["SSAS", "FIC"];
-    else if (pi) key_details.products_discussed = [pi];
+    if (pi) key_details.products_discussed = pi === "Both" ? ["SSAS", "FIC"] : [pi];
   }
 
-  // consult_eval → keep only expected keys, force values to 0/0.5/1
+  // consult_eval → keep only the expected keys, force 0/0.5/1
   const ceIn = js.consult_eval || {};
   const ceKeys = [
-    "intro",
-    "rapport_open",
-    "open_question",
-    "needs_pain_uncovered",
-    "services_explained_clearly",
-    "benefits_linked_to_needs",
-    "active_listening",
-    "clear_responses_or_followup",
-    "commitment_requested",
-    "next_steps_confirmed",
-    "specific_tax_estimate_given",
-    "fees_tax_deductible_explained",
-    "next_step_specific_date_time",
-    "interactive_throughout",
-    "quantified_value_roi",
+    "intro","rapport_open","open_question","needs_pain_uncovered",
+    "services_explained_clearly","benefits_linked_to_needs","active_listening",
+    "clear_responses_or_followup","commitment_requested","next_steps_confirmed",
+    "specific_tax_estimate_given","fees_tax_deductible_explained",
+    "next_step_specific_date_time","interactive_throughout","quantified_value_roi"
   ];
   const consult_eval = {};
   for (const k of ceKeys) {
@@ -285,27 +261,13 @@ export async function analyseTranscript(callTypeLabel, transcript) {
   }
 
   // sales performance rating
-  let sales_performance_rating =
-    clamp(js.sales_performance_rating, 1, 10, 1) ?? 1;
+  let sales_performance_rating = clamp(js.sales_performance_rating, 1, 10, 1) ?? 1;
 
-  // Enforce deterministic links between outcome & likelihood/rating
-  const explicitCommitment =
-    outcome === "Proceed now" ||
-    /agree(d)?\s+to\s+(proceed|sign|go ahead)|we\s+will\s+sign/i.test(t);
-
-  if (explicitCommitment) {
-    outcome = "Proceed now";
-    if (likelihood_to_close < 80) likelihood_to_close = 80;
-    if (sales_performance_rating < 8) sales_performance_rating = 8;
-  } else {
-    // If no commitment language, don't allow "Proceed now"
-    if (outcome === "Proceed now") outcome = "Likely";
+  // If outcome = Proceed now → ensure >=8 as agreed
+  if (outcome === "Proceed now" && sales_performance_rating < 8) {
+    sales_performance_rating = 8;
+    if (likelihood_to_close < 80) likelihood_to_close = 80; // keep consistent with a commitment
   }
-
-  // Stable text fields
-  const sales_performance_summary = asText(js.sales_performance_summary, "");
-  const score_reasoning = asText(js.score_reasoning, "");
-  const increase_likelihood = asText(js.increase_likelihood, "");
 
   const result = {
     call_type,
@@ -317,36 +279,24 @@ export async function analyseTranscript(callTypeLabel, transcript) {
     ai_decision_criteria,
     key_details,
     sales_performance_rating,
-    sales_performance_summary,
-    score_reasoning,
-    increase_likelihood,
-    consult_eval,
+    sales_performance_summary: asText(js.sales_performance_summary, ""),
+    score_reasoning: asText(js.score_reasoning, ""),
+    increase_likelihood: asText(js.increase_likelihood, ""),
+    consult_eval
   };
 
-  // Compact personal-data summary for the call field
+  // Derive a compact personal-data summary block for call field
   const dpParts = [];
-  const pd = [
-    "dob",
-    "ni",
-    "utr",
-    "address",
-    "nationality",
-    "pension_refs",
-    "company_details",
-  ];
+  const pd = ["dob","ni","utr","address","nationality","pension_refs","company_details"];
   if (key_details.client_name) dpParts.push(`Name: ${key_details.client_name}`);
-  if (key_details.company_name)
-    dpParts.push(`Company: ${key_details.company_name}`);
+  if (key_details.company_name) dpParts.push(`Company: ${key_details.company_name}`);
   for (const k of pd) {
-    const v = asText(key_details[k]);
-    if (v) {
-      const label = k === "ni" ? "NI" : k.replace(/_/g, " ");
-      dpParts.push(`${label[0].toUpperCase() + label.slice(1)}: ${v}`);
+    if (asText(key_details[k])) {
+      const label = k === "ni" ? "NI" : k.replace(/_/g," ");
+      dpParts.push(`${label[0].toUpperCase()+label.slice(1)}: ${key_details[k]}`);
     }
   }
-  result.__data_points_captured_text = dpParts.length
-    ? dpParts.join("\n")
-    : "Not mentioned.";
+  result.__data_points_captured_text = dpParts.length ? dpParts.join("\n") : "Not mentioned.";
 
   return result;
 }
