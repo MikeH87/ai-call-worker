@@ -343,6 +343,165 @@ export async function updateCall(callId, analysis) {
     console.log("[debug] Call updated:", after?.properties || after);
   } catch {}
 }
+// === Qualification Call updater ===
+export async function updateQualificationCall(callId, data) {
+  if (!callId || !process.env.HUBSPOT_PRIVATE_APP_TOKEN) {
+    console.warn("Missing callId or HUBSPOT_PRIVATE_APP_TOKEN");
+    return;
+  }
+
+  const url = `https://api.hubapi.com/crm/v3/objects/calls/${callId}`;
+  const headers = {
+    Authorization: `Bearer ${process.env.HUBSPOT_PRIVATE_APP_TOKEN}`,
+    "Content-Type": "application/json",
+  };
+
+  const props = {
+    ai_inferred_call_type: "Qualification Call",
+    ai_call_type_confidence: 1.0,
+    ai_product_interest: data.ai_product_interest ?? "",
+    ai_decision_criteria: data.ai_decision_criteria ?? "",
+    ai_data_points_captured: data.ai_data_points_captured ?? "",
+    ai_next_steps: data.ai_next_steps ?? "",
+    ai_key_objections: data.ai_key_objections ?? "",
+    chat_gpt___increase_likelihood_of_sale_suggestions:
+      data.chat_gpt_increase_likelihood_of_sale ?? "",
+    chat_gpt___score_reasoning: data.chat_gpt_score_reasoning ?? "",
+    sales_performance_summary: data.sales_performance_summary ?? "",
+    chat_gpt___sales_performance: data.chat_gpt_sales_performance ?? null,
+    ai_objection_categories: data.ai_objection_categories ?? "",
+    ai_objection_severity: data.ai_objection_severity ?? "",
+    ai_objections_bullets: data.ai_objections_bullets ?? "",
+    ai_primary_objection: data.ai_primary_objection ?? "",
+    ai_consultation_likelihood_to_close:
+      data.ai_consultation_likelihood_to_close ?? null,
+    ai_consultation_required_materials:
+      data.ai_consultation_required_materials ?? "",
+  };
+
+  const body = { properties: props };
+
+  try {
+    const res = await fetch(url, {
+      method: "PATCH",
+      headers,
+      body: JSON.stringify(body),
+    });
+
+    if (!res.ok) {
+      const msg = await res.text();
+      console.error("HubSpot Qualification update failed:", msg);
+    } else {
+      console.log(`Qualification Call ${callId} updated.`);
+    }
+  } catch (err) {
+    console.error("HubSpot Qualification update error:", err);
+  }
+}
+
+// === Qualification Scorecard creator ===
+export async function createQualificationScorecard({
+  callId,
+  contactIds = [],
+  data,
+}) {
+  const token = process.env.HUBSPOT_PRIVATE_APP_TOKEN;
+  if (!token) {
+    console.error("Missing HUBSPOT_PRIVATE_APP_TOKEN");
+    return null;
+  }
+
+  const url = "https://api.hubapi.com/crm/v3/objects/p49487487_sales_scorecards";
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    "Content-Type": "application/json",
+  };
+
+  // Basic properties
+  const props = {
+    sales_scorecard_summary: data.sales_performance_summary ?? "",
+    sales_performance_rating: data.chat_gpt_sales_performance ?? null,
+    qualification_score: data.qualification_score ?? null,
+    ai_qualification_likelihood_to_proceed:
+      data.ai_consultation_likelihood_to_close ?? null,
+    ai_qualification_outcome: data.ai_qualification_outcome ?? "",
+    ai_qualification_required_materials:
+      data.ai_consultation_required_materials ?? "",
+    ai_qualification_decision_criteria: data.ai_decision_criteria ?? "",
+    ai_qualification_key_objections: data.ai_key_objections ?? "",
+    ai_qualification_next_steps: data.ai_next_steps ?? "",
+    qual_active_listening: data.qualification_eval?.qual_active_listening ?? 0,
+    qual_benefits_linked_to_needs:
+      data.qualification_eval?.qual_benefits_linked_to_needs ?? 0,
+    qual_clear_responses_or_followup:
+      data.qualification_eval?.qual_clear_responses_or_followup ?? 0,
+    qual_commitment_requested:
+      data.qualification_eval?.qual_commitment_requested ?? 0,
+    qual_intro: data.qualification_eval?.qual_intro ?? 0,
+    qual_next_steps_confirmed:
+      data.qualification_eval?.qual_next_steps_confirmed ?? 0,
+    qual_open_question: data.qualification_eval?.qual_open_question ?? 0,
+    qual_rapport: data.qualification_eval?.qual_rapport ?? 0,
+    qual_relevant_pain_identified:
+      data.qualification_eval?.qual_relevant_pain_identified ?? 0,
+    qual_services_explained_clearly:
+      data.qualification_eval?.qual_services_explained_clearly ?? 0,
+  };
+
+  const body = { properties: props };
+
+  // Create the Scorecard
+  const res = await fetch(url, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const msg = await res.text();
+    console.error("Failed to create Qualification Scorecard:", msg);
+    return null;
+  }
+  const js = await res.json();
+  const scorecardId = js.id;
+  console.log("Created Qualification Scorecard:", scorecardId);
+
+  // --- Associate Scorecard ↔ Call
+  try {
+    const assocUrl = `https://api.hubapi.com/crm/v4/associations/p49487487_sales_scorecards/calls/batch/create`;
+    const assocBody = {
+      inputs: [{ from: { id: scorecardId }, to: { id: callId }, type: "scorecard_to_call" }],
+    };
+    await fetch(assocUrl, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(assocBody),
+    });
+    console.log("Associated Scorecard with Call", callId);
+  } catch (err) {
+    console.error("Association to Call failed:", err);
+  }
+
+  // --- Associate Scorecard ↔ Contacts
+  for (const cid of contactIds) {
+    try {
+      const assocUrl = `https://api.hubapi.com/crm/v4/associations/p49487487_sales_scorecards/contacts/batch/create`;
+      const assocBody = {
+        inputs: [{ from: { id: scorecardId }, to: { id: cid }, type: "scorecard_to_contact" }],
+      };
+      await fetch(assocUrl, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(assocBody),
+      });
+      console.log("Associated Scorecard with Contact", cid);
+    } catch (err) {
+      console.error("Association to Contact failed:", err);
+    }
+  }
+
+  // Leads will be added automatically once HubSpot exposes them
+  return scorecardId;
+}
 
 // ---------- SCORECARD CREATE + ASSOC ----------
 export async function createScorecard(analysis, ctx) {
