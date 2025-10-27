@@ -1,4 +1,4 @@
-// hubspot/hubspot.js
+// hubspot/hubspot.js — v1.10 (forced types[] assoc + verification GETs)
 import fetch from "node-fetch";
 import dotenv from "dotenv";
 dotenv.config();
@@ -9,10 +9,10 @@ const HUBSPOT_TOKEN =
   process.env.HUBSPOT_ACCESS_TOKEN;
 
 if (!HUBSPOT_TOKEN) {
-  console.warn(
-    "[warn] HubSpot token missing: set HUBSPOT_PRIVATE_APP_TOKEN (preferred) or HUBSPOT_TOKEN"
-  );
+  console.warn("[warn] HubSpot token missing: set HUBSPOT_PRIVATE_APP_TOKEN (preferred) or HUBSPOT_TOKEN");
 }
+
+console.log("hubspot.js — v1.10");
 
 const HS = {
   base: "https://api.hubapi.com",
@@ -31,7 +31,6 @@ async function hsFetch(url, init = {}) {
     const text = await res.text().catch(() => "");
     throw new Error(`${init.method || "GET"} ${url} -> ${res.status} ${text}`);
   }
-  // some assoc endpoints return 204/empty
   try {
     return await res.json();
   } catch {
@@ -67,13 +66,11 @@ export async function getAssociations(callId, toType) {
 
 // ---------- ASSOCIATION DISCOVERY ----------
 async function discoverAssocMeta(fromType, toType) {
-  // returns { list: [{typeId, id, label, category}], preferred }
   try {
     const url = `${HS.base}/crm/v4/associations/${fromType}/${toType}/labels`;
     const data = await hsFetch(url);
     const list = data?.results || [];
-    const preferred =
-      list.find((x) => x?.category === "HUBSPOT_DEFINED") || list[0] || null;
+    const preferred = list.find((x) => x?.category === "HUBSPOT_DEFINED") || list[0] || null;
     return { list, preferred };
   } catch (e) {
     console.warn(`[warn] labels discovery failed for ${fromType} -> ${toType}:`, e.message);
@@ -81,23 +78,34 @@ async function discoverAssocMeta(fromType, toType) {
   }
 }
 
-// ---------- ASSOCIATION ATTEMPTS (3 strategies) ----------
+// ---------- ASSOCIATION ATTEMPTS ----------
 async function assocTryV4Single(fromType, fromId, toType, toId, typeId) {
   const url = `${HS.base}/crm/v4/objects/${fromType}/${fromId}/associations/${toType}/${toId}/${typeId}`;
-  await hsFetch(url, { method: "PUT" }); // no body
+  await hsFetch(url, { method: "PUT" });
   return "v4-single";
 }
 
+// v4 batch with types[] (correct JSON)
 async function assocTryV4BatchTypeId(fromType, fromId, toType, toId, typeId) {
   const url = `${HS.base}/crm/v4/associations/${fromType}/${toType}/batch/create`;
-  const body = { inputs: [{ from: { id: String(fromId) }, to: { id: String(toId) }, type: String(typeId) }] };
+  const body = {
+    inputs: [
+      {
+        from: { id: String(fromId) },
+        to: { id: String(toId) },
+        types: [{ associationCategory: "USER_DEFINED", associationTypeId: Number(typeId) }],
+      },
+    ],
+  };
   await hsFetch(url, { method: "POST", body: JSON.stringify(body) });
   return "v4-batch-typeId";
 }
 
 async function assocTryV3BatchLabel(fromType, fromId, toType, toId, label) {
   const url = `${HS.base}/crm/v3/associations/${fromType}/${toType}/batch/create`;
-  const body = { inputs: [{ from: { id: String(fromId) }, to: { id: String(toId) }, type: String(label) }] };
+  const body = {
+    inputs: [{ from: { id: String(fromId) }, to: { id: String(toId) }, type: String(label) }],
+  };
   await hsFetch(url, { method: "POST", body: JSON.stringify(body) });
   return "v3-batch-label";
 }
@@ -108,40 +116,122 @@ async function associateSmart(fromType, fromId, toType, toId) {
     console.warn(`[warn] No association types returned for ${fromType} -> ${toType}`);
     return false;
   }
-
-  // Try with preferred first; if needed, try others.
   const candidates = [preferred, ...list.filter((x) => x !== preferred)];
-
   for (const c of candidates) {
     const typeId = c.typeId || c.id;
     const label = c.label || String(typeId);
 
-    // 1) v4 single (typeId in path)
     try {
       const how = await assocTryV4Single(fromType, fromId, toType, toId, typeId);
       console.log(`[assoc] Linked ${fromType}:${fromId} -> ${toType}:${toId} via ${how} (typeId=${typeId}, label=${label})`);
       return true;
     } catch (_) {}
 
-    // 2) v4 batch (typeId in "type")
     try {
       const how = await assocTryV4BatchTypeId(fromType, fromId, toType, toId, typeId);
       console.log(`[assoc] Linked ${fromType}:${fromId} -> ${toType}:${toId} via ${how} (typeId=${typeId}, label=${label})`);
       return true;
     } catch (_) {}
 
-    // 3) v3 batch (label string)
     try {
       const how = await assocTryV3BatchLabel(fromType, fromId, toType, toId, label);
       console.log(`[assoc] Linked ${fromType}:${fromId} -> ${toType}:${toId} via ${how} (typeId=${typeId}, label=${label})`);
       return true;
+    } catch (_) {}
+  }
+  console.warn(`[warn] Association attempts exhausted for ${fromType}:${fromId} -> ${toType}:${toId}`);
+  return false;
+}
+
+// ---------- HARDENED types[] CALLS↔SCORECARDS + CONTACTS/DEALS (with verification) ----------
+export async function associateScorecardAllViaTypes({ scorecardId, callId, contactIds = [], dealIds = [] }) {
+  console.log(`[assoc] FORCED entry scorecardId=${scorecardId}, callId=${callId}, contacts=${contactIds.join(",")}, deals=${dealIds.join(",")}`);
+
+  const TYPE_SCORECARDS_TO_CALLS = 395;
+  const TYPE_CALLS_TO_SCORECARDS = 396;
+  const TYPE_SCORECARDS_TO_CONTACTS = 421;
+  const TYPE_SCORECARDS_TO_DEALS = 423;
+
+  if (!scorecardId || !callId) {
+    console.warn("[assoc] missing scorecardId or callId; skipping assoc.");
+    return;
+  }
+
+  // helper: verify function
+  async function verifyAssoc(fromObjectType, fromId, toObjectType) {
+    const url = `${HS.base}/crm/v4/objects/${fromObjectType}/${fromId}/associations/${toObjectType}?limit=100`;
+    try {
+      const data = await hsFetch(url);
+      const count = (data?.results || []).length;
+      console.log(`[assoc] verify ${fromObjectType}:${fromId} -> ${toObjectType}: ${count} linked`);
+      return count;
     } catch (e) {
-      // keep looping to next candidate
+      console.warn(`[assoc] verify error for ${fromObjectType}:${fromId} -> ${toObjectType}:`, e.message);
+      return 0;
     }
   }
 
-  console.warn(`[warn] Association attempts exhausted for ${fromType}:${fromId} -> ${toType}:${toId}`);
-  return false;
+  try {
+    // A) CALL -> SCORECARD
+    await hsFetch(`${HS.base}/crm/v4/associations/calls/p49487487_sales_scorecards/batch/create`, {
+      method: "POST",
+      body: JSON.stringify({
+        inputs: [{
+          from: { id: String(callId) },
+          to: { id: String(scorecardId) },
+          types: [{ associationCategory: "USER_DEFINED", associationTypeId: TYPE_CALLS_TO_SCORECARDS }],
+        }],
+      }),
+    });
+    console.log(`[assoc] FORCED calls:${callId} -> scorecards:${scorecardId} (typeId=${TYPE_CALLS_TO_SCORECARDS})`);
+    await verifyAssoc("calls", String(callId), "p49487487_sales_scorecards");
+
+    // B) SCORECARD -> CALL
+    await hsFetch(`${HS.base}/crm/v4/associations/p49487487_sales_scorecards/calls/batch/create`, {
+      method: "POST",
+      body: JSON.stringify({
+        inputs: [{
+          from: { id: String(scorecardId) },
+          to: { id: String(callId) },
+          types: [{ associationCategory: "USER_DEFINED", associationTypeId: TYPE_SCORECARDS_TO_CALLS }],
+        }],
+      }),
+    });
+    console.log(`[assoc] FORCED scorecards:${scorecardId} -> calls:${callId} (typeId=${TYPE_SCORECARDS_TO_CALLS})`);
+    await verifyAssoc("p49487487_sales_scorecards", String(scorecardId), "calls");
+
+    // C) SCORECARD -> CONTACTS
+    if (contactIds.length) {
+      const inputs = contactIds.map((cid) => ({
+        from: { id: String(scorecardId) },
+        to: { id: String(cid) },
+        types: [{ associationCategory: "USER_DEFINED", associationTypeId: TYPE_SCORECARDS_TO_CONTACTS }],
+      }));
+      await hsFetch(`${HS.base}/crm/v4/associations/p49487487_sales_scorecards/contacts/batch/create`, {
+        method: "POST",
+        body: JSON.stringify({ inputs }),
+      });
+      console.log(`[assoc] FORCED scorecards:${scorecardId} -> contacts:${contactIds.join(",")} (typeId=${TYPE_SCORECARDS_TO_CONTACTS})`);
+      await verifyAssoc("p49487487_sales_scorecards", String(scorecardId), "contacts");
+    }
+
+    // D) SCORECARD -> DEALS
+    if (dealIds.length) {
+      const inputs = dealIds.map((did) => ({
+        from: { id: String(scorecardId) },
+        to: { id: String(did) },
+        types: [{ associationCategory: "USER_DEFINED", associationTypeId: TYPE_SCORECARDS_TO_DEALS }],
+      }));
+      await hsFetch(`${HS.base}/crm/v4/associations/p49487487_sales_scorecards/deals/batch/create`, {
+        method: "POST",
+        body: JSON.stringify({ inputs }),
+      });
+      console.log(`[assoc] FORCED scorecards:${scorecardId} -> deals:${dealIds.join(",")} (typeId=${TYPE_SCORECARDS_TO_DEALS})`);
+      await verifyAssoc("p49487487_sales_scorecards", String(scorecardId), "deals");
+    }
+  } catch (err) {
+    console.warn("[assoc] association error:", err.message);
+  }
 }
 
 // ---------- CALL UPDATE ----------
@@ -152,25 +242,13 @@ export async function updateCall(callId, analysis) {
       ? String(analysis.ai_call_type_confidence)
       : "90";
 
-  const decisionCriteria = Array.isArray(analysis?.ai_decision_criteria)
-    ? analysis.ai_decision_criteria
-    : [];
-
-  const materials =
-    (Array.isArray(analysis?.materials_to_send) && analysis.materials_to_send.length > 0)
-      ? analysis.materials_to_send
-      : [];
-
-  const nextSteps =
-    (Array.isArray(analysis?.next_actions) && analysis.next_actions.length > 0)
-      ? analysis.next_actions
-      : [];
-
+  const decisionCriteria = Array.isArray(analysis?.ai_decision_criteria) ? analysis.ai_decision_criteria : [];
+  const materials = Array.isArray(analysis?.materials_to_send) && analysis.materials_to_send.length ? analysis.materials_to_send : [];
+  const nextSteps = Array.isArray(analysis?.next_actions) && analysis.next_actions.length ? analysis.next_actions : [];
   const objections = Array.isArray(analysis?.objections) ? analysis.objections : [];
 
   const dataPointsText =
-    typeof analysis?.__data_points_captured_text === "string" &&
-    analysis.__data_points_captured_text.trim().length
+    typeof analysis?.__data_points_captured_text === "string" && analysis.__data_points_captured_text.trim().length
       ? analysis.__data_points_captured_text
       : "No personal data captured.";
 
@@ -185,23 +263,20 @@ export async function updateCall(callId, analysis) {
       ? Math.max(1, Math.min(10, Math.round(analysis.likelihood_to_close / 10)))
       : 1;
 
-  const allowedCategories = new Set(["Price","Timing","Risk","Complexity","Authority","Clarity"]);
+  const allowedCategories = new Set(["Price", "Timing", "Risk", "Complexity", "Authority", "Clarity"]);
   let aiCat = "Clarity";
-  if (objections.some(o => /price|fee|cost/i.test(o))) aiCat = "Price";
-  else if (objections.some(o => /time|timeline|delay/i.test(o))) aiCat = "Timing";
-  else if (objections.some(o => /risk/i.test(o))) aiCat = "Risk";
-  else if (objections.some(o => /complex/i.test(o))) aiCat = "Complexity";
-  else if (objections.some(o => /authority|sign off|decision/i.test(o))) aiCat = "Authority";
+  if (objections.some((o) => /price|fee|cost/i.test(o))) aiCat = "Price";
+  else if (objections.some((o) => /time|timeline|delay/i.test(o))) aiCat = "Timing";
+  else if (objections.some((o) => /risk/i.test(o))) aiCat = "Risk";
+  else if (objections.some((o) => /complex/i.test(o))) aiCat = "Complexity";
+  else if (objections.some((o) => /authority|sign off|decision/i.test(o))) aiCat = "Authority";
   if (!allowedCategories.has(aiCat)) aiCat = "Clarity";
 
   const increaseLikely = Array.isArray(analysis?.increase_likelihood)
     ? analysis.increase_likelihood.join("; ")
-    : (analysis?.increase_likelihood || "No suggestions.");
+    : analysis?.increase_likelihood || "No suggestions.";
   const perfSummary = analysis?.sales_performance_summary || "No specific coaching available.";
-  const perfScore =
-    typeof analysis?.sales_performance_rating === "number"
-      ? String(analysis.sales_performance_rating)
-      : "";
+  const perfScore = typeof analysis?.sales_performance_rating === "number" ? String(analysis.sales_performance_rating) : "";
   const scoreReason = analysis?.score_reasoning || "No reasoning provided.";
 
   const missingInfo =
@@ -209,8 +284,7 @@ export async function updateCall(callId, analysis) {
       ? analysis.ai_missing_information
       : "Nothing requested or all information provided.";
 
-  const requestedMaterials =
-    materials.length > 0 ? materials.join("; ") : "Nothing requested";
+  const requestedMaterials = materials.length > 0 ? materials.join("; ") : "Nothing requested";
 
   const props = {
     ai_inferred_call_type: callType,
@@ -236,10 +310,7 @@ export async function updateCall(callId, analysis) {
 
   const url = `${HS.base}/crm/v3/objects/calls/${callId}`;
   try {
-    await hsFetch(url, {
-      method: "PATCH",
-      body: JSON.stringify({ properties: props }),
-    });
+    await hsFetch(url, { method: "PATCH", body: JSON.stringify({ properties: props }) });
   } catch (e) {
     console.warn("[HubSpot] PATCH", url, "failed:", e.message);
   }
@@ -290,8 +361,7 @@ export async function createScorecard(analysis, ctx) {
 
     sales_performance_rating_: Number(analysis?.sales_performance_rating || 1),
     sales_scorecard___what_you_can_improve_on:
-      analysis?.sales_performance_summary ||
-      "What went well:\n- \n\nAreas to improve:\n- ",
+      analysis?.sales_performance_summary || "What went well:\n- \n\nAreas to improve:\n- ",
 
     ai_next_steps: (analysis?.next_actions || []).join("; "),
     ai_consultation_required_materials:
@@ -368,20 +438,19 @@ export async function createScorecard(analysis, ctx) {
     console.warn("[HubSpot] create scorecard failed:", e.message);
     return null;
   }
-
   if (!scorecardId) return null;
 
-  // Always associate to the Call; optionally to contacts/deals
-  const assocOK = await associateSmart(objectType, scorecardId, "calls", String(callId));
-  for (const cid of (ctx?.contactIds || [])) {
+  // Flexible assoc attempts (may do one-way)
+  await associateSmart(objectType, scorecardId, "calls", String(callId));
+  for (const cid of contactIds || []) {
     await associateSmart(objectType, scorecardId, "contacts", String(cid));
   }
-  for (const did of (ctx?.dealIds || [])) {
+  for (const did of dealIds || []) {
     await associateSmart(objectType, scorecardId, "deals", String(did));
   }
 
-  if (!assocOK) {
-    console.warn("[warn] scorecard was created but not linked to the Call (will still exist).");
-  }
+  // Enforce both directions + contacts/deals via types[] with verification
+  await associateScorecardAllViaTypes({ scorecardId, callId, contactIds, dealIds });
+
   return scorecardId;
 }

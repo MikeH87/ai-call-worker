@@ -1,4 +1,4 @@
-// index.js
+// index.js — v4.1.0-force-assoc
 import express from "express";
 import bodyParser from "body-parser";
 import dotenv from "dotenv";
@@ -6,11 +6,19 @@ import dotenv from "dotenv";
 import { analyseTranscript } from "./ai/analyse.js";
 import { transcribeAudioParallel } from "./ai/parallelTranscribe.js";
 import { getCombinedPrompt } from "./ai/getCombinedPrompt.js";
-import { createScorecard, updateCall, getHubSpotObject, getAssociations } from "./hubspot/hubspot.js";
+import {
+  createScorecard,
+  updateCall,
+  getHubSpotObject,
+  getAssociations,
+  associateScorecardAllViaTypes,
+} from "./hubspot/hubspot.js";
 
 dotenv.config();
 const app = express();
 app.use(bodyParser.json({ limit: "5mb" }));
+
+console.log("index.js — v4.1.0-force-assoc");
 
 app.get("/", (req, res) => {
   res.send("AI Call Worker v4.x modular running ✅");
@@ -25,23 +33,18 @@ app.get("/env-check", (req, res) => {
   res.json({ ok: true, tokenSource, hasHubSpotToken: hasAccess || hasPrivate || hasLegacy, seenHubSpotEnvKeys: keys, node: process.version, now: Date.now() });
 });
 
-// ----- helpers: safe extraction & URL coercion -----
+// helpers
 function getPath(obj, path) {
   return path.split(".").reduce((a, k) => (a && a[k] != null ? a[k] : undefined), obj);
 }
 function firstDefined(...vals) {
-  for (const v of vals) {
-    if (v !== undefined && v !== null) return v;
-  }
+  for (const v of vals) if (v !== undefined && v !== null) return v;
   return undefined;
 }
 function urlify(val) {
   if (!val) return "";
   if (Array.isArray(val)) return urlify(val[0]);
-  if (typeof val === "object") {
-    // Common shapes: { url }, { href }, { link }, { value }, nested arrays, etc.
-    return urlify(val.url || val.href || val.link || val.value || val.src || val.source || val.toString?.());
-  }
+  if (typeof val === "object") return urlify(val.url || val.href || val.link || val.value || val.src || val.source || val.toString?.());
   const s = String(val).trim();
   return /^https?:\/\//i.test(s) ? s : "";
 }
@@ -50,7 +53,6 @@ function idify(val) {
   if (Array.isArray(val)) return idify(val[0]);
   if (typeof val === "object") return idify(val.id || val.hs_object_id || val.value || val.toString?.());
   const s = String(val).trim();
-  // Must be non-empty and mostly digits (but allow string ids from tests)
   return s.length ? s : "";
 }
 
@@ -59,7 +61,6 @@ function extractFromWebhook(body = {}) {
   const input = b.inputFields || {};
   const props = b.properties || b.objectProperties || b.object?.properties || {};
 
-  // Try lots of shapes for call id
   const callId = idify(firstDefined(
     b.callId, b.objectId, b.id, b.hs_object_id,
     input.hs_object_id, input.objectId, input.id,
@@ -67,7 +68,6 @@ function extractFromWebhook(body = {}) {
     getPath(b, "object.id")
   ));
 
-  // Try lots of shapes for recording URL
   const recordingUrl = urlify(firstDefined(
     b.recordingUrl,
     input.recordingUrl,
@@ -75,31 +75,18 @@ function extractFromWebhook(body = {}) {
     props.hs_call_recording_url,
     input.hs_call_video_recording_url,
     input.hs_call_recording_url,
-    // Super-defensive: sometimes nested objects/arrays inside input/properties
     getPath(b, "recording.url"),
     getPath(b, "properties.recordingUrl"),
     getPath(b, "inputFields.recording.url")
   ));
 
-  const candidatesId = [
-    b.callId, b.objectId, b.id, b.hs_object_id,
-    input.hs_object_id, input.objectId, input.id,
-    props.hs_object_id, getPath(b, "object.id")
-  ].filter(v => v !== undefined);
-
-  const candidatesUrl = [
-    b.recordingUrl, input.recordingUrl,
-    props.hs_call_video_recording_url, props.hs_call_recording_url,
-    input.hs_call_video_recording_url, input.hs_call_recording_url,
-    getPath(b, "recording.url"),
-    getPath(b, "properties.recordingUrl"),
-    getPath(b, "inputFields.recording.url")
-  ].filter(v => v !== undefined);
+  const candidatesId = [b.callId, b.objectId, b.id, b.hs_object_id, input.hs_object_id, input.objectId, input.id, props.hs_object_id, getPath(b, "object.id")].filter(v => v !== undefined);
+  const candidatesUrl = [b.recordingUrl, input.recordingUrl, props.hs_call_video_recording_url, props.hs_call_recording_url, input.hs_call_video_recording_url, input.hs_call_recording_url, getPath(b, "recording.url"), getPath(b, "properties.recordingUrl"), getPath(b, "inputFields.recording.url")].filter(v => v !== undefined);
 
   return { callId, recordingUrl, seen: { candidatesId, candidatesUrl } };
 }
 
-// Optional: debug call recording props
+// optional debug
 app.get("/debug/call-recording", async (req, res) => {
   try {
     const { callId } = req.query;
@@ -111,9 +98,7 @@ app.get("/debug/call-recording", async (req, res) => {
       "hs_call_status"
     ]);
     const p = call?.properties || {};
-    res.json({
-      ok: true,
-      callId,
+    res.json({ ok: true, callId,
       hs_call_video_recording_url: p.hs_call_video_recording_url || null,
       hs_call_recording_url: p.hs_call_recording_url || null,
       hs_call_recording_duration: p.hs_call_recording_duration || null,
@@ -124,9 +109,20 @@ app.get("/debug/call-recording", async (req, res) => {
   }
 });
 
+// NEW: manual assoc test endpoint
+app.post("/assoc-test", async (req, res) => {
+  try {
+    const { scorecardId, callId, contactIds = [], dealIds = [] } = req.body || {};
+    if (!scorecardId || !callId) return res.status(400).json({ ok: false, error: "scorecardId and callId are required" });
+    await associateScorecardAllViaTypes({ scorecardId, callId, contactIds, dealIds });
+    return res.json({ ok: true });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 app.post("/process-call", async (req, res) => {
   try {
-    // 1) Parse webhook
     let { callId, recordingUrl, chunkSeconds, concurrency } = req.body || {};
     const parsed = extractFromWebhook(req.body);
     callId = idify(callId) || parsed.callId;
@@ -138,7 +134,6 @@ app.post("/process-call", async (req, res) => {
       console.log("[webhook] parsed candidates (URLs):", parsed.seen.candidatesUrl);
     }
 
-    // 2) If URL still missing but we have callId, fetch from HubSpot
     if (callId && !recordingUrl) {
       console.log("[info] recordingUrl missing — fetching from HubSpot Call…");
       try {
@@ -149,23 +144,22 @@ app.post("/process-call", async (req, res) => {
           "hs_call_status"
         ]);
         const p = call?.properties || {};
-        recordingUrl = urlify(p.hs_call_video_recording_url) || urlify(p.hs_call_recording_url) || "";
+        recordingUrl = (p.hs_call_video_recording_url && /^https?:\/\//i.test(p.hs_call_video_recording_url)) ? p.hs_call_video_recording_url
+                      : (p.hs_call_recording_url && /^https?:\/\//i.test(p.hs_call_recording_url)) ? p.hs_call_recording_url
+                      : "";
         if (recordingUrl) console.log("[info] Found recording URL on Call.");
       } catch (err) {
         console.warn("[warn] Could not fetch call to find recording URL:", err.message);
       }
     }
 
-    // 3) Validate presence
     if (!callId || !recordingUrl) {
       console.warn("[warn] Missing callId or recordingUrl", { callIdPresent: !!callId, recordingUrlPresent: !!recordingUrl });
       return res.status(400).json({ ok: false, error: "callId and recordingUrl are required" });
     }
 
-    // Respond immediately, then background work
     res.status(200).send({ ok: true, callId });
 
-    // 4) Transcription
     const dest = `/tmp/ai-call-worker/${callId}.mp3`;
     console.log(`[bg] Downloading audio to ${dest}`);
     console.log("[bg] Transcribing in parallel… (segment=%ss, concurrency=%s)", Number(chunkSeconds) || 120, Number(concurrency) || 4);
@@ -188,7 +182,6 @@ app.post("/process-call", async (req, res) => {
 
     console.log("[bg] Transcription done, fetching HubSpot call…");
 
-    // 5) Analysis (using TLPI context + call type)
     const callInfo = await getHubSpotObject("calls", callId, ["hubspot_owner_id", "hs_activity_type"]);
     const typeLabel = callInfo?.properties?.hs_activity_type || "Initial Consultation";
 
@@ -196,15 +189,22 @@ app.post("/process-call", async (req, res) => {
     const analysis = await analyseTranscript(typeLabel, transcript);
     console.log("[ai] analysis:", analysis);
 
-    // 6) Associations + updates
     const ownerId = callInfo?.properties?.hubspot_owner_id;
     const contactIds = await getAssociations(callId, "contacts");
     const dealIds = await getAssociations(callId, "deals");
     console.log("[assoc]", { callId, contactIds, dealIds, ownerId });
 
     await updateCall(callId, analysis);
-    const newId = await createScorecard(analysis, { callId, contactIds, dealIds, ownerId });
-    if (newId) console.log("[scorecard] created id:", newId);
+
+    const scorecardId = await createScorecard(analysis, { callId, contactIds, dealIds, ownerId });
+    if (scorecardId) {
+      console.log("[scorecard] created id:", scorecardId);
+
+      // FORCED association (with verification GETs inside)
+      console.log("[force-assoc] start…");
+      await associateScorecardAllViaTypes({ scorecardId, callId, contactIds, dealIds });
+      console.log("[force-assoc] done.");
+    }
 
     console.log(`✅ Done ${callId}`);
   } catch (err) {
