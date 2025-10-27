@@ -1,4 +1,4 @@
-// index.js — v4.2.4-qualification-owner-map
+// index.js — v4.2.5-qualification-call-mapping
 import express from "express";
 import bodyParser from "body-parser";
 import dotenv from "dotenv";
@@ -23,14 +23,14 @@ dotenv.config();
 const app = express();
 app.use(bodyParser.json({ limit: "5mb" }));
 
-console.log("index.js — v4.2.4-qualification-owner-map");
+console.log("index.js — v4.2.5-qualification-call-mapping");
 try { console.log("HS exports available:", Object.keys(HS)); } catch {}
 
 // ---------- tiny utils ----------
 function getPath(obj, path) { return path.split(".").reduce((a, k) => (a && a[k] != null ? a[k] : undefined), obj); }
 function firstDefined(...vals) { for (const v of vals) if (v !== undefined && v !== null) return v; }
 function urlify(val) { if (!val) return ""; if (Array.isArray(val)) return urlify(val[0]); if (typeof val === "object") return urlify(val.url || val.href || val.link || val.value || val.src || val.source || val.toString?.()); const s = String(val).trim(); return /^https?:\/\//i.test(s) ? s : ""; }
-function idify(val) { if (!val) return ""; if (Array.isArray(val)) return idify(val[0]); if (typeof val === "object") return idify(val.id || val.hs_object_id || val.value || val.toString?.()); const s = String(val).trim(); return s.length ? s : ""; }
+function idify(val) { if (!val) return ""; if (Array.isArray(val)) return idify(val[0]); if (typeof val) return String(val.id || val.hs_object_id || val.value || val).trim(); }
 
 // ---------- routes ----------
 app.get("/", (_req, res) => res.send("AI Call Worker v4.x running ✅"));
@@ -137,10 +137,10 @@ app.post("/process-call", async (req, res) => {
       const dealIds = await getAssociations(callId, "deals");
       console.log("[assoc]", { callId, contactIds, dealIds, ownerId });
 
-      // Write ai_qualification_* on the Call
+      // Write ONLY generic call fields (NOT ai_qualification_* — those belong to scorecard)
       await updateQualificationCall(callId, analysis);
 
-      // Create scorecard (carry owner)
+      // Create scorecard (owner carried)
       const scorecardId = await createQualificationScorecard({ callId, contactIds, ownerId, data: analysis });
       console.log("[scorecard] Qualification created:", scorecardId);
 

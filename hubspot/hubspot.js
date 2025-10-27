@@ -1,4 +1,4 @@
-// hubspot/hubspot.js — v1.13 (qualification -> ai_qualification_* on Call; scorecard owner; coaching summary; forced assoc kept)
+// hubspot/hubspot.js — v1.14 (fix: do NOT write ai_qualification_* on Call; keep owner on scorecard; coaching summary)
 import fetch from "node-fetch";
 import dotenv from "dotenv";
 dotenv.config();
@@ -277,41 +277,39 @@ export async function updateCall(callId, analysis) {
   } catch {}
 }
 
-// ---------- Qualification Call updater (writes ai_qualification_* on Call) ----------
+// ---------- Qualification Call updater (write ONLY existing/generic Call props) ----------
 export async function updateQualificationCall(callId, data) {
   const token = HUBSPOT_TOKEN;
   if (!callId || !token) { console.warn("[qual] Missing callId or HubSpot token"); return; }
 
   const url = `${HS.base}/crm/v3/objects/calls/${callId}`;
 
+  // We DO NOT set ai_qualification_* here (those live on the scorecard).
+  // We set generic/consultation-named props that exist on Calls.
+  const decisionCriteria = toLines(data?.ai_decision_criteria);
+  const nextSteps = toLines(data?.ai_next_steps);
+  const objectionsText = toLines(data?.ai_key_objections);
+  const materials = toLines(data?.ai_consultation_required_materials ?? data?.materials_to_send);
+  const outcome = toText(data?.ai_qualification_outcome ?? data?.outcome ?? "Unclear");
+  const likelihood = toNumberOrNull(
+    data?.ai_qualification_likelihood_to_proceed ?? data?.ai_consultation_likelihood_to_close
+  );
+
   const props = {
-    ai_inferred_call_type: "Qualification call", // exact option in your portal
+    ai_inferred_call_type: "Qualification call",
     ai_call_type_confidence: 90,
+    ai_decision_criteria: decisionCriteria,
+    ai_next_steps: nextSteps || "No next steps mentioned.",
+    ai_key_objections: objectionsText || "No objections",
+    ai_objections_bullets: objectionsText ? objectionsText.replace(/; /g, " • ") : "No objections",
+    ai_primary_objection: toText(Array.isArray(data?.ai_key_objections) ? data.ai_key_objections[0] : ""),
+    ai_consultation_required_materials: materials || "Nothing requested",
+    ai_consultation_outcome: outcome,
+    ai_consultation_likelihood_to_close: toNumberOrNull(likelihood) ?? 1,
 
-    // Qualification-specific fields on the Call record:
-    ai_qualification_likelihood_to_proceed: toNumberOrNull(
-      data?.ai_qualification_likelihood_to_proceed ?? data?.ai_consultation_likelihood_to_close
-    ),
-    ai_qualification_outcome: toText(
-      data?.ai_qualification_outcome ?? data?.outcome ?? "Unclear"
-    ),
-    ai_qualification_required_materials: toLines(
-      data?.ai_qualification_required_materials ?? data?.ai_consultation_required_materials
-    ),
-    ai_qualification_decision_criteria: toLines(
-      data?.ai_qualification_decision_criteria ?? data?.ai_decision_criteria
-    ),
-    ai_qualification_key_objections: toLines(
-      data?.ai_qualification_key_objections ?? data?.ai_key_objections
-    ),
-    ai_qualification_next_steps: toLines(
-      data?.ai_qualification_next_steps ?? data?.ai_next_steps
-    ),
-
-    // Keep coaching fields as well:
+    // coaching on the call (optional but useful)
     sales_performance_summary: toLines(
-      // Ensure this is coaching-style, not a raw call summary:
-      data?.sales_performance_summary || data?.coaching_summary || ""
+      data?.sales_performance_summary || data?.coaching_summary || "What went well:\n- \n\nAreas to improve:\n- "
     ),
     chat_gpt___sales_performance: toNumberOrNull(data?.chat_gpt_sales_performance),
     chat_gpt___score_reasoning: toText(data?.chat_gpt_score_reasoning, ""),
@@ -326,7 +324,7 @@ export async function updateQualificationCall(callId, data) {
   }
 }
 
-// ---------- Qualification Scorecard creator (carries owner + coaching summary) ----------
+// ---------- Qualification Scorecard creator (carries owner + coaching summary + qual_* fields) ----------
 export async function createQualificationScorecard({ callId, contactIds = [], ownerId, data }) {
   const token = HUBSPOT_TOKEN;
   if (!token) { console.error("Missing HubSpot token"); return null; }
@@ -353,23 +351,30 @@ export async function createQualificationScorecard({ callId, contactIds = [], ow
   const qualScore = Math.max(0, Math.min(10, Math.round(weighted * 10) / 10));
 
   const props = {
-    activity_type: "Qualification call",                       // required
-    activity_name: `${callId} — Qualification call — ${today}`,// useful label
-    hubspot_owner_id: ownerId || undefined,                    // <-- carry owner from call
+    activity_type: "Qualification call",
+    activity_name: `${callId} — Qualification call — ${today}`,
+    hubspot_owner_id: ownerId || undefined, // carry owner
 
-    // Coaching/feedback to the consultant (not a raw summary)
+    // Coaching/feedback (not a plain recap)
     sales_scorecard___what_you_can_improve_on: toLines(
       data?.sales_performance_summary || data?.coaching_summary || "What went well:\n- \n\nAreas to improve:\n- "
     ),
-    // Headline rating
     sales_performance_rating_: toNumberOrNull(data?.chat_gpt_sales_performance),
 
-    // Generic AI fields reused on this scorecard
+    // Scorecard stores the qualification-specific outputs:
     ai_next_steps: toLines(data?.ai_qualification_next_steps ?? data?.ai_next_steps),
-    ai_consultation_required_materials: toLines(data?.ai_qualification_required_materials ?? data?.ai_consultation_required_materials),
-    ai_decision_criteria: toLines(data?.ai_qualification_decision_criteria ?? data?.ai_decision_criteria),
-    ai_key_objections: toLines(data?.ai_qualification_key_objections ?? data?.ai_key_objections),
-    ai_consultation_outcome: toText(data?.ai_qualification_outcome ?? data?.outcome ?? "Unclear"),
+    ai_consultation_required_materials: toLines(
+      data?.ai_qualification_required_materials ?? data?.ai_consultation_required_materials
+    ),
+    ai_decision_criteria: toLines(
+      data?.ai_qualification_decision_criteria ?? data?.ai_decision_criteria
+    ),
+    ai_key_objections: toLines(
+      data?.ai_qualification_key_objections ?? data?.ai_key_objections
+    ),
+    ai_consultation_outcome: toText(
+      data?.ai_qualification_outcome ?? data?.outcome ?? "Unclear"
+    ),
     ai_consultation_likelihood_to_close: toNumberOrNull(
       data?.ai_qualification_likelihood_to_proceed ?? data?.ai_consultation_likelihood_to_close
     ),
@@ -498,6 +503,6 @@ export async function createScorecard(analysis, ctx) {
   }
   if (!scorecardId) return null;
 
-  // Associations handled by caller
+  // Caller handles associations
   return scorecardId;
 }
