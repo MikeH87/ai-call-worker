@@ -1,4 +1,4 @@
-// hubspot/hubspot.js — v1.12a (normalised + fixed enum + scorecard activity_type)
+// hubspot/hubspot.js — v1.12b (qualification scorecard: correct property names + weighted qual_score_final)
 import fetch from "node-fetch";
 import dotenv from "dotenv";
 dotenv.config();
@@ -366,7 +366,7 @@ export async function updateQualificationCall(callId, data) {
   const url = `${HS.base}/crm/v3/objects/calls/${callId}`;
 
   const props = {
-    // EXACT option label as defined in your HubSpot property (note the lowercase "c"):
+    // EXACT option label (lowercase "c"):
     ai_inferred_call_type: "Qualification call",
     ai_call_type_confidence: 90,
 
@@ -387,7 +387,6 @@ export async function updateQualificationCall(callId, data) {
     ai_objections_bullets: toLines(data?.ai_objections_bullets),
     ai_primary_objection: toText(data?.ai_primary_objection, ""),
 
-    // Likelihood to BOOK the IC (qualification context)
     ai_consultation_likelihood_to_close: toNumberOrNull(data?.ai_consultation_likelihood_to_close),
     ai_consultation_required_materials: toLines(data?.ai_consultation_required_materials),
   };
@@ -400,7 +399,7 @@ export async function updateQualificationCall(callId, data) {
   }
 }
 
-// ---------- Qualification Scorecard creator (now sets required activity_type) ----------
+// ---------- Qualification Scorecard creator (uses existing fields) ----------
 export async function createQualificationScorecard({ callId, contactIds = [], data }) {
   const token = HUBSPOT_TOKEN;
   if (!token) {
@@ -409,35 +408,65 @@ export async function createQualificationScorecard({ callId, contactIds = [], da
   }
 
   const url = `${HS.base}/crm/v3/objects/p49487487_sales_scorecards`;
-
   const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
 
+  // 0/1 flags expected (same style as IC scorecard)
+  const fv = (v) => (v === 1 ? 1 : 0);
+
+  // Weighted total = 10 (more important items carry more weight)
+  const weights = {
+    qual_commitment_requested: 2.0,
+    qual_relevant_pain_identified: 1.5,
+    qual_benefits_linked_to_needs: 1.5,
+    qual_open_question: 1.0,
+    qual_clear_responses_or_followup: 1.0,
+    qual_next_steps_confirmed: 1.0,
+    qual_services_explained_clearly: 0.75,
+    qual_intro: 0.5,
+    qual_rapport: 0.5,
+    qual_active_listening: 0.25,
+  };
+
+  // Compute qual_score_final
+  const q = data?.qualification_eval || {};
+  let weighted = 0;
+  for (const [k, w] of Object.entries(weights)) {
+    const v = fv(q?.[k]);
+    weighted += v * w;
+  }
+  const qualScore = Math.max(0, Math.min(10, Math.round(weighted * 10) / 10));
+
   const props = {
-    // REQUIRED by your custom object:
+    // Required/headers
     activity_type: "Qualification call",
     activity_name: `${callId} — Qualification call — ${today}`,
 
-    sales_scorecard_summary: toLines(data?.sales_performance_summary),
-    sales_performance_rating: toNumberOrNull(data?.chat_gpt_sales_performance),
-    qualification_score: toNumberOrNull(data?.qualification_score),
+    // Sales coaching summary + headline rating
+    sales_scorecard___what_you_can_improve_on: toLines(data?.sales_performance_summary),
+    sales_performance_rating_: toNumberOrNull(data?.chat_gpt_sales_performance),
 
-    ai_qualification_likelihood_to_proceed: toNumberOrNull(data?.ai_consultation_likelihood_to_close),
-    ai_qualification_outcome: toText(data?.ai_qualification_outcome, ""),
-    ai_qualification_required_materials: toLines(data?.ai_consultation_required_materials),
-    ai_qualification_decision_criteria: toLines(data?.ai_decision_criteria),
-    ai_qualification_key_objections: toLines(data?.ai_key_objections),
-    ai_qualification_next_steps: toLines(data?.ai_next_steps),
+    // Generic AI fields (same fields used by IC scorecards)
+    ai_next_steps: toLines(data?.ai_next_steps),
+    ai_consultation_required_materials: toLines(data?.ai_consultation_required_materials),
+    ai_decision_criteria: toLines(data?.ai_decision_criteria),
+    ai_key_objections: toLines(data?.ai_key_objections),
+    ai_consultation_outcome: toText(data?.ai_qualification_outcome || data?.outcome || "Unclear"),
+    ai_consultation_likelihood_to_close: toNumberOrNull(data?.ai_consultation_likelihood_to_close),
 
-    qual_active_listening: toNumberOrNull(data?.qualification_eval?.qual_active_listening) ?? 0,
-    qual_benefits_linked_to_needs: toNumberOrNull(data?.qualification_eval?.qual_benefits_linked_to_needs) ?? 0,
-    qual_clear_responses_or_followup: toNumberOrNull(data?.qualification_eval?.qual_clear_responses_or_followup) ?? 0,
-    qual_commitment_requested: toNumberOrNull(data?.qualification_eval?.qual_commitment_requested) ?? 0,
-    qual_intro: toNumberOrNull(data?.qualification_eval?.qual_intro) ?? 0,
-    qual_next_steps_confirmed: toNumberOrNull(data?.qualification_eval?.qual_next_steps_confirmed) ?? 0,
-    qual_open_question: toNumberOrNull(data?.qualification_eval?.qual_open_question) ?? 0,
-    qual_rapport: toNumberOrNull(data?.qualification_eval?.qual_rapport) ?? 0,
-    qual_relevant_pain_identified: toNumberOrNull(data?.qualification_eval?.qual_relevant_pain_identified) ?? 0,
-    qual_services_explained_clearly: toNumberOrNull(data?.qualification_eval?.qual_services_explained_clearly) ?? 0,
+    // Ten scored behaviours
+    qual_active_listening: toNumberOrNull(q?.qual_active_listening) ?? 0,
+    qual_benefits_linked_to_needs: toNumberOrNull(q?.qual_benefits_linked_to_needs) ?? 0,
+    qual_clear_responses_or_followup: toNumberOrNull(q?.qual_clear_responses_or_followup) ?? 0,
+    qual_commitment_requested: toNumberOrNull(q?.qual_commitment_requested) ?? 0,
+    qual_intro: toNumberOrNull(q?.qual_intro) ?? 0,
+    qual_next_steps_confirmed: toNumberOrNull(q?.qual_next_steps_confirmed) ?? 0,
+    qual_open_question: toNumberOrNull(q?.qual_open_question) ?? 0,
+    qual_rapport: toNumberOrNull(q?.qual_rapport) ?? 0,
+    qual_relevant_pain_identified: toNumberOrNull(q?.qual_relevant_pain_identified) ?? 0,
+    qual_services_explained_clearly: toNumberOrNull(q?.qual_services_explained_clearly) ?? 0,
+
+    // Final score (1–10) using existing property name
+    qual_score_final: qualScore,
   };
 
   let scorecardId = null;
