@@ -1,4 +1,4 @@
-// index.js — v4.1.0-force-assoc
+// index.js — v4.1.0-force-assoc (namespace import diagnostic)
 import express from "express";
 import bodyParser from "body-parser";
 import dotenv from "dotenv";
@@ -6,13 +6,9 @@ import dotenv from "dotenv";
 import { analyseTranscript } from "./ai/analyse.js";
 import { transcribeAudioParallel } from "./ai/parallelTranscribe.js";
 import { getCombinedPrompt } from "./ai/getCombinedPrompt.js";
-import {
-  createScorecard,
-  updateCall,
-  getHubSpotObject,
-  getAssociations,
-  associateScorecardAllViaTypes,
-} from "./hubspot/hubspot.js";
+
+// ⬇️ CHANGED: use namespace import so app won’t crash if named export resolution is odd on Render
+import * as HS from "./hubspot/hubspot.js";
 
 dotenv.config();
 const app = express();
@@ -20,6 +16,23 @@ app.use(bodyParser.json({ limit: "5mb" }));
 
 console.log("index.js — v4.1.0-force-assoc");
 
+// Log what Render actually sees exported from hubspot.js
+try {
+  console.log("HS exports available:", Object.keys(HS));
+} catch (e) {
+  console.warn("Could not list HS exports:", e?.message || e);
+}
+
+// Convenience shorthands (preserve original names)
+const {
+  createScorecard,
+  updateCall,
+  getHubSpotObject,
+  getAssociations,
+  associateScorecardAllViaTypes,
+} = HS;
+
+// ---------- routes ----------
 app.get("/", (req, res) => {
   res.send("AI Call Worker v4.x modular running ✅");
 });
@@ -33,7 +46,7 @@ app.get("/env-check", (req, res) => {
   res.json({ ok: true, tokenSource, hasHubSpotToken: hasAccess || hasPrivate || hasLegacy, seenHubSpotEnvKeys: keys, node: process.version, now: Date.now() });
 });
 
-// helpers
+// ---------- helpers ----------
 function getPath(obj, path) {
   return path.split(".").reduce((a, k) => (a && a[k] != null ? a[k] : undefined), obj);
 }
@@ -86,7 +99,7 @@ function extractFromWebhook(body = {}) {
   return { callId, recordingUrl, seen: { candidatesId, candidatesUrl } };
 }
 
-// optional debug
+// ---------- debug endpoints ----------
 app.get("/debug/call-recording", async (req, res) => {
   try {
     const { callId } = req.query;
