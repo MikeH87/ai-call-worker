@@ -1,4 +1,4 @@
-// hubspot/hubspot.js — v1.10 (forced types[] assoc + verification GETs)
+// hubspot/hubspot.js — v1.11 (normalised strings/numbers + forced types[] assoc + verification GETs)
 import fetch from "node-fetch";
 import dotenv from "dotenv";
 dotenv.config();
@@ -9,7 +9,6 @@ const HUBSPOT_TOKEN =
   process.env.HUBSPOT_ACCESS_TOKEN;
 
 console.log("hubspot.js — v1.10 (expected)");
-
 
 if (!HUBSPOT_TOKEN) {
   console.warn("[warn] HubSpot token missing: set HUBSPOT_PRIVATE_APP_TOKEN (preferred) or HUBSPOT_TOKEN");
@@ -40,6 +39,24 @@ async function hsFetch(url, init = {}) {
     return {};
   }
 }
+
+// ---------- Normalisers (textify arrays/objects safely) ----------
+const toText = (v, fb = "") => {
+  if (v == null) return fb;
+  if (Array.isArray(v)) return v.map((x) => toText(x, "")).filter(Boolean).join("; ");
+  if (typeof v === "object") return String(v?.text ?? v?.content ?? v?.value ?? JSON.stringify(v));
+  const s = String(v).trim();
+  return s || fb;
+};
+const toLines = (v) => {
+  if (v == null) return "";
+  if (Array.isArray(v)) return v.map((x) => toText(x, "")).filter(Boolean).join("\n");
+  return toText(v, "");
+};
+const toNumberOrNull = (v) => {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+};
 
 // ---------- READ HELPERS ----------
 export async function getHubSpotObject(objectType, objectId, properties = []) {
@@ -237,7 +254,7 @@ export async function associateScorecardAllViaTypes({ scorecardId, callId, conta
   }
 }
 
-// ---------- CALL UPDATE ----------
+// ---------- CALL UPDATE (Initial Consultation path) ----------
 export async function updateCall(callId, analysis) {
   const callType = analysis?.call_type || "Initial Consultation";
   const conf =
@@ -343,167 +360,101 @@ export async function updateCall(callId, analysis) {
     console.log("[debug] Call updated:", after?.properties || after);
   } catch {}
 }
-// === Qualification Call updater ===
+
+// ---------- Qualification Call updater (normalised) ----------
 export async function updateQualificationCall(callId, data) {
-  if (!callId || !process.env.HUBSPOT_PRIVATE_APP_TOKEN) {
-    console.warn("Missing callId or HUBSPOT_PRIVATE_APP_TOKEN");
+  const token = HUBSPOT_TOKEN;
+  if (!callId || !token) {
+    console.warn("[qual] Missing callId or HubSpot token");
     return;
   }
 
-  const url = `https://api.hubapi.com/crm/v3/objects/calls/${callId}`;
-  const headers = {
-    Authorization: `Bearer ${process.env.HUBSPOT_PRIVATE_APP_TOKEN}`,
-    "Content-Type": "application/json",
-  };
-
+  const url = `${HS.base}/crm/v3/objects/calls/${callId}`;
   const props = {
     ai_inferred_call_type: "Qualification Call",
-    ai_call_type_confidence: 1.0,
-    ai_product_interest: data.ai_product_interest ?? "",
-    ai_decision_criteria: data.ai_decision_criteria ?? "",
-    ai_data_points_captured: data.ai_data_points_captured ?? "",
-    ai_next_steps: data.ai_next_steps ?? "",
-    ai_key_objections: data.ai_key_objections ?? "",
-    chat_gpt___increase_likelihood_of_sale_suggestions:
-      data.chat_gpt_increase_likelihood_of_sale ?? "",
-    chat_gpt___score_reasoning: data.chat_gpt_score_reasoning ?? "",
-    sales_performance_summary: data.sales_performance_summary ?? "",
-    chat_gpt___sales_performance: data.chat_gpt_sales_performance ?? null,
-    ai_objection_categories: data.ai_objection_categories ?? "",
-    ai_objection_severity: data.ai_objection_severity ?? "",
-    ai_objections_bullets: data.ai_objections_bullets ?? "",
-    ai_primary_objection: data.ai_primary_objection ?? "",
-    ai_consultation_likelihood_to_close:
-      data.ai_consultation_likelihood_to_close ?? null,
-    ai_consultation_required_materials:
-      data.ai_consultation_required_materials ?? "",
+    ai_call_type_confidence: 90,
+
+    ai_product_interest: toText(data?.ai_product_interest, "Unclear"),
+    ai_decision_criteria: toLines(data?.ai_decision_criteria),
+    ai_data_points_captured: toLines(data?.ai_data_points_captured),
+    ai_next_steps: toLines(data?.ai_next_steps),
+    ai_key_objections: toText(data?.ai_key_objections, ""),
+
+    chat_gpt___increase_likelihood_of_sale_suggestions: toLines(data?.chat_gpt_increase_likelihood_of_sale),
+    chat_gpt___score_reasoning: toText(data?.chat_gpt_score_reasoning, ""),
+
+    sales_performance_summary: toLines(data?.sales_performance_summary),
+    chat_gpt___sales_performance: toNumberOrNull(data?.chat_gpt_sales_performance),
+
+    ai_objection_categories: toText(data?.ai_objection_categories, ""),
+    ai_objection_severity: toText(data?.ai_objection_severity, ""),
+    ai_objections_bullets: toLines(data?.ai_objections_bullets),
+    ai_primary_objection: toText(data?.ai_primary_objection, ""),
+
+    // Likelihood to BOOK the IC (qualification context)
+    ai_consultation_likelihood_to_close: toNumberOrNull(data?.ai_consultation_likelihood_to_close),
+    ai_consultation_required_materials: toLines(data?.ai_consultation_required_materials),
   };
 
-  const body = { properties: props };
-
   try {
-    const res = await fetch(url, {
-      method: "PATCH",
-      headers,
-      body: JSON.stringify(body),
-    });
-
-    if (!res.ok) {
-      const msg = await res.text();
-      console.error("HubSpot Qualification update failed:", msg);
-    } else {
-      console.log(`Qualification Call ${callId} updated.`);
-    }
+    await hsFetch(url, { method: "PATCH", body: JSON.stringify({ properties: props }) });
+    console.log(`[qual] Qualification Call ${callId} updated.`);
   } catch (err) {
-    console.error("HubSpot Qualification update error:", err);
+    console.error("[qual] HubSpot Qualification update failed:", err?.message || err);
   }
 }
 
-// === Qualification Scorecard creator ===
-export async function createQualificationScorecard({
-  callId,
-  contactIds = [],
-  data,
-}) {
-  const token = process.env.HUBSPOT_PRIVATE_APP_TOKEN;
+// ---------- Qualification Scorecard creator (normalised; associations handled in index.js) ----------
+export async function createQualificationScorecard({ callId, contactIds = [], data }) {
+  const token = HUBSPOT_TOKEN;
   if (!token) {
-    console.error("Missing HUBSPOT_PRIVATE_APP_TOKEN");
+    console.error("Missing HubSpot token");
     return null;
   }
 
-  const url = "https://api.hubapi.com/crm/v3/objects/p49487487_sales_scorecards";
-  const headers = {
-    Authorization: `Bearer ${token}`,
-    "Content-Type": "application/json",
-  };
+  const url = `${HS.base}/crm/v3/objects/p49487487_sales_scorecards`;
 
-  // Basic properties
   const props = {
-    sales_scorecard_summary: data.sales_performance_summary ?? "",
-    sales_performance_rating: data.chat_gpt_sales_performance ?? null,
-    qualification_score: data.qualification_score ?? null,
-    ai_qualification_likelihood_to_proceed:
-      data.ai_consultation_likelihood_to_close ?? null,
-    ai_qualification_outcome: data.ai_qualification_outcome ?? "",
-    ai_qualification_required_materials:
-      data.ai_consultation_required_materials ?? "",
-    ai_qualification_decision_criteria: data.ai_decision_criteria ?? "",
-    ai_qualification_key_objections: data.ai_key_objections ?? "",
-    ai_qualification_next_steps: data.ai_next_steps ?? "",
-    qual_active_listening: data.qualification_eval?.qual_active_listening ?? 0,
-    qual_benefits_linked_to_needs:
-      data.qualification_eval?.qual_benefits_linked_to_needs ?? 0,
-    qual_clear_responses_or_followup:
-      data.qualification_eval?.qual_clear_responses_or_followup ?? 0,
-    qual_commitment_requested:
-      data.qualification_eval?.qual_commitment_requested ?? 0,
-    qual_intro: data.qualification_eval?.qual_intro ?? 0,
-    qual_next_steps_confirmed:
-      data.qualification_eval?.qual_next_steps_confirmed ?? 0,
-    qual_open_question: data.qualification_eval?.qual_open_question ?? 0,
-    qual_rapport: data.qualification_eval?.qual_rapport ?? 0,
-    qual_relevant_pain_identified:
-      data.qualification_eval?.qual_relevant_pain_identified ?? 0,
-    qual_services_explained_clearly:
-      data.qualification_eval?.qual_services_explained_clearly ?? 0,
+    sales_scorecard_summary: toLines(data?.sales_performance_summary),
+    sales_performance_rating: toNumberOrNull(data?.chat_gpt_sales_performance),
+    qualification_score: toNumberOrNull(data?.qualification_score),
+
+    // Qualification-specific fields on the Scorecard
+    ai_qualification_likelihood_to_proceed: toNumberOrNull(data?.ai_consultation_likelihood_to_close),
+    ai_qualification_outcome: toText(data?.ai_qualification_outcome, ""),
+    ai_qualification_required_materials: toLines(data?.ai_consultation_required_materials),
+    ai_qualification_decision_criteria: toLines(data?.ai_decision_criteria),
+    ai_qualification_key_objections: toLines(data?.ai_key_objections),
+    ai_qualification_next_steps: toLines(data?.ai_next_steps),
+
+    // Ten scored behaviours
+    qual_active_listening: toNumberOrNull(data?.qualification_eval?.qual_active_listening) ?? 0,
+    qual_benefits_linked_to_needs: toNumberOrNull(data?.qualification_eval?.qual_benefits_linked_to_needs) ?? 0,
+    qual_clear_responses_or_followup: toNumberOrNull(data?.qualification_eval?.qual_clear_responses_or_followup) ?? 0,
+    qual_commitment_requested: toNumberOrNull(data?.qualification_eval?.qual_commitment_requested) ?? 0,
+    qual_intro: toNumberOrNull(data?.qualification_eval?.qual_intro) ?? 0,
+    qual_next_steps_confirmed: toNumberOrNull(data?.qualification_eval?.qual_next_steps_confirmed) ?? 0,
+    qual_open_question: toNumberOrNull(data?.qualification_eval?.qual_open_question) ?? 0,
+    qual_rapport: toNumberOrNull(data?.qualification_eval?.qual_rapport) ?? 0,
+    qual_relevant_pain_identified: toNumberOrNull(data?.qualification_eval?.qual_relevant_pain_identified) ?? 0,
+    qual_services_explained_clearly: toNumberOrNull(data?.qualification_eval?.qual_services_explained_clearly) ?? 0,
   };
 
-  const body = { properties: props };
-
-  // Create the Scorecard
-  const res = await fetch(url, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const msg = await res.text();
-    console.error("Failed to create Qualification Scorecard:", msg);
+  let scorecardId = null;
+  try {
+    const created = await hsFetch(url, { method: "POST", body: JSON.stringify({ properties: props }) });
+    scorecardId = created?.id || null;
+    console.log("Created Qualification Scorecard:", scorecardId);
+  } catch (err) {
+    console.error("Failed to create Qualification Scorecard:", err?.message || err);
     return null;
   }
-  const js = await res.json();
-  const scorecardId = js.id;
-  console.log("Created Qualification Scorecard:", scorecardId);
 
-  // --- Associate Scorecard ↔ Call
-  try {
-    const assocUrl = `https://api.hubapi.com/crm/v4/associations/p49487487_sales_scorecards/calls/batch/create`;
-    const assocBody = {
-      inputs: [{ from: { id: scorecardId }, to: { id: callId }, type: "scorecard_to_call" }],
-    };
-    await fetch(assocUrl, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(assocBody),
-    });
-    console.log("Associated Scorecard with Call", callId);
-  } catch (err) {
-    console.error("Association to Call failed:", err);
-  }
-
-  // --- Associate Scorecard ↔ Contacts
-  for (const cid of contactIds) {
-    try {
-      const assocUrl = `https://api.hubapi.com/crm/v4/associations/p49487487_sales_scorecards/contacts/batch/create`;
-      const assocBody = {
-        inputs: [{ from: { id: scorecardId }, to: { id: cid }, type: "scorecard_to_contact" }],
-      };
-      await fetch(assocUrl, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(assocBody),
-      });
-      console.log("Associated Scorecard with Contact", cid);
-    } catch (err) {
-      console.error("Association to Contact failed:", err);
-    }
-  }
-
-  // Leads will be added automatically once HubSpot exposes them
+  // We now do associations centrally in index.js via associateScorecardAllViaTypes
   return scorecardId;
 }
 
-// ---------- SCORECARD CREATE + ASSOC ----------
+// ---------- SCORECARD CREATE + ASSOC (Initial Consultation) ----------
 export async function createScorecard(analysis, ctx) {
   const { callId, contactIds = [], dealIds = [], ownerId } = ctx || {};
   const objectType = "p49487487_sales_scorecards";
