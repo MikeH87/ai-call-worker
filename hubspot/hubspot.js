@@ -1,8 +1,7 @@
-// hubspot/hubspot.js — v1.15
-// - Qualification scorecard now writes ai_qualification_* props explicitly
-// - Coaching summary is constructive feedback (not a call recap)
-// - Owner carried from call → scorecard
-// - Existing functionality retained (IC path unchanged; forced associations util kept)
+// hubspot/hubspot.js — v1.16
+// - Adds new CALL props for qualification marketing & booking likelihood
+// - Keeps all existing behaviour from v1.15 (IC path unchanged; assoc utils intact)
+// - Qualification scorecard still writes ai_qualification_* on the SCORECARD
 import fetch from "node-fetch";
 import dotenv from "dotenv";
 dotenv.config();
@@ -313,7 +312,7 @@ export async function updateCall(callId, analysis) {
   } catch {}
 }
 
-// ---------- Qualification Call updater (Call record: generic props only) ----------
+// ---------- Qualification Call updater (CALL record: adds marketing + booking likelihood) ----------
 export async function updateQualificationCall(callId, data) {
   const token = HUBSPOT_TOKEN;
   if (!callId || !token) { console.warn("[qual] Missing callId or HubSpot token"); return; }
@@ -323,13 +322,26 @@ export async function updateQualificationCall(callId, data) {
   const decisionCriteria = toLines(data?.ai_decision_criteria);
   const nextSteps = toLines(data?.ai_next_steps);
   const objectionsText = toLines(data?.ai_key_objections);
-  const materials = toLines(data?.ai_consultation_required_materials ?? data?.materials_to_send);
+  const materials = toLines(data?.ai_consultation_required_materials ?? data?.ai_qualification_required_materials ?? data?.materials_to_send);
   const outcome = toText(data?.ai_qualification_outcome ?? data?.outcome ?? "Unclear");
-  const likelihood = toNumberOrNull(
+
+  // Likelihood to BUY from TLPI (1–10)
+  const likelihoodBuy = toNumberOrNull(
     data?.ai_qualification_likelihood_to_proceed ?? data?.ai_consultation_likelihood_to_close
   );
 
+  // New marketing / admin fields on CALL
+  const howHeard = toText(data?.ai_how_heard_about_tlpi, "Not mentioned");
+  const problemToSolve = toText(data?.ai_problem_to_solve, "Not mentioned");
+  const approxCT = toNumberOrNull(data?.ai_approx_corporation_tax_bill);
+  const directorStatusRaw = toText(data?.ai_is_company_director, "Unsure");
+  const directorStatus = /^(yes|no|unsure)$/i.test(directorStatusRaw) ? directorStatusRaw : "Unsure";
+
+  // New “likelihood to book IC” dropdown on CALL
+  const likelihoodBookIC = toText(data?.ai_qualification_likelihood_to_book_ic, "Unclear");
+
   const props = {
+    // keep generic AI call context filled on CALL
     ai_inferred_call_type: "Qualification call",
     ai_call_type_confidence: 90,
     ai_decision_criteria: decisionCriteria,
@@ -339,8 +351,16 @@ export async function updateQualificationCall(callId, data) {
     ai_primary_objection: toText(Array.isArray(data?.ai_key_objections) ? data.ai_key_objections[0] : ""),
     ai_consultation_required_materials: materials || "Nothing requested",
     ai_consultation_outcome: outcome,
-    ai_consultation_likelihood_to_close: toNumberOrNull(likelihood) ?? 1,
+    ai_consultation_likelihood_to_close: toNumberOrNull(likelihoodBuy) ?? 1,
 
+    // NEW: marketing/admin fields on CALL
+    ai_how_heard_about_tlpi: howHeard,
+    ai_problem_to_solve: problemToSolve,
+    ai_approx_corporation_tax_bill: approxCT,
+    ai_is_company_director: directorStatus,
+    ai_qualification_likelihood_to_book_ic: likelihoodBookIC,
+
+    // Coaching snapshot on CALL (kept)
     sales_performance_summary: buildCoachingSummary(data),
     chat_gpt___sales_performance: toNumberOrNull(data?.chat_gpt_sales_performance),
     chat_gpt___score_reasoning: toText(data?.chat_gpt_score_reasoning, ""),
@@ -355,7 +375,7 @@ export async function updateQualificationCall(callId, data) {
   }
 }
 
-// ---------- Qualification Scorecard creator (writes ai_qualification_* on scorecard) ----------
+// ---------- Qualification Scorecard creator (writes ai_qualification_* on SCORECARD) ----------
 export async function createQualificationScorecard({ callId, contactIds = [], ownerId, data }) {
   const token = HUBSPOT_TOKEN;
   if (!token) { console.error("Missing HubSpot token"); return null; }
@@ -381,13 +401,13 @@ export async function createQualificationScorecard({ callId, contactIds = [], ow
   for (const [k, w] of Object.entries(weights)) weighted += fv(q?.[k]) * w;
   const qualScore = Math.max(0, Math.min(10, Math.round(weighted * 10) / 10));
 
-  // Normalised values
+  // Normalised values for SCORECARD's ai_qualification_* props
   const qualNext = toLines(data?.ai_qualification_next_steps ?? data?.ai_next_steps);
   const qualMaterials = toLines(data?.ai_qualification_required_materials ?? data?.ai_consultation_required_materials);
   const qualCriteria = toLines(data?.ai_qualification_decision_criteria ?? data?.ai_decision_criteria);
   const qualObjections = toLines(data?.ai_qualification_key_objections ?? data?.ai_key_objections);
   const qualOutcome = toText(data?.ai_qualification_outcome ?? data?.outcome ?? "Unclear");
-  const qualLikelihood = toNumberOrNull(
+  const qualLikelihoodBuy = toNumberOrNull(
     data?.ai_qualification_likelihood_to_proceed ?? data?.ai_consultation_likelihood_to_close
   );
 
@@ -400,13 +420,13 @@ export async function createQualificationScorecard({ callId, contactIds = [], ow
     sales_scorecard___what_you_can_improve_on: buildCoachingSummary(data),
     sales_performance_rating_: toNumberOrNull(data?.chat_gpt_sales_performance),
 
-    // —— Qualification-specific fields (EXPLICIT ai_qualification_* on SCORECARD) ——
+    // —— Qualification-specific fields on SCORECARD —— 
     ai_qualification_next_steps: qualNext,
     ai_qualification_required_materials: qualMaterials,
     ai_qualification_decision_criteria: qualCriteria,
     ai_qualification_key_objections: qualObjections,
     ai_qualification_outcome: qualOutcome,
-    ai_qualification_likelihood_to_proceed: qualLikelihood,
+    ai_qualification_likelihood_to_proceed: qualLikelihoodBuy,
 
     // Ten scored behaviours
     qual_active_listening: toNumberOrNull(q?.qual_active_listening) ?? 0,
