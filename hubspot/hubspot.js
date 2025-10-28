@@ -1,15 +1,9 @@
-// hubspot/hubspot.js — v1.17
-// Changes since v1.16:
-// - Qualification updater fixes:
-//   • Do NOT write ai_consultation_outcome on qualification calls
-//   • Ensure ai_product_interest always set (default "Unclear")
-//   • Ensure ai_data_points_captured / ai_missing_information are populated (fallback text)
-//   • Limit sales_performance_summary to max 4 concise bullets (improvement priority)
-//   • Derive ai_objection_categories from objection text (incl. Authority detection)
-//   • Set ai_primary_objection as the most prevalent/first objection
-//   • Parse approx CT bill numbers robustly (e.g. "£100k", "around 75,000")
-//   • Ensure ai_qualification_likelihood_to_proceed is written
-// - All other functionality preserved.
+// hubspot/hubspot.js — v1.18 (qualification clamp + enums + bullets)
+// Changes vs v1.17:
+// - Objection category now returns ONLY: Price | Timing | Risk | Complexity | Authority | Clarity
+// - Qualification updater clamps ai_objection_categories to allowed set (fallback Clarity)
+// - Retains: product interest default, fallbacks for data points/missing info,
+//   short 4-bullet coaching, owner propagated to scorecard, CT bill parsing, etc.
 
 import fetch from "node-fetch";
 import dotenv from "dotenv";
@@ -116,19 +110,18 @@ function buildQualificationBullets(data = {}) {
   return limitBullets(out, 4);
 }
 
-// Map objection text to a single category
+// Map objection text to ONE allowed enum:
+// Price | Timing | Risk | Complexity | Authority | Clarity
 function categorizeObjections(text = "") {
-  const s = String(text).toLowerCase();
-  if (!s) return "Unclear";
+  const s = String(text || "").toLowerCase();
 
-  if (/(price|fee|cost|expens|cheaper|quote)/i.test(s)) return "Price / Cost / Fees";
-  if (/(time|timing|delay|later|not.*good.*time|busy|next month)/i.test(s)) return "Timing / Delay / Urgency";
-  if (/(complex|confus|complicated|too much effort)/i.test(s)) return "Complexity / Understanding";
-  if (/(risk|trust|security|safe|regulated|scam|reputation)/i.test(s)) return "Risk / Trust / Security";
-  if (/(partner|accountant|director|board|co[- ]?director|wife|husband|spouse|need.*approval|sign.?off)/i.test(s)) return "Authority / Decision-maker";
-  if (/(fit|relevan|not.*for.*me|doesn.?t.*apply|not.*applicable)/i.test(s)) return "Fit / Need / Relevance";
-  if (/(competitor|other provider|another provider|compare|comparing)/i.test(s)) return "Competitor";
-  return "Unclear";
+  if (/(price|fee|cost|expens|cheaper|quote)/i.test(s)) return "Price";
+  if (/(time|timing|delay|later|not.*good.*time|busy|next month)/i.test(s)) return "Timing";
+  if (/(complex|confus|complicated|too much effort)/i.test(s)) return "Complexity";
+  if (/(risk|trust|security|safe|regulated|scam|reputation)/i.test(s)) return "Risk";
+  if (/(partner|accountant|director|board|co[- ]?director|wife|husband|spouse|need.*approval|sign.?off|decision[- ]?maker)/i.test(s)) return "Authority";
+
+  return "Clarity"; // safe fallback
 }
 
 // ---------- READ ----------
@@ -365,7 +358,7 @@ export async function updateCall(callId, analysis) {
   } catch {}
 }
 
-// ---------- Qualification Call updater (fixed) ----------
+// ---------- Qualification Call updater (clamped & short) ----------
 export async function updateQualificationCall(callId, data) {
   const token = HUBSPOT_TOKEN;
   if (!callId || !token) { console.warn("[qual] Missing callId or HubSpot token"); return; }
@@ -376,7 +369,6 @@ export async function updateQualificationCall(callId, data) {
   const nextSteps = toLines(data?.ai_qualification_next_steps ?? data?.ai_next_steps);
   const objectionsText = toLines(data?.ai_qualification_key_objections ?? data?.ai_key_objections);
   const materials = toLines(data?.ai_qualification_required_materials ?? data?.ai_consultation_required_materials ?? data?.materials_to_send);
-  const outcome = toText(data?.ai_qualification_outcome ?? data?.outcome ?? "Unclear");
 
   const likelihoodProceed = toNumberOrNull(
     data?.ai_qualification_likelihood_to_proceed ?? data?.ai_consultation_likelihood_to_close
@@ -407,27 +399,32 @@ export async function updateQualificationCall(callId, data) {
     ? "• " + bullets.join("\n• ")
     : "• Ask for commitment to book the IC\n• Confirm next steps explicitly";
 
-  // Derive objection category + primary
-  const objectionCategory = categorizeObjections(objectionsText);
+  // Derive objection category + primary, clamp to allowed enums
+  const derivedCategory = categorizeObjections(objectionsText);
+  const allowedObjectionEnums = new Set(["Price", "Timing", "Risk", "Complexity", "Authority", "Clarity"]);
+  const safeObjectionCategory = allowedObjectionEnums.has(derivedCategory) ? derivedCategory : "Clarity";
+
   const primaryObjection = (() => {
     if (!objectionsText) return "No objection";
     const parts = objectionsText.split(/[\n;•]+/).map(s => s.trim()).filter(Boolean);
     return parts[0] || "No objection";
   })();
 
-  // Data points / missing info defaults for qual context
+  // Defaults for qual context
   const dataPoints = (() => {
     if (Array.isArray(data?.ai_data_points_captured) && data.ai_data_points_captured.length) {
       return data.ai_data_points_captured.join("; ");
     }
-    return "No data points captured";
+    const t = toText(data?.ai_data_points_captured, "");
+    return t ? t : "No data points captured";
   })();
 
   const missingInfo = (() => {
     if (Array.isArray(data?.ai_missing_information) && data.ai_missing_information.length) {
       return data.ai_missing_information.join("; ");
     }
-    return "Not mentioned";
+    const t = toText(data?.ai_missing_information, "");
+    return t ? t : "Not mentioned";
   })();
 
   const props = {
@@ -442,13 +439,13 @@ export async function updateQualificationCall(callId, data) {
     ai_key_objections: objectionsText || "No objections",
     ai_objections_bullets: objectionsText ? objectionsText.replace(/; /g, " • ") : "No objections",
     ai_primary_objection: primaryObjection,
-    ai_objection_categories: objectionCategory,
+    ai_objection_categories: safeObjectionCategory, // <- clamped to allowed set
 
     ai_data_points_captured: dataPoints,
     ai_missing_information: missingInfo,
     ai_consultation_required_materials: materials || "Nothing requested",
 
-    // NEW — CALL-level marketing/eligibility fields you created
+    // NEW — CALL-level marketing/eligibility fields
     ai_how_heard_about_tlpi: toText(data?.ai_how_heard_about_tlpi, ""),
     ai_problem_to_solve: toText(data?.ai_problem_to_solve, ""),
     ai_approx_corporation_tax_bill: parseApproxNumber(data?.ai_approx_corporation_tax_bill),
@@ -471,7 +468,7 @@ export async function updateQualificationCall(callId, data) {
   }
 }
 
-// ---------- Qualification Scorecard creator (unchanged from v1.16) ----------
+// ---------- Qualification Scorecard creator ----------
 export async function createQualificationScorecard({ callId, contactIds = [], ownerId, data }) {
   const token = HUBSPOT_TOKEN;
   if (!token) { console.error("Missing HubSpot token"); return null; }
@@ -512,7 +509,7 @@ export async function createQualificationScorecard({ callId, contactIds = [], ow
     activity_name: `${callId} — Qualification call — ${today}`,
     hubspot_owner_id: ownerId || undefined, // carry owner
 
-    // Coaching/feedback (short summary already on call; scorecard keeps the longer coaching format if model supplies it)
+    // Coaching/feedback (scorecard can keep longer coaching text if model supplies it)
     sales_scorecard___what_you_can_improve_on:
       toText(data?.sales_scorecard_summary, "") || "What went well:\n- \n\nAreas to improve:\n- ",
     sales_performance_rating_: toNumberOrNull(data?.chat_gpt_sales_performance),
