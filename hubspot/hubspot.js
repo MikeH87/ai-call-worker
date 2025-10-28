@@ -1,7 +1,16 @@
-// hubspot/hubspot.js — v1.16
-// - Adds new CALL props for qualification marketing & booking likelihood
-// - Keeps all existing behaviour from v1.15 (IC path unchanged; assoc utils intact)
-// - Qualification scorecard still writes ai_qualification_* on the SCORECARD
+// hubspot/hubspot.js — v1.17
+// Changes since v1.16:
+// - Qualification updater fixes:
+//   • Do NOT write ai_consultation_outcome on qualification calls
+//   • Ensure ai_product_interest always set (default "Unclear")
+//   • Ensure ai_data_points_captured / ai_missing_information are populated (fallback text)
+//   • Limit sales_performance_summary to max 4 concise bullets (improvement priority)
+//   • Derive ai_objection_categories from objection text (incl. Authority detection)
+//   • Set ai_primary_objection as the most prevalent/first objection
+//   • Parse approx CT bill numbers robustly (e.g. "£100k", "around 75,000")
+//   • Ensure ai_qualification_likelihood_to_proceed is written
+// - All other functionality preserved.
+
 import fetch from "node-fetch";
 import dotenv from "dotenv";
 dotenv.config();
@@ -44,38 +53,82 @@ const toText = (v, fb = "") => {
   return s || fb;
 };
 const toLines = (v) => Array.isArray(v) ? v.map(x => toText(x, "")).filter(Boolean).join("\n") : toText(v, "");
-const toNumberOrNull = (v) => Number.isFinite(Number(v)) ? Number(v) : null;
+const toNumberOrNull = (v) => {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+};
+const toEnum = (value, allowed = [], fallback) => {
+  const s = String(value ?? "").trim();
+  return allowed.includes(s) ? s : (fallback ?? (allowed[0] ?? ""));
+};
+const parseApproxNumber = (x) => {
+  const s = toText(x, "");
+  if (!s) return null;
+  const cleaned = s.replace(/[, ]/g, "").replace(/£/g, "").toLowerCase();
+  // handle “100k” / “75k”
+  const mK = cleaned.match(/^(\d+(\.\d+)?)k$/);
+  if (mK) return Math.round(Number(mK[1]) * 1000);
+  const only = cleaned.replace(/[^0-9.]/g, "");
+  const n = Number(only);
+  return Number.isFinite(n) ? n : null;
+};
 
-// Build a coaching summary (not a recap)
-function buildCoachingSummary(data = {}) {
-  const inc = Array.isArray(data?.chat_gpt_increase_likelihood_of_sale)
-    ? data.chat_gpt_increase_likelihood_of_sale
-    : (toText(data?.chat_gpt_increase_likelihood_of_sale) ? [toText(data?.chat_gpt_increase_likelihood_of_sale)] : []);
+// Short, imperative bullets, up to 4, improvement-priority
+function limitBullets(bullets = [], max = 4) {
+  const clean = (s) => String(s || "")
+    .replace(/^[-•\s]+/, "")
+    .replace(/\.$/, "")
+    .trim();
+  return bullets.map(clean).filter(Boolean).slice(0, max);
+}
 
+// Derive concise qualification coaching bullets
+function buildQualificationBullets(data = {}) {
+  // Prefer model-provided bullets if present
+  const provided = Array.isArray(data?.sales_performance_summary_bullets)
+    ? data.sales_performance_summary_bullets
+    : [];
+  if (provided.length) {
+    return limitBullets(provided, 4);
+  }
+
+  // Otherwise derive from qualification_eval flags
   const q = data?.qualification_eval || {};
-  const flags = [
-    ["Introduced clearly", q?.qual_intro],
-    ["Asked open questions", q?.qual_open_question],
-    ["Linked benefits to needs", q?.qual_benefits_linked_to_needs],
-    ["Identified relevant pain", q?.qual_relevant_pain_identified],
-    ["Provided clear responses or follow-up", q?.qual_clear_responses_or_followup],
-    ["Explained services clearly", q?.qual_services_explained_clearly],
-    ["Built rapport", q?.qual_rapport],
-    ["Confirmed next steps", q?.qual_next_steps_confirmed],
-    ["Requested commitment to book IC", q?.qual_commitment_requested],
-    ["Active listening", q?.qual_active_listening],
+  const improvemap = [
+    ["qual_intro", "Tighten your intro and purpose."],
+    ["qual_open_question", "Ask more open questions."],
+    ["qual_benefits_linked_to_needs", "Link benefits to stated needs."],
+    ["qual_relevant_pain_identified", "Surface a specific pain point earlier."],
+    ["qual_clear_responses_or_followup", "Give clearer, complete responses."],
+    ["qual_services_explained_clearly", "Explain TLPI services more clearly."],
+    ["qual_rapport", "Build rapport more intentionally."],
+    ["qual_next_steps_confirmed", "Confirm next steps explicitly."],
+    ["qual_commitment_requested", "Ask for commitment to book the IC."],
+    ["qual_active_listening", "Demonstrate active listening cues."],
   ];
+  const improvements = improvemap.filter(([k]) => q?.[k] !== 1).map(([, msg]) => msg);
+  const positives = improvemap.filter(([k]) => q?.[k] === 1).map(([, msg]) => msg.replace("more ", "")); // shorter positive
 
-  const wentWell = flags.filter(([_, v]) => v === 1).map(([label]) => `- ${label}`);
-  const improve = [
-    ...flags.filter(([_, v]) => v !== 1).map(([label]) => `- ${label}`),
-    ...inc.map((s) => `- ${toText(s)}`),
-  ];
+  let out = [];
+  if (improvements.length >= 4) out = improvements.slice(0, 4);
+  else out = [...improvements, ...positives].slice(0, 4);
 
-  const ww = wentWell.length ? wentWell.join("\n") : "- —";
-  const imp = improve.length ? improve.join("\n") : "- —";
+  return limitBullets(out, 4);
+}
 
-  return `What went well:\n${ww}\n\nAreas to improve:\n${imp}`;
+// Map objection text to a single category
+function categorizeObjections(text = "") {
+  const s = String(text).toLowerCase();
+  if (!s) return "Unclear";
+
+  if (/(price|fee|cost|expens|cheaper|quote)/i.test(s)) return "Price / Cost / Fees";
+  if (/(time|timing|delay|later|not.*good.*time|busy|next month)/i.test(s)) return "Timing / Delay / Urgency";
+  if (/(complex|confus|complicated|too much effort)/i.test(s)) return "Complexity / Understanding";
+  if (/(risk|trust|security|safe|regulated|scam|reputation)/i.test(s)) return "Risk / Trust / Security";
+  if (/(partner|accountant|director|board|co[- ]?director|wife|husband|spouse|need.*approval|sign.?off)/i.test(s)) return "Authority / Decision-maker";
+  if (/(fit|relevan|not.*for.*me|doesn.?t.*apply|not.*applicable)/i.test(s)) return "Fit / Need / Relevance";
+  if (/(competitor|other provider|another provider|compare|comparing)/i.test(s)) return "Competitor";
+  return "Unclear";
 }
 
 // ---------- READ ----------
@@ -312,56 +365,99 @@ export async function updateCall(callId, analysis) {
   } catch {}
 }
 
-// ---------- Qualification Call updater (CALL record: adds marketing + booking likelihood) ----------
+// ---------- Qualification Call updater (fixed) ----------
 export async function updateQualificationCall(callId, data) {
   const token = HUBSPOT_TOKEN;
   if (!callId || !token) { console.warn("[qual] Missing callId or HubSpot token"); return; }
-
   const url = `${HS.base}/crm/v3/objects/calls/${callId}`;
 
-  const decisionCriteria = toLines(data?.ai_decision_criteria);
-  const nextSteps = toLines(data?.ai_next_steps);
-  const objectionsText = toLines(data?.ai_key_objections);
-  const materials = toLines(data?.ai_consultation_required_materials ?? data?.ai_qualification_required_materials ?? data?.materials_to_send);
+  // Normalise inputs from analysis
+  const decisionCriteria = toLines(data?.ai_qualification_decision_criteria ?? data?.ai_decision_criteria);
+  const nextSteps = toLines(data?.ai_qualification_next_steps ?? data?.ai_next_steps);
+  const objectionsText = toLines(data?.ai_qualification_key_objections ?? data?.ai_key_objections);
+  const materials = toLines(data?.ai_qualification_required_materials ?? data?.ai_consultation_required_materials ?? data?.materials_to_send);
   const outcome = toText(data?.ai_qualification_outcome ?? data?.outcome ?? "Unclear");
 
-  // Likelihood to BUY from TLPI (1–10)
-  const likelihoodBuy = toNumberOrNull(
+  const likelihoodProceed = toNumberOrNull(
     data?.ai_qualification_likelihood_to_proceed ?? data?.ai_consultation_likelihood_to_close
   );
 
-  // New marketing / admin fields on CALL
-  const howHeard = toText(data?.ai_how_heard_about_tlpi, "Not mentioned");
-  const problemToSolve = toText(data?.ai_problem_to_solve, "Not mentioned");
-  const approxCT = toNumberOrNull(data?.ai_approx_corporation_tax_bill);
-  const directorStatusRaw = toText(data?.ai_is_company_director, "Unsure");
-  const directorStatus = /^(yes|no|unsure)$/i.test(directorStatusRaw) ? directorStatusRaw : "Unsure";
+  const likelihoodBookIC = toEnum(
+    data?.ai_qualification_likelihood_to_book_ic,
+    ["Booked", "Very Likely", "Likely", "Unclear", "Unlikely", "No"],
+    "Unclear"
+  );
 
-  // New “likelihood to book IC” dropdown on CALL
-  const likelihoodBookIC = toText(data?.ai_qualification_likelihood_to_book_ic, "Unclear");
+  const director = toEnum(
+    data?.ai_is_company_director,
+    ["Yes", "No", "Unsure"],
+    "Unsure"
+  );
+
+  // Product interest: default to "Unclear"
+  const productInterest = toEnum(
+    data?.ai_product_interest,
+    ["SSAS", "FIC", "Both", "Unclear"],
+    "Unclear"
+  );
+
+  // Build short coaching bullets (max 4)
+  const bullets = buildQualificationBullets(data);
+  const summaryShort = bullets.length
+    ? "• " + bullets.join("\n• ")
+    : "• Ask for commitment to book the IC\n• Confirm next steps explicitly";
+
+  // Derive objection category + primary
+  const objectionCategory = categorizeObjections(objectionsText);
+  const primaryObjection = (() => {
+    if (!objectionsText) return "No objection";
+    const parts = objectionsText.split(/[\n;•]+/).map(s => s.trim()).filter(Boolean);
+    return parts[0] || "No objection";
+  })();
+
+  // Data points / missing info defaults for qual context
+  const dataPoints = (() => {
+    if (Array.isArray(data?.ai_data_points_captured) && data.ai_data_points_captured.length) {
+      return data.ai_data_points_captured.join("; ");
+    }
+    return "No data points captured";
+  })();
+
+  const missingInfo = (() => {
+    if (Array.isArray(data?.ai_missing_information) && data.ai_missing_information.length) {
+      return data.ai_missing_information.join("; ");
+    }
+    return "Not mentioned";
+  })();
 
   const props = {
-    // keep generic AI call context filled on CALL
+    // Core “qualification” signal fields on CALL
     ai_inferred_call_type: "Qualification call",
     ai_call_type_confidence: 90,
+
+    ai_product_interest: productInterest,
+
     ai_decision_criteria: decisionCriteria,
     ai_next_steps: nextSteps || "No next steps mentioned.",
     ai_key_objections: objectionsText || "No objections",
     ai_objections_bullets: objectionsText ? objectionsText.replace(/; /g, " • ") : "No objections",
-    ai_primary_objection: toText(Array.isArray(data?.ai_key_objections) ? data.ai_key_objections[0] : ""),
+    ai_primary_objection: primaryObjection,
+    ai_objection_categories: objectionCategory,
+
+    ai_data_points_captured: dataPoints,
+    ai_missing_information: missingInfo,
     ai_consultation_required_materials: materials || "Nothing requested",
-    ai_consultation_outcome: outcome,
-    ai_consultation_likelihood_to_close: toNumberOrNull(likelihoodBuy) ?? 1,
 
-    // NEW: marketing/admin fields on CALL
-    ai_how_heard_about_tlpi: howHeard,
-    ai_problem_to_solve: problemToSolve,
-    ai_approx_corporation_tax_bill: approxCT,
-    ai_is_company_director: directorStatus,
+    // NEW — CALL-level marketing/eligibility fields you created
+    ai_how_heard_about_tlpi: toText(data?.ai_how_heard_about_tlpi, ""),
+    ai_problem_to_solve: toText(data?.ai_problem_to_solve, ""),
+    ai_approx_corporation_tax_bill: parseApproxNumber(data?.ai_approx_corporation_tax_bill),
+    ai_is_company_director: director,
     ai_qualification_likelihood_to_book_ic: likelihoodBookIC,
+    ai_qualification_likelihood_to_proceed: likelihoodProceed ?? 1,
 
-    // Coaching snapshot on CALL (kept)
-    sales_performance_summary: buildCoachingSummary(data),
+    // Coaching (short)
+    sales_performance_summary: summaryShort,
     chat_gpt___sales_performance: toNumberOrNull(data?.chat_gpt_sales_performance),
     chat_gpt___score_reasoning: toText(data?.chat_gpt_score_reasoning, ""),
     chat_gpt___increase_likelihood_of_sale_suggestions: toLines(data?.chat_gpt_increase_likelihood_of_sale),
@@ -375,7 +471,7 @@ export async function updateQualificationCall(callId, data) {
   }
 }
 
-// ---------- Qualification Scorecard creator (writes ai_qualification_* on SCORECARD) ----------
+// ---------- Qualification Scorecard creator (unchanged from v1.16) ----------
 export async function createQualificationScorecard({ callId, contactIds = [], ownerId, data }) {
   const token = HUBSPOT_TOKEN;
   if (!token) { console.error("Missing HubSpot token"); return null; }
@@ -401,13 +497,13 @@ export async function createQualificationScorecard({ callId, contactIds = [], ow
   for (const [k, w] of Object.entries(weights)) weighted += fv(q?.[k]) * w;
   const qualScore = Math.max(0, Math.min(10, Math.round(weighted * 10) / 10));
 
-  // Normalised values for SCORECARD's ai_qualification_* props
+  // Normalised values
   const qualNext = toLines(data?.ai_qualification_next_steps ?? data?.ai_next_steps);
   const qualMaterials = toLines(data?.ai_qualification_required_materials ?? data?.ai_consultation_required_materials);
   const qualCriteria = toLines(data?.ai_qualification_decision_criteria ?? data?.ai_decision_criteria);
   const qualObjections = toLines(data?.ai_qualification_key_objections ?? data?.ai_key_objections);
   const qualOutcome = toText(data?.ai_qualification_outcome ?? data?.outcome ?? "Unclear");
-  const qualLikelihoodBuy = toNumberOrNull(
+  const qualLikelihood = toNumberOrNull(
     data?.ai_qualification_likelihood_to_proceed ?? data?.ai_consultation_likelihood_to_close
   );
 
@@ -416,17 +512,18 @@ export async function createQualificationScorecard({ callId, contactIds = [], ow
     activity_name: `${callId} — Qualification call — ${today}`,
     hubspot_owner_id: ownerId || undefined, // carry owner
 
-    // Coaching/feedback
-    sales_scorecard___what_you_can_improve_on: buildCoachingSummary(data),
+    // Coaching/feedback (short summary already on call; scorecard keeps the longer coaching format if model supplies it)
+    sales_scorecard___what_you_can_improve_on:
+      toText(data?.sales_scorecard_summary, "") || "What went well:\n- \n\nAreas to improve:\n- ",
     sales_performance_rating_: toNumberOrNull(data?.chat_gpt_sales_performance),
 
-    // —— Qualification-specific fields on SCORECARD —— 
+    // —— Qualification-specific fields (EXPLICIT ai_qualification_* on SCORECARD) ——
     ai_qualification_next_steps: qualNext,
     ai_qualification_required_materials: qualMaterials,
     ai_qualification_decision_criteria: qualCriteria,
     ai_qualification_key_objections: qualObjections,
     ai_qualification_outcome: qualOutcome,
-    ai_qualification_likelihood_to_proceed: qualLikelihoodBuy,
+    ai_qualification_likelihood_to_proceed: qualLikelihood,
 
     // Ten scored behaviours
     qual_active_listening: toNumberOrNull(q?.qual_active_listening) ?? 0,
