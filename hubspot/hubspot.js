@@ -331,7 +331,7 @@ export async function updateCall(callId, analysis) {
     ai_call_type_confidence: conf,
     ai_consultation_outcome: analysis?.outcome || "Unclear",
     ai_consultation_likelihood_to_close: String(likeToClose),
-    ai_product_interest: productInterest,
+    ai_product_interest: (String(productInterest).toLowerCase()==='not mentioned'?'Unclear':productInterest),
     ai_decision_criteria: decisionCriteria.join("; "),
     ai_data_points_captured: dataPointsText,
     ai_missing_information: _asTextOrEmpty(missingInfo),
@@ -432,7 +432,7 @@ export async function updateQualificationCall(callId, data) {
     ai_inferred_call_type: "Qualification call",
     ai_call_type_confidence: 90,
 
-    ai_product_interest: productInterest,
+    ai_product_interest: (String(productInterest).toLowerCase()==='not mentioned'?'Unclear':productInterest),
 
     ai_decision_criteria: _asTextOrEmpty(decisionCriteria),
     ai_next_steps: nextSteps || "No next steps mentioned.",
@@ -646,5 +646,6 @@ export async function createScorecard(analysis, ctx) {
   if (!scorecardId) return null;
   return scorecardId;
 }
+
 
 
