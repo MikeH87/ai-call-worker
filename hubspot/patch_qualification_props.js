@@ -1,6 +1,7 @@
-﻿/* hubspot/patch_qualification_props.js — minimal, isolated patcher (v2)
-   Purpose: patch ONLY 3 CALL props (CT bill, director, likelihood) safely.
-   Enhancement: if analysis bundle lacks data_points, fetch the CALL and parse ai_data_points_captured there. */
+﻿/* hubspot/patch_qualification_props.js — v3
+   Safe, isolated: patches ONLY 3 CALL props.
+   Change: ALWAYS fetch the Call’s ai_data_points_captured from HubSpot and parse CT from there.
+*/
 
 import fetch from "node-fetch";
 import dotenv from "dotenv";
@@ -13,20 +14,11 @@ const HUBSPOT_TOKEN =
 
 const HS_BASE = "https://api.hubapi.com";
 
-const toText = (v, fb = "") => {
-  if (v == null) return fb;
-  if (Array.isArray(v)) return v.map(x => toText(x, "")).filter(Boolean).join("; ");
-  if (typeof v === "object") return String(v?.text ?? v?.content ?? v?.value ?? "");
-  const s = String(v).trim();
-  return s || fb;
-};
-
 const clampEnum = (val, allowed) => {
   const s = String(val ?? "").trim();
   return allowed.includes(s) ? s : "";
 };
 
-// 300k / £300,000 / 0.3m / 300 grand
 function parseApproxNumber(x) {
   const s0 = String(x ?? "").trim();
   if (!s0) return null;
@@ -39,12 +31,10 @@ function parseApproxNumber(x) {
   return Number.isFinite(n) ? Math.round(n) : null;
 }
 
-// Fallback: look for a number near “corporation tax” / “ct”
+// CT extractor: tolerant window around "corporation tax" / "ct"
 function extractCorporationTaxFromText(text = "") {
   const s = String(text || "");
   if (!s) return null;
-  // Allow pluralisation (“corporation tax bills”) while still matching the “corporation tax” phrase:
-  // We search for a money-like token within a small window adjacent to "corporation tax" or "ct".
   const re = /(?:^|.{0,120})(£?\s*\d[\d,]*(?:\.\d+)?\s*(?:k|m|million|grand|g)?)(?=[^a-zA-Z]{0,25}(?:corp(?:oration)?\s*tax|ct\b))|(?:corp(?:oration)?\s*tax|ct\b)[^a-zA-Z]{0,25}(£?\s*\d[\d,]*(?:\.\d+)?\s*(?:k|m|million|grand|g)?)/ig;
   let best = null;
   for (const m of s.matchAll(re)) {
@@ -55,14 +45,14 @@ function extractCorporationTaxFromText(text = "") {
   return best;
 }
 
-async function hsGetCall(callId) {
-  const url = `${HS_BASE}/crm/v3/objects/calls/${callId}?properties=ai_data_points_captured`;
+async function hsGetCallDataPoints(callId) {
+  const url = `${HS_BASE}/crm/v3/objects/calls/${callId}?properties=ai_data_points_captured,ai_is_company_director,ai_qualification_likelihood_to_book_ic`;
   const res = await fetch(url, {
     headers: { "Content-Type":"application/json", Authorization: `Bearer ${HUBSPOT_TOKEN}` }
   });
   if (!res.ok) {
     const t = await res.text().catch(() => "");
-    console.error("[qual-patch] hsGetCall failed:", res.status, t);
+    console.error("[qual-patch] hsGetCallDataPoints failed:", res.status, t);
     return null;
   }
   try { return await res.json(); } catch { return null; }
@@ -72,26 +62,15 @@ export async function patchQualificationCallProps({ callId, data }) {
   try {
     if (!callId) { console.warn("[qual-patch] no callId"); return; }
 
-    // 1) Gather from analysis bundle (if present)
-    let dataPoints = Array.isArray(data?.ai_data_points_captured)
-      ? data.ai_data_points_captured.join("; ")
-      : toText(data?.ai_data_points_captured, "");
+    // ALWAYS read from the Call in HubSpot (most reliable source after main update)
+    const callObj = await hsGetCallDataPoints(callId);
+    const propsInCall = callObj?.properties || {};
 
-    // 2) If missing/empty, read the CALL's ai_data_points_captured from HubSpot (post main update)
-    if (!dataPoints) {
-      const callObj = await hsGetCall(callId);
-      const prop = callObj?.properties?.ai_data_points_captured;
-      dataPoints = toText(prop, "");
-      if (process.env.DEBUG_QUAL) {
-        console.log("[qual-patch] pulled dataPoints from CALL:", dataPoints.slice(0, 200));
-      }
-    }
+    const dataPoints = String(propsInCall.ai_data_points_captured ?? "");
+    const ctFromText = extractCorporationTaxFromText(dataPoints);
+    const ctBill = (ctFromText ?? null);
 
-    // 3) Compute the three fields safely
-    const ctFromAI = parseApproxNumber(data?.ai_approx_corporation_tax_bill);
-    const ctFromText = (ctFromAI == null) ? extractCorporationTaxFromText(dataPoints) : null;
-    const ctBill = (ctFromAI ?? ctFromText ?? null);
-
+    // For now, keep director/likelihood from analysis if provided; otherwise leave blank (prompt tweak will fix)
     const director = clampEnum(
       data?.ai_is_company_director,
       ["Yes", "No", "Unsure"]
@@ -107,7 +86,7 @@ export async function patchQualificationCallProps({ callId, data }) {
       ai_qualification_likelihood_to_book_ic: likelihoodBookIC,
     };
 
-    // 4) PATCH only these three properties
+    // PATCH only these three properties (cannot affect anything else)
     const url = `${HS_BASE}/crm/v3/objects/calls/${callId}`;
     const res = await fetch(url, {
       method: "PATCH",
@@ -123,7 +102,7 @@ export async function patchQualificationCallProps({ callId, data }) {
       console.error("[qual-patch] PATCH failed:", res.status, t, "props:", props);
       return;
     }
-    console.log("[qual-patch] Updated 3 CALL props OK:", callId, props);
+    console.log("[qual-patch] Updated 3 CALL props OK:", callId, props, "dataPoints:", dataPoints.slice(0,200));
   } catch (e) {
     console.error("[qual-patch] error:", e?.message || e);
   }
