@@ -8,7 +8,7 @@
 import fetch from "node-fetch";
 import dotenv from "dotenv";
 dotenv.config();
-
+function _asTextOrEmpty(v){ return (v == null ? "" : String(v)); }
 const HUBSPOT_TOKEN =
   process.env.HUBSPOT_PRIVATE_APP_TOKEN ||
   process.env.HUBSPOT_TOKEN ||
@@ -646,4 +646,5 @@ export async function createScorecard(analysis, ctx) {
   if (!scorecardId) return null;
   return scorecardId;
 }
+
 
