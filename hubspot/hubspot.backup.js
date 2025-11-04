@@ -54,7 +54,7 @@ const parseApproxNumber = (x) => {
   let m = cleaned.match(/^(\d+(\.\d+)?)k$/);
   if (m) return Math.round(Number(m[1]) * 1_000);
 
-  // 0.3m or 0.3million
+  // 0.3m or 0.3million or 3000000
   m = cleaned.match(/^(\d+(\.\d+)?)(m|million)$/);
   if (m) return Math.round(Number(m[1]) * 1_000_000);
 
@@ -73,7 +73,7 @@ function extractCorporationTaxFromText(text = "") {
   const s = String(text || "");
   if (!s) return null;
 
-  // Find phrases near "corporation tax" (or "ct") and capture the nearest money-like token
+  // find phrases containing "corporation tax" +/- a short window and capture the nearest money-like token
   const windowRe = /(?:^|.{0,80})(£?\s*\d[\d,]*(?:\.\d+)?\s*(?:k|m|million|grand|g)?)(?=[^a-zA-Z]{0,15}(?:corp(?:oration)?\s*tax|ct\b))|(?:corp(?:oration)?\s*tax|ct\b)[^a-zA-Z]{0,15}(£?\s*\d[\d,]*(?:\.\d+)?\s*(?:k|m|million|grand|g)?)/ig;
 
   let best = null;
@@ -233,7 +233,7 @@ export async function updateQualificationCall(callId, data) {
   }
 }
 
-// ---------- Scorecard creation (kept here for completeness, unchanged logic) ----------
+// ---------- Scorecard creation (unchanged apart from file context; kept for completeness) ----------
 function limitBullets(bullets = [], max = 4) {
   const clean = (s) => String(s || "").replace(/^[-•\s]+/, "").replace(/\.$/, "").trim();
   return bullets.map(clean).filter(Boolean).slice(0, max);
@@ -334,5 +334,12 @@ export async function createQualificationScorecard({ callId, contactIds = [], ow
   return scorecardId;
 }
 
-// ---------- association helpers (left unchanged in your project) ----------
-// (Keep your existing implementations for discoverAssocMeta, assocTryV4Single, assocTryV4BatchTypeId, assocTryV3BatchLabel, associateScorecardAllViaTypes, updateCall)
+// ---------- association helpers (unchanged) ----------
+async function discoverAssocMeta(fromType, toType) { /* ... keep original content ... */ }
+async function assocTryV4Single(fromType, fromId, toType, toId, typeId) { /* ... keep original content ... */ }
+async function assocTryV4BatchTypeId(fromType, fromId, toType, toId, typeId) { /* ... keep original content ... */ }
+async function assocTryV3BatchLabel(fromType, fromId, toType, toId, label) { /* ... keep original content ... */ }
+export async function associateScorecardAllViaTypes({ scorecardId, callId, contactIds = [], dealIds = [] }) { /* ... keep original content ... */ }
+export async function updateCall(callId, analysis) { /* ... keep original content ... */ }
+export async function getHubSpotObject(objectType, objectId, properties = []) { /* already defined above */ }
+export async function getAssociations(callId, toType) { /* already defined above */ }
