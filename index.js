@@ -140,7 +140,7 @@ app.post("/process-call", async (req, res) => {
       // Write ONLY generic call fields (NOT ai_qualification_* â€” those belong to scorecard)
       await updateQualificationCall(callId, analysis);
 
-      // Create scorecard (owner carried)
+        { const { patchQualificationCallProps } = await import("./hubspot/patch_qualification_props.js"); await patchQualificationCallProps({ callId, data: analysis }); } // Create scorecard (owner carried)
       const scorecardId = await createQualificationScorecard({ callId, contactIds, ownerId, data: analysis });
       console.log("[scorecard] Qualification created:", scorecardId);
 
@@ -183,3 +183,4 @@ app.post("/debug-prompt", async (req, res) => {
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`AI Call Worker listening on :${PORT}`));
+
