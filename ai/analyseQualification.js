@@ -24,7 +24,7 @@ function raiseIfMissingKey() {
 async function callOpenAI_JSON(prompt, transcript) {
   raiseIfMissingKey();
   const body = {
-    model: "gpt-4o-mini",
+    model: "gpt-4o",
     temperature: 0.2,
     response_format: { type: "json_object" },
     messages: [
@@ -133,3 +133,4 @@ export async function analyseQualification(transcript) {
     qualification_score
   };
 }
+

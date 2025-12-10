@@ -1,4 +1,4 @@
-﻿// hubspot/hubspot.js â€” v1.18 (qualification clamp + enums + bullets)
+// hubspot/hubspot.js — v1.18 (qualification clamp + enums + bullets)
 // Changes vs v1.17:
 // - Objection category now returns ONLY: Price | Timing | Risk | Complexity | Authority | Clarity
 // - Qualification updater clamps ai_objection_categories to allowed set (fallback Clarity)
@@ -58,8 +58,8 @@ const toEnum = (value, allowed = [], fallback) => {
 const parseApproxNumber = (x) => {
   const s = toText(x, "");
   if (!s) return null;
-  const cleaned = s.replace(/[, ]/g, "").replace(/Â£/g, "").toLowerCase();
-  // handle â€œ100kâ€ / â€œ75kâ€
+  const cleaned = s.replace(/[, ]/g, "").replace(/£/g, "").toLowerCase();
+  // handle “100k” / “75k”
   const mK = cleaned.match(/^(\d+(\.\d+)?)k$/);
   if (mK) return Math.round(Number(mK[1]) * 1000);
   const only = cleaned.replace(/[^0-9.]/g, "");
@@ -70,7 +70,7 @@ const parseApproxNumber = (x) => {
 // Short, imperative bullets, up to 4, improvement-priority
 function limitBullets(bullets = [], max = 4) {
   const clean = (s) => String(s || "")
-    .replace(/^[-â€¢\s]+/, "")
+    .replace(/^[--\s]+/, "")
     .replace(/\.$/, "")
     .trim();
   return bullets.map(clean).filter(Boolean).slice(0, max);
@@ -338,7 +338,7 @@ export async function updateCall(callId, analysis) {
     ai_consultation_required_materials: requestedMaterials,
     ai_next_steps: nextSteps.length ? nextSteps.join("; ") : "No next steps mentioned.",
     ai_key_objections: objections.length ? objections.join("; ") : "No objections",
-    ai_objections_bullets: objections.length ? objections.join(" â€¢ ") : "No objections",
+    ai_objections_bullets: objections.length ? objections.join(" - ") : "No objections",
     ai_primary_objection: objections[0] || "No objection",
     ai_objection_severity: analysis?.ai_objection_severity || "Medium",
     ai_objection_categories: aiCat,
@@ -396,8 +396,8 @@ export async function updateQualificationCall(callId, data) {
   // Build short coaching bullets (max 4)
   const bullets = buildQualificationBullets(data);
   const summaryShort = bullets.length
-    ? "â€¢ " + bullets.join("\nâ€¢ ")
-    : "â€¢ Ask for commitment to book the IC\nâ€¢ Confirm next steps explicitly";
+    ? "- " + bullets.join("\n- ")
+    : "- Ask for commitment to book the IC\n- Confirm next steps explicitly";
 
   // Derive objection category + primary, clamp to allowed enums
   const derivedCategory = categorizeObjections(objectionsText);
@@ -406,7 +406,7 @@ export async function updateQualificationCall(callId, data) {
 
   const primaryObjection = (() => {
     if (!objectionsText) return "No objection";
-    const parts = objectionsText.split(/[\n;â€¢]+/).map(s => s.trim()).filter(Boolean);
+    const parts = objectionsText.split(/[\n;-]+/).map(s => s.trim()).filter(Boolean);
     return parts[0] || "No objection";
   })();
 
@@ -428,7 +428,7 @@ export async function updateQualificationCall(callId, data) {
   })();
 
   const props = {
-    // Core â€œqualificationâ€ signal fields on CALL
+    // Core “qualification” signal fields on CALL
     ai_inferred_call_type: "Qualification call",
     ai_call_type_confidence: 90,
 
@@ -437,7 +437,7 @@ export async function updateQualificationCall(callId, data) {
     ai_decision_criteria: _asTextOrEmpty(decisionCriteria),
     ai_next_steps: nextSteps || "No next steps mentioned.",
     ai_key_objections: objectionsText || "No objections",
-    ai_objections_bullets: objectionsText ? objectionsText.replace(/; /g, " â€¢ ") : "No objections",
+    ai_objections_bullets: objectionsText ? objectionsText.replace(/; /g, " - ") : "No objections",
     ai_primary_objection: _asTextOrEmpty(primaryObjection),
     ai_objection_categories: safeObjectionCategory, // <- clamped to allowed set
 
@@ -445,7 +445,7 @@ export async function updateQualificationCall(callId, data) {
     ai_missing_information: _asTextOrEmpty(missingInfo),
     ai_consultation_required_materials: materials || "Nothing requested",
 
-    // NEW â€” CALL-level marketing/eligibility fields
+    // NEW — CALL-level marketing/eligibility fields
     ai_how_heard_about_tlpi: _asTextOrEmpty(toText(data?.ai_how_heard_about_tlpi, "")),
     ai_problem_to_solve: _asTextOrEmpty(toText(data?.ai_problem_to_solve, "")),
     ai_approx_corporation_tax_bill: parseApproxNumber(data?.ai_approx_corporation_tax_bill),
@@ -506,7 +506,7 @@ export async function createQualificationScorecard({ callId, contactIds = [], ow
 
   const props = {
     activity_type: "Qualification call",
-    activity_name: `${callId} â€” Qualification call â€” ${today}`,
+    activity_name: `${callId} — Qualification call — ${today}`,
     hubspot_owner_id: ownerId || undefined, // carry owner
 
     // Coaching/feedback (scorecard can keep longer coaching text if model supplies it)
@@ -514,7 +514,7 @@ export async function createQualificationScorecard({ callId, contactIds = [], ow
       toText(data?.sales_scorecard_summary, "") || "What went well:\n- \n\nAreas to improve:\n- ",
     sales_performance_rating_: toNumberOrNull(data?.chat_gpt_sales_performance),
 
-    // â€”â€” Qualification-specific fields (EXPLICIT ai_qualification_* on SCORECARD) â€”â€”
+    // —— Qualification-specific fields (EXPLICIT ai_qualification_* on SCORECARD) ——
     ai_qualification_next_steps: qualNext,
     ai_qualification_required_materials: qualMaterials,
     ai_qualification_decision_criteria: qualCriteria,
@@ -534,7 +534,7 @@ export async function createQualificationScorecard({ callId, contactIds = [], ow
     qual_relevant_pain_identified: toNumberOrNull(q?.qual_relevant_pain_identified) ?? 0,
     qual_services_explained_clearly: toNumberOrNull(q?.qual_services_explained_clearly) ?? 0,
 
-    // Final weighted score (1â€“10)
+    // Final weighted score (1–10)
     qual_score_final: qualScore,
   };
 
@@ -565,7 +565,7 @@ export async function createScorecard(analysis, ctx) {
 
   const props = {
     activity_type: "Initial Consultation",
-    activity_name: `${callId} â€” Initial Consultation â€” ${new Date().toISOString().slice(0, 10)}`,
+    activity_name: `${callId} — Initial Consultation — ${new Date().toISOString().slice(0, 10)}`,
     hubspot_owner_id: ownerId || undefined,
 
     sales_performance_rating_: Number(analysis?.sales_performance_rating || 1),
@@ -646,6 +646,7 @@ export async function createScorecard(analysis, ctx) {
   if (!scorecardId) return null;
   return scorecardId;
 }
+
 
 
 
