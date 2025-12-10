@@ -51,23 +51,46 @@ async function callOpenAI_JSON(prompt, transcript) {
 
 // --- Prompt & expected schema ---
 const PROMPT_QUAL = `
-Respond ONLY in valid JSON matching this schema:
+You are TLPI's Sales & Compliance Assistant. Use British English.
+
+Respond ONLY with a single valid JSON object matching this schema exactly:
+
 {
+  "ai_is_company_director": "Yes | No | Unsure",
   "ai_product_interest": "SSAS | FIC | Both | Unclear",
-  "ai_decision_criteria": "What matters to the client when choosing TLPI",
+
+  "ai_how_heard_about_tlpi": "<source or 'Not mentioned'>",
+  "ai_problem_to_solve": "<primary motivation or 'Not mentioned'>",
+  "ai_approx_corporation_tax_bill": "<digits only like 90000, or 'Not mentioned'>",
+
+  "ai_decision_criteria": "<what matters most or 'Not mentioned'>",
+  "ai_key_objections": "<short list or 'Not mentioned'>",
+  "ai_next_steps": "<concise next actions with timing or 'Not mentioned'>",
+
+  "ai_qualification_outcome": "Booked Initial Consultation | Requested call-back | Not Now | Refused IC | Unclear | No fit",
+
+  "ai_qualification_likelihood_to_book_ic": "Booked | Very Likely | Likely | Unclear | Unlikely | No",
+  "ai_qualification_likelihood_to_proceed": 0-10,
+
+  "ai_qualification_required_materials": "<materials promised/requested or 'No materials requested'>",
+  "ai_qualification_decision_criteria": "<copy of decision criteria>",
+  "ai_qualification_key_objections": "<copy of key objections>",
+  "ai_qualification_next_steps": "<copy of next steps>",
+
   "ai_data_points_captured": "Any personal/company data mentioned (comma separated)",
-  "ai_next_steps": "Agreed next actions",
-  "ai_key_objections": "Concise summary of objections raised",
-  "chat_gpt_increase_likelihood_of_sale": "3 bullet suggestions to improve likelihood of booking an Initial Consultation",
-  "chat_gpt_score_reasoning": "Short reason for the score",
-  "sales_performance_summary": "2–4 bullet points on what went well / areas to improve",
-  "chat_gpt_sales_performance": 1–10,
-  "ai_objection_categories": "Short labels like 'Fees' or 'Timing'",
+  "ai_objection_categories": "Short labels like 'Price', 'Timing', 'Complexity', 'Risk', 'Authority', 'Clarity'",
   "ai_objection_severity": "Low | Medium | High",
   "ai_objections_bullets": "Bullet list of objections",
   "ai_primary_objection": "Single most important objection",
-  "ai_consultation_likelihood_to_close": 0–100,
+
+  "chat_gpt_increase_likelihood_of_sale": "3 bullet suggestions to improve likelihood of booking an Initial Consultation",
+  "chat_gpt_score_reasoning": "Short reason for the score",
+  "sales_performance_summary": "2-4 bullet points on what went well / areas to improve",
+  "chat_gpt_sales_performance": 1-10,
+
+  "ai_consultation_likelihood_to_close": 0-100,
   "ai_consultation_required_materials": "Guides, links, or 'Did not request any'",
+
   "qualification_eval": {
     "qual_active_listening": 0|0.5|1,
     "qual_benefits_linked_to_needs": 0|0.5|1,
@@ -81,10 +104,20 @@ Respond ONLY in valid JSON matching this schema:
     "qual_services_explained_clearly": 0|0.5|1
   }
 }
+
 Rules:
-- Outcome target = client books an Initial Consultation.
-- If clearly committed to book → ai_consultation_likelihood_to_close ≥ 80.
-- If no interest or disqualified → ai_consultation_likelihood_to_close ≤ 30.
+- Treat "saas/sas/SaaS" as SSAS.
+- Treat self-descriptions such as "business owner", "owner of the company", "I run the business", or clear evidence that they pay UK corporation tax as ai_is_company_director = "Yes" unless the transcript explicitly states they are not a director.
+- If a corporation tax amount is mentioned anywhere (for example "�90,000", "90k", "0.3m", "300 grand", "paying more than 30k in corp tax"), set ai_approx_corporation_tax_bill to digits only with no commas, currency or suffix (for example "90000" or "30000"). Convert shorthand like "30k" to "30000". If several CT figures appear, choose the largest plausible one. If no CT amount is stated, use "Not mentioned".
+- Map the whole-conversation outcome to ai_qualification_likelihood_to_book_ic:
+  - "Booked" if an Initial Consultation / Zoom / meeting is actually scheduled on the call (even if called something else).
+  - "Very Likely" for firm positive intent plus a short timeframe (this week, tomorrow, or the next few days).
+  - "Likely" for positive intent but softer commitment or a longer timeframe.
+  - "Unclear" only if you genuinely cannot tell what will happen.
+  - "Unlikely" if they keep delaying beyond about 7 days or remain very non-committal.
+  - "No" if they decline a consultation or meeting.
+- ai_qualification_likelihood_to_proceed is 0-10 (integer) reflecting how likely they are to go ahead with TLPI overall.
+- If something is not stated, use "Not mentioned" (or [] for arrays). Never omit keys.
 `;
 
 export async function analyseQualification(transcript) {
@@ -133,4 +166,5 @@ export async function analyseQualification(transcript) {
     qualification_score
   };
 }
+
 
