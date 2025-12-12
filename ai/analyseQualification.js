@@ -61,13 +61,13 @@ Respond ONLY with a single valid JSON object matching this schema exactly:
 
   "ai_how_heard_about_tlpi": "<source or 'Not mentioned'>",
   "ai_problem_to_solve": "<primary motivation or 'Not mentioned'>",
-  "ai_approx_corporation_tax_bill": "<digits only like 90000, or 'Not mentioned'>",
+  "ai_approx_corporation_tax_bill": "Approx annual UK corporation tax bill as DIGITS ONLY (e.g. "30000"). Use "" if not mentioned.",
 
   "ai_decision_criteria": "<what matters most or 'Not mentioned'>",
   "ai_key_objections": "<short list or 'Not mentioned'>",
   "ai_next_steps": "<concise next actions with timing or 'Not mentioned'>",
 
-  "ai_qualification_outcome": "Booked Initial Consultation | Requested call-back | Not Now | Refused IC | Unclear | No fit",
+  "ai_qualification_outcome": "Booked Initial Consultation | Requested call-back | Not Now | Refused IC | Unclear | No Fit",
 
   "ai_qualification_likelihood_to_book_ic": "Booked | Very Likely | Likely | Unclear | Unlikely | No",
   "ai_qualification_likelihood_to_proceed": 0-10,
@@ -166,5 +166,6 @@ export async function analyseQualification(transcript) {
     qualification_score
   };
 }
+
 
 

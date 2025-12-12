@@ -110,7 +110,7 @@ export async function patchQualificationCallProps({ callId, data }) {
     }
 
     const props = {};
-    if (ctBill != null) props.ai_approx_corporation_tax_bill = String(ctBill);
+    if (ctBill != null && ctBill > 0) props.ai_approx_corporation_tax_bill = String(ctBill);
     if (director) props.ai_is_company_director = director;
     if (likelihoodBookIC) props.ai_qualification_likelihood_to_book_ic = likelihoodBookIC;
 
@@ -136,3 +136,4 @@ export async function patchQualificationCallProps({ callId, data }) {
     console.error("[qual-patch] error:", e?.message || e);
   }
 }
+
