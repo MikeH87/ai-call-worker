@@ -1,4 +1,4 @@
-﻿// index.js â€” v4.2.5-qualification-call-mapping
+// index.js — v4.2.5-qualification-call-mapping
 import express from "express";
 import bodyParser from "body-parser";
 import dotenv from "dotenv";
@@ -23,7 +23,7 @@ dotenv.config();
 const app = express();
 app.use(bodyParser.json({ limit: "5mb" }));
 
-console.log("index.js â€” v4.2.5-qualification-call-mapping");
+console.log("index.js — v4.2.5-qualification-call-mapping");
 try { console.log("HS exports available:", Object.keys(HS)); } catch {}
 
 // ---------- tiny utils ----------
@@ -33,7 +33,7 @@ function urlify(val) { if (!val) return ""; if (Array.isArray(val)) return urlif
 function idify(val) { if (!val) return ""; if (Array.isArray(val)) return idify(val[0]); if (typeof val) return String(val.id || val.hs_object_id || val.value || val).trim(); }
 
 // ---------- routes ----------
-app.get("/", (_req, res) => res.send("AI Call Worker v4.x running âœ…"));
+app.get("/", (_req, res) => res.send("AI Call Worker v4.x running ✅"));
 
 app.get("/env-check", (_req, res) => {
   const keys = Object.keys(process.env).filter(k => k.toUpperCase().startsWith("HUBSPOT")).sort();
@@ -81,7 +81,7 @@ app.post("/process-call", async (req, res) => {
     if (!callId) return res.status(400).json({ ok: false, error: "callId required" });
 
     if (!recordingUrl) {
-      console.log("[info] recordingUrl missing â€” fetching from HubSpot Callâ€¦");
+      console.log("[info] recordingUrl missing — fetching from HubSpot Call…");
       try {
         const call = await getHubSpotObject("calls", callId, [
           "hs_call_video_recording_url",
@@ -104,10 +104,10 @@ app.post("/process-call", async (req, res) => {
     // Early 200 so HubSpot doesn't retry immediately
     res.status(200).send({ ok: true, callId });
 
-    const dest = `/tmp/ai-call-worker/${callId}.mp3`;
+    const dest = `/tmp/ai-call-worker/${callId}.download`;
     console.log("[bg] Processing call", callId);
     console.log(`[bg] Downloading audio to ${dest}`);
-    console.log("[bg] Transcribing in parallelâ€¦ (segment=%ss, concurrency=%s)", Number(chunkSeconds) || 120, Number(concurrency) || 4);
+    console.log("[bg] Transcribing in parallel… (segment=%ss, concurrency=%s)", Number(chunkSeconds) || 120, Number(concurrency) || 4);
 
     let transcript;
     try {
@@ -117,7 +117,7 @@ app.post("/process-call", async (req, res) => {
         concurrency: Number(concurrency) || 4,
       });
     } catch (err) {
-      if (err && err.code === "EMPTY_TRANSCRIPT") { console.warn("[bg] Empty/blank recording â€” skipping AI analysis."); return; }
+      if (err && err.code === "EMPTY_TRANSCRIPT") { console.warn("[bg] Empty/blank recording — skipping AI analysis."); return; }
       console.error("[bg] Transcription error:", err.message || err);
       throw err;
     }
@@ -129,7 +129,7 @@ app.post("/process-call", async (req, res) => {
     // Branch by activity type
     if (/^qualification call$/i.test(typeLabel)) {
       console.log("[ai] Call type detected: Qualification Call");
-      console.log("ðŸŸ¦ Running Qualification Call analysisâ€¦");
+      console.log("🟦 Running Qualification Call analysis…");
 
       const analysis = await analyseQualification(transcript);
 
@@ -137,7 +137,7 @@ app.post("/process-call", async (req, res) => {
       const dealIds = await getAssociations(callId, "deals");
       console.log("[assoc]", { callId, contactIds, dealIds, ownerId });
 
-      // Write ONLY generic call fields (NOT ai_qualification_* â€” those belong to scorecard)
+      // Write ONLY generic call fields (NOT ai_qualification_* — those belong to scorecard)
       await updateQualificationCall(callId, analysis);
 
         { const { patchQualificationCallProps } = await import("./hubspot/patch_qualification_props.js"); await patchQualificationCallProps({ callId, data: analysis }); } // Create scorecard (owner carried)
@@ -145,16 +145,16 @@ app.post("/process-call", async (req, res) => {
       console.log("[scorecard] Qualification created:", scorecardId);
 
       if (scorecardId) {
-        console.log("[force-assoc] start (qualification) â€¦");
+        console.log("[force-assoc] start (qualification) …");
         if (typeof associateScorecardAllViaTypes === "function") await associateScorecardAllViaTypes({ scorecardId, callId, contactIds, dealIds });
         console.log("[force-assoc] done (qualification).");
       }
-      console.log("âœ… Qualification Call complete");
+      console.log("✅ Qualification Call complete");
       return;
     }
 
     // Default: Initial Consultation
-    console.log("[ai] Analysing with TLPI contextâ€¦");
+    console.log("[ai] Analysing with TLPI context…");
     const analysis = await analyseTranscript(typeLabel, transcript);
 
     const contactIds = await getAssociations(callId, "contacts");
@@ -165,13 +165,13 @@ app.post("/process-call", async (req, res) => {
 
     const scorecardId = await createScorecard(analysis, { callId, contactIds, dealIds, ownerId });
     if (scorecardId) {
-      console.log("[force-assoc] startâ€¦");
+      console.log("[force-assoc] start…");
       if (typeof associateScorecardAllViaTypes === "function") await associateScorecardAllViaTypes({ scorecardId, callId, contactIds, dealIds });
       console.log("[force-assoc] done.");
     }
-    console.log(`âœ… Done ${callId}`);
+    console.log(`✅ Done ${callId}`);
   } catch (err) {
-    console.error("âŒ Background error:", err);
+    console.error("❌ Background error:", err);
   }
 });
 
@@ -183,4 +183,5 @@ app.post("/debug-prompt", async (req, res) => {
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`AI Call Worker listening on :${PORT}`));
+
 
