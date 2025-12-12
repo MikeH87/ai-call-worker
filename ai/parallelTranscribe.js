@@ -1,9 +1,7 @@
 // ai/parallelTranscribe.js
 import fs from "fs";
-import fs from "fs/promises";
-
 async function guardMediaFileBeforeProbe(inputPath) {
-  const fh = await fs.open(inputPath, "r");
+  const fh = await _fsp_guard.open(inputPath, "r");
   try {
     const buf = Buffer.alloc(256);
     const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
@@ -32,10 +30,8 @@ async function guardMediaFileBeforeProbe(inputPath) {
   }
 }
 import fsp from "fs/promises";
-import fs from "fs/promises";
-
 async function guardMediaFileBeforeProbe(inputPath) {
-  const fh = await fs.open(inputPath, "r");
+  const fh = await _fsp_guard.open(inputPath, "r");
   try {
     const buf = Buffer.alloc(256);
     const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
@@ -64,10 +60,8 @@ async function guardMediaFileBeforeProbe(inputPath) {
   }
 }
 import path from "path";
-import fs from "fs/promises";
-
 async function guardMediaFileBeforeProbe(inputPath) {
-  const fh = await fs.open(inputPath, "r");
+  const fh = await _fsp_guard.open(inputPath, "r");
   try {
     const buf = Buffer.alloc(256);
     const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
@@ -96,10 +90,8 @@ async function guardMediaFileBeforeProbe(inputPath) {
   }
 }
 import os from "os";
-import fs from "fs/promises";
-
 async function guardMediaFileBeforeProbe(inputPath) {
-  const fh = await fs.open(inputPath, "r");
+  const fh = await _fsp_guard.open(inputPath, "r");
   try {
     const buf = Buffer.alloc(256);
     const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
@@ -128,10 +120,8 @@ async function guardMediaFileBeforeProbe(inputPath) {
   }
 }
 import fetch from "node-fetch";
-import fs from "fs/promises";
-
 async function guardMediaFileBeforeProbe(inputPath) {
-  const fh = await fs.open(inputPath, "r");
+  const fh = await _fsp_guard.open(inputPath, "r");
   try {
     const buf = Buffer.alloc(256);
     const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
@@ -160,10 +150,8 @@ async function guardMediaFileBeforeProbe(inputPath) {
   }
 }
 import ffmpeg from "fluent-ffmpeg";
-import fs from "fs/promises";
-
 async function guardMediaFileBeforeProbe(inputPath) {
-  const fh = await fs.open(inputPath, "r");
+  const fh = await _fsp_guard.open(inputPath, "r");
   try {
     const buf = Buffer.alloc(256);
     const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
@@ -192,10 +180,8 @@ async function guardMediaFileBeforeProbe(inputPath) {
   }
 }
 import ffmpegInstaller from "@ffmpeg-installer/ffmpeg";
-import fs from "fs/promises";
-
 async function guardMediaFileBeforeProbe(inputPath) {
-  const fh = await fs.open(inputPath, "r");
+  const fh = await _fsp_guard.open(inputPath, "r");
   try {
     const buf = Buffer.alloc(256);
     const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
@@ -224,10 +210,8 @@ async function guardMediaFileBeforeProbe(inputPath) {
   }
 }
 import FormData from "form-data";
-import fs from "fs/promises";
-
 async function guardMediaFileBeforeProbe(inputPath) {
-  const fh = await fs.open(inputPath, "r");
+  const fh = await _fsp_guard.open(inputPath, "r");
   try {
     const buf = Buffer.alloc(256);
     const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
@@ -473,6 +457,7 @@ export async function transcribeAudioParallel(destPath, callId, opts = {}) {
   }
   return trimmed;
 }
+
 
 
 
