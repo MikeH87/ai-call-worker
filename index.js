@@ -3,12 +3,210 @@ import express from "express";
 import bodyParser from "body-parser";
 import dotenv from "dotenv";
 
+let _zoomTokenCache = { token: null, expiresAt: 0 };
+
+function _basicAuthHeader(user, pass) {
+  const raw = `${user}:${pass}`;
+  return "Basic " + Buffer.from(raw).toString("base64");
+}
+
+async function getZoomAccessToken() {
+  const accountId = process.env.ZOOM_ACCOUNT_ID;
+  const clientId = process.env.ZOOM_CLIENT_ID;
+  const clientSecret = process.env.ZOOM_CLIENT_SECRET;
+
+  if (!accountId || !clientId || !clientSecret) {
+    throw new Error("Missing Zoom env vars: ZOOM_ACCOUNT_ID / ZOOM_CLIENT_ID / ZOOM_CLIENT_SECRET");
+  }
+
+  const now = Date.now();
+  if (_zoomTokenCache.token && now < _zoomTokenCache.expiresAt) {
+    return _zoomTokenCache.token;
+  }
+
+  const tokenUrl = `https://zoom.us/oauth/token?grant_type=account_credentials&account_id=${encodeURIComponent(accountId)}`;
+
+  const res = await fetch(tokenUrl, {
+    method: "POST",
+    headers: {
+      Authorization: _basicAuthHeader(clientId, clientSecret),
+    },
+  });
+
+  if (!res.ok) {
+    const t = await res.text().catch(() => "");
+    throw new Error(`Zoom token request failed: ${res.status} ${t.slice(0, 200)}`);
+  }
+
+  const js = await res.json();
+  const token = js.access_token;
+  const expiresIn = Number(js.expires_in || 3600);
+
+  if (!token) throw new Error("Zoom token response missing access_token");
+
+  // refresh ~60s early
+  _zoomTokenCache.token = token;
+  _zoomTokenCache.expiresAt = Date.now() + Math.max(0, (expiresIn - 60)) * 1000;
+
+  return token;
+}
+
+function looksLikeMediaContentType(ct) {
+  if (!ct) return false;
+  const c = ct.toLowerCase();
+  return c.startsWith("audio/") || c.startsWith("video/") || c.includes("octet-stream");
+}
+
+async function getZoomDownloadUrl(rawUrl) {
+  const u = new URL(rawUrl);
+  const isZoomWebhookDownload =
+    /zoom\.us$/i.test(u.hostname) && u.pathname.includes("/rec/webhook_download/");
+
+  if (!isZoomWebhookDownload) return rawUrl;
+
+  const token = await getZoomAccessToken();
+  if (!u.searchParams.has("access_token")) u.searchParams.set("access_token", token);
+  return u.toString();
+}
+
 import { analyseTranscript } from "./ai/analyse.js";
 import { transcribeAudioParallel } from "./ai/parallelTranscribe.js";
 import { getCombinedPrompt } from "./ai/getCombinedPrompt.js";
 import { analyseQualification } from "./ai/analyseQualification.js";
 
+let _zoomTokenCache = { token: null, expiresAt: 0 };
+
+function _basicAuthHeader(user, pass) {
+  const raw = `${user}:${pass}`;
+  return "Basic " + Buffer.from(raw).toString("base64");
+}
+
+async function getZoomAccessToken() {
+  const accountId = process.env.ZOOM_ACCOUNT_ID;
+  const clientId = process.env.ZOOM_CLIENT_ID;
+  const clientSecret = process.env.ZOOM_CLIENT_SECRET;
+
+  if (!accountId || !clientId || !clientSecret) {
+    throw new Error("Missing Zoom env vars: ZOOM_ACCOUNT_ID / ZOOM_CLIENT_ID / ZOOM_CLIENT_SECRET");
+  }
+
+  const now = Date.now();
+  if (_zoomTokenCache.token && now < _zoomTokenCache.expiresAt) {
+    return _zoomTokenCache.token;
+  }
+
+  const tokenUrl = `https://zoom.us/oauth/token?grant_type=account_credentials&account_id=${encodeURIComponent(accountId)}`;
+
+  const res = await fetch(tokenUrl, {
+    method: "POST",
+    headers: {
+      Authorization: _basicAuthHeader(clientId, clientSecret),
+    },
+  });
+
+  if (!res.ok) {
+    const t = await res.text().catch(() => "");
+    throw new Error(`Zoom token request failed: ${res.status} ${t.slice(0, 200)}`);
+  }
+
+  const js = await res.json();
+  const token = js.access_token;
+  const expiresIn = Number(js.expires_in || 3600);
+
+  if (!token) throw new Error("Zoom token response missing access_token");
+
+  // refresh ~60s early
+  _zoomTokenCache.token = token;
+  _zoomTokenCache.expiresAt = Date.now() + Math.max(0, (expiresIn - 60)) * 1000;
+
+  return token;
+}
+
+function looksLikeMediaContentType(ct) {
+  if (!ct) return false;
+  const c = ct.toLowerCase();
+  return c.startsWith("audio/") || c.startsWith("video/") || c.includes("octet-stream");
+}
+
+async function getZoomDownloadUrl(rawUrl) {
+  const u = new URL(rawUrl);
+  const isZoomWebhookDownload =
+    /zoom\.us$/i.test(u.hostname) && u.pathname.includes("/rec/webhook_download/");
+
+  if (!isZoomWebhookDownload) return rawUrl;
+
+  const token = await getZoomAccessToken();
+  if (!u.searchParams.has("access_token")) u.searchParams.set("access_token", token);
+  return u.toString();
+}
+
 import * as HS from "./hubspot/hubspot.js";
+
+let _zoomTokenCache = { token: null, expiresAt: 0 };
+
+function _basicAuthHeader(user, pass) {
+  const raw = `${user}:${pass}`;
+  return "Basic " + Buffer.from(raw).toString("base64");
+}
+
+async function getZoomAccessToken() {
+  const accountId = process.env.ZOOM_ACCOUNT_ID;
+  const clientId = process.env.ZOOM_CLIENT_ID;
+  const clientSecret = process.env.ZOOM_CLIENT_SECRET;
+
+  if (!accountId || !clientId || !clientSecret) {
+    throw new Error("Missing Zoom env vars: ZOOM_ACCOUNT_ID / ZOOM_CLIENT_ID / ZOOM_CLIENT_SECRET");
+  }
+
+  const now = Date.now();
+  if (_zoomTokenCache.token && now < _zoomTokenCache.expiresAt) {
+    return _zoomTokenCache.token;
+  }
+
+  const tokenUrl = `https://zoom.us/oauth/token?grant_type=account_credentials&account_id=${encodeURIComponent(accountId)}`;
+
+  const res = await fetch(tokenUrl, {
+    method: "POST",
+    headers: {
+      Authorization: _basicAuthHeader(clientId, clientSecret),
+    },
+  });
+
+  if (!res.ok) {
+    const t = await res.text().catch(() => "");
+    throw new Error(`Zoom token request failed: ${res.status} ${t.slice(0, 200)}`);
+  }
+
+  const js = await res.json();
+  const token = js.access_token;
+  const expiresIn = Number(js.expires_in || 3600);
+
+  if (!token) throw new Error("Zoom token response missing access_token");
+
+  // refresh ~60s early
+  _zoomTokenCache.token = token;
+  _zoomTokenCache.expiresAt = Date.now() + Math.max(0, (expiresIn - 60)) * 1000;
+
+  return token;
+}
+
+function looksLikeMediaContentType(ct) {
+  if (!ct) return false;
+  const c = ct.toLowerCase();
+  return c.startsWith("audio/") || c.startsWith("video/") || c.includes("octet-stream");
+}
+
+async function getZoomDownloadUrl(rawUrl) {
+  const u = new URL(rawUrl);
+  const isZoomWebhookDownload =
+    /zoom\.us$/i.test(u.hostname) && u.pathname.includes("/rec/webhook_download/");
+
+  if (!isZoomWebhookDownload) return rawUrl;
+
+  const token = await getZoomAccessToken();
+  if (!u.searchParams.has("access_token")) u.searchParams.set("access_token", token);
+  return u.toString();
+}
 const {
   createScorecard,
   updateCall,
@@ -141,6 +339,72 @@ app.post("/process-call", async (req, res) => {
       await updateQualificationCall(callId, analysis);
 
         { const { patchQualificationCallProps } = await import("./hubspot/patch_qualification_props.js"); await patchQualificationCallProps({ callId, data: analysis }); } // Create scorecard (owner carried)
+
+let _zoomTokenCache = { token: null, expiresAt: 0 };
+
+function _basicAuthHeader(user, pass) {
+  const raw = `${user}:${pass}`;
+  return "Basic " + Buffer.from(raw).toString("base64");
+}
+
+async function getZoomAccessToken() {
+  const accountId = process.env.ZOOM_ACCOUNT_ID;
+  const clientId = process.env.ZOOM_CLIENT_ID;
+  const clientSecret = process.env.ZOOM_CLIENT_SECRET;
+
+  if (!accountId || !clientId || !clientSecret) {
+    throw new Error("Missing Zoom env vars: ZOOM_ACCOUNT_ID / ZOOM_CLIENT_ID / ZOOM_CLIENT_SECRET");
+  }
+
+  const now = Date.now();
+  if (_zoomTokenCache.token && now < _zoomTokenCache.expiresAt) {
+    return _zoomTokenCache.token;
+  }
+
+  const tokenUrl = `https://zoom.us/oauth/token?grant_type=account_credentials&account_id=${encodeURIComponent(accountId)}`;
+
+  const res = await fetch(tokenUrl, {
+    method: "POST",
+    headers: {
+      Authorization: _basicAuthHeader(clientId, clientSecret),
+    },
+  });
+
+  if (!res.ok) {
+    const t = await res.text().catch(() => "");
+    throw new Error(`Zoom token request failed: ${res.status} ${t.slice(0, 200)}`);
+  }
+
+  const js = await res.json();
+  const token = js.access_token;
+  const expiresIn = Number(js.expires_in || 3600);
+
+  if (!token) throw new Error("Zoom token response missing access_token");
+
+  // refresh ~60s early
+  _zoomTokenCache.token = token;
+  _zoomTokenCache.expiresAt = Date.now() + Math.max(0, (expiresIn - 60)) * 1000;
+
+  return token;
+}
+
+function looksLikeMediaContentType(ct) {
+  if (!ct) return false;
+  const c = ct.toLowerCase();
+  return c.startsWith("audio/") || c.startsWith("video/") || c.includes("octet-stream");
+}
+
+async function getZoomDownloadUrl(rawUrl) {
+  const u = new URL(rawUrl);
+  const isZoomWebhookDownload =
+    /zoom\.us$/i.test(u.hostname) && u.pathname.includes("/rec/webhook_download/");
+
+  if (!isZoomWebhookDownload) return rawUrl;
+
+  const token = await getZoomAccessToken();
+  if (!u.searchParams.has("access_token")) u.searchParams.set("access_token", token);
+  return u.toString();
+}
       const scorecardId = await createQualificationScorecard({ callId, contactIds, ownerId, data: analysis });
       console.log("[scorecard] Qualification created:", scorecardId);
 
@@ -183,5 +447,6 @@ app.post("/debug-prompt", async (req, res) => {
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`AI Call Worker listening on :${PORT}`));
+
 
 
