@@ -1,12 +1,260 @@
 // ai/parallelTranscribe.js
 import fs from "fs";
+import fs from "fs/promises";
+
+async function guardMediaFileBeforeProbe(inputPath) {
+  const fh = await fs.open(inputPath, "r");
+  try {
+    const buf = Buffer.alloc(256);
+    const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
+    const head = buf.slice(0, bytesRead);
+
+    // If it looks like HTML/JSON/text, bail with helpful log
+    const headTxt = head.toString("utf8");
+    if (headTxt.trim().startsWith("<") || headTxt.trim().startsWith("{") || headTxt.toLowerCase().includes("html")) {
+      console.error("[bg] Non-media file head (looks like HTML/JSON):", headTxt.slice(0, 200));
+      throw new Error("Downloaded content is not media (likely Zoom auth/expiry)");
+    }
+
+    // Basic signature checks
+    const hex = head.toString("hex");
+    const isMp3 = hex.startsWith("494433") || hex.startsWith("fff");
+    const isMp4 = hex.includes("66747970"); // 'ftyp'
+    const isWebm = hex.startsWith("1a45dfa3");
+    const isWav = hex.startsWith("52494646");
+
+    if (!(isMp3 || isMp4 || isWebm || isWav)) {
+      console.error("[bg] File head hex:", hex.slice(0, 64));
+      throw new Error("Downloaded content is not recognised media");
+    }
+  } finally {
+    await fh.close();
+  }
+}
 import fsp from "fs/promises";
+import fs from "fs/promises";
+
+async function guardMediaFileBeforeProbe(inputPath) {
+  const fh = await fs.open(inputPath, "r");
+  try {
+    const buf = Buffer.alloc(256);
+    const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
+    const head = buf.slice(0, bytesRead);
+
+    // If it looks like HTML/JSON/text, bail with helpful log
+    const headTxt = head.toString("utf8");
+    if (headTxt.trim().startsWith("<") || headTxt.trim().startsWith("{") || headTxt.toLowerCase().includes("html")) {
+      console.error("[bg] Non-media file head (looks like HTML/JSON):", headTxt.slice(0, 200));
+      throw new Error("Downloaded content is not media (likely Zoom auth/expiry)");
+    }
+
+    // Basic signature checks
+    const hex = head.toString("hex");
+    const isMp3 = hex.startsWith("494433") || hex.startsWith("fff");
+    const isMp4 = hex.includes("66747970"); // 'ftyp'
+    const isWebm = hex.startsWith("1a45dfa3");
+    const isWav = hex.startsWith("52494646");
+
+    if (!(isMp3 || isMp4 || isWebm || isWav)) {
+      console.error("[bg] File head hex:", hex.slice(0, 64));
+      throw new Error("Downloaded content is not recognised media");
+    }
+  } finally {
+    await fh.close();
+  }
+}
 import path from "path";
+import fs from "fs/promises";
+
+async function guardMediaFileBeforeProbe(inputPath) {
+  const fh = await fs.open(inputPath, "r");
+  try {
+    const buf = Buffer.alloc(256);
+    const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
+    const head = buf.slice(0, bytesRead);
+
+    // If it looks like HTML/JSON/text, bail with helpful log
+    const headTxt = head.toString("utf8");
+    if (headTxt.trim().startsWith("<") || headTxt.trim().startsWith("{") || headTxt.toLowerCase().includes("html")) {
+      console.error("[bg] Non-media file head (looks like HTML/JSON):", headTxt.slice(0, 200));
+      throw new Error("Downloaded content is not media (likely Zoom auth/expiry)");
+    }
+
+    // Basic signature checks
+    const hex = head.toString("hex");
+    const isMp3 = hex.startsWith("494433") || hex.startsWith("fff");
+    const isMp4 = hex.includes("66747970"); // 'ftyp'
+    const isWebm = hex.startsWith("1a45dfa3");
+    const isWav = hex.startsWith("52494646");
+
+    if (!(isMp3 || isMp4 || isWebm || isWav)) {
+      console.error("[bg] File head hex:", hex.slice(0, 64));
+      throw new Error("Downloaded content is not recognised media");
+    }
+  } finally {
+    await fh.close();
+  }
+}
 import os from "os";
+import fs from "fs/promises";
+
+async function guardMediaFileBeforeProbe(inputPath) {
+  const fh = await fs.open(inputPath, "r");
+  try {
+    const buf = Buffer.alloc(256);
+    const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
+    const head = buf.slice(0, bytesRead);
+
+    // If it looks like HTML/JSON/text, bail with helpful log
+    const headTxt = head.toString("utf8");
+    if (headTxt.trim().startsWith("<") || headTxt.trim().startsWith("{") || headTxt.toLowerCase().includes("html")) {
+      console.error("[bg] Non-media file head (looks like HTML/JSON):", headTxt.slice(0, 200));
+      throw new Error("Downloaded content is not media (likely Zoom auth/expiry)");
+    }
+
+    // Basic signature checks
+    const hex = head.toString("hex");
+    const isMp3 = hex.startsWith("494433") || hex.startsWith("fff");
+    const isMp4 = hex.includes("66747970"); // 'ftyp'
+    const isWebm = hex.startsWith("1a45dfa3");
+    const isWav = hex.startsWith("52494646");
+
+    if (!(isMp3 || isMp4 || isWebm || isWav)) {
+      console.error("[bg] File head hex:", hex.slice(0, 64));
+      throw new Error("Downloaded content is not recognised media");
+    }
+  } finally {
+    await fh.close();
+  }
+}
 import fetch from "node-fetch";
+import fs from "fs/promises";
+
+async function guardMediaFileBeforeProbe(inputPath) {
+  const fh = await fs.open(inputPath, "r");
+  try {
+    const buf = Buffer.alloc(256);
+    const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
+    const head = buf.slice(0, bytesRead);
+
+    // If it looks like HTML/JSON/text, bail with helpful log
+    const headTxt = head.toString("utf8");
+    if (headTxt.trim().startsWith("<") || headTxt.trim().startsWith("{") || headTxt.toLowerCase().includes("html")) {
+      console.error("[bg] Non-media file head (looks like HTML/JSON):", headTxt.slice(0, 200));
+      throw new Error("Downloaded content is not media (likely Zoom auth/expiry)");
+    }
+
+    // Basic signature checks
+    const hex = head.toString("hex");
+    const isMp3 = hex.startsWith("494433") || hex.startsWith("fff");
+    const isMp4 = hex.includes("66747970"); // 'ftyp'
+    const isWebm = hex.startsWith("1a45dfa3");
+    const isWav = hex.startsWith("52494646");
+
+    if (!(isMp3 || isMp4 || isWebm || isWav)) {
+      console.error("[bg] File head hex:", hex.slice(0, 64));
+      throw new Error("Downloaded content is not recognised media");
+    }
+  } finally {
+    await fh.close();
+  }
+}
 import ffmpeg from "fluent-ffmpeg";
+import fs from "fs/promises";
+
+async function guardMediaFileBeforeProbe(inputPath) {
+  const fh = await fs.open(inputPath, "r");
+  try {
+    const buf = Buffer.alloc(256);
+    const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
+    const head = buf.slice(0, bytesRead);
+
+    // If it looks like HTML/JSON/text, bail with helpful log
+    const headTxt = head.toString("utf8");
+    if (headTxt.trim().startsWith("<") || headTxt.trim().startsWith("{") || headTxt.toLowerCase().includes("html")) {
+      console.error("[bg] Non-media file head (looks like HTML/JSON):", headTxt.slice(0, 200));
+      throw new Error("Downloaded content is not media (likely Zoom auth/expiry)");
+    }
+
+    // Basic signature checks
+    const hex = head.toString("hex");
+    const isMp3 = hex.startsWith("494433") || hex.startsWith("fff");
+    const isMp4 = hex.includes("66747970"); // 'ftyp'
+    const isWebm = hex.startsWith("1a45dfa3");
+    const isWav = hex.startsWith("52494646");
+
+    if (!(isMp3 || isMp4 || isWebm || isWav)) {
+      console.error("[bg] File head hex:", hex.slice(0, 64));
+      throw new Error("Downloaded content is not recognised media");
+    }
+  } finally {
+    await fh.close();
+  }
+}
 import ffmpegInstaller from "@ffmpeg-installer/ffmpeg";
+import fs from "fs/promises";
+
+async function guardMediaFileBeforeProbe(inputPath) {
+  const fh = await fs.open(inputPath, "r");
+  try {
+    const buf = Buffer.alloc(256);
+    const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
+    const head = buf.slice(0, bytesRead);
+
+    // If it looks like HTML/JSON/text, bail with helpful log
+    const headTxt = head.toString("utf8");
+    if (headTxt.trim().startsWith("<") || headTxt.trim().startsWith("{") || headTxt.toLowerCase().includes("html")) {
+      console.error("[bg] Non-media file head (looks like HTML/JSON):", headTxt.slice(0, 200));
+      throw new Error("Downloaded content is not media (likely Zoom auth/expiry)");
+    }
+
+    // Basic signature checks
+    const hex = head.toString("hex");
+    const isMp3 = hex.startsWith("494433") || hex.startsWith("fff");
+    const isMp4 = hex.includes("66747970"); // 'ftyp'
+    const isWebm = hex.startsWith("1a45dfa3");
+    const isWav = hex.startsWith("52494646");
+
+    if (!(isMp3 || isMp4 || isWebm || isWav)) {
+      console.error("[bg] File head hex:", hex.slice(0, 64));
+      throw new Error("Downloaded content is not recognised media");
+    }
+  } finally {
+    await fh.close();
+  }
+}
 import FormData from "form-data";
+import fs from "fs/promises";
+
+async function guardMediaFileBeforeProbe(inputPath) {
+  const fh = await fs.open(inputPath, "r");
+  try {
+    const buf = Buffer.alloc(256);
+    const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
+    const head = buf.slice(0, bytesRead);
+
+    // If it looks like HTML/JSON/text, bail with helpful log
+    const headTxt = head.toString("utf8");
+    if (headTxt.trim().startsWith("<") || headTxt.trim().startsWith("{") || headTxt.toLowerCase().includes("html")) {
+      console.error("[bg] Non-media file head (looks like HTML/JSON):", headTxt.slice(0, 200));
+      throw new Error("Downloaded content is not media (likely Zoom auth/expiry)");
+    }
+
+    // Basic signature checks
+    const hex = head.toString("hex");
+    const isMp3 = hex.startsWith("494433") || hex.startsWith("fff");
+    const isMp4 = hex.includes("66747970"); // 'ftyp'
+    const isWebm = hex.startsWith("1a45dfa3");
+    const isWav = hex.startsWith("52494646");
+
+    if (!(isMp3 || isMp4 || isWebm || isWav)) {
+      console.error("[bg] File head hex:", hex.slice(0, 64));
+      throw new Error("Downloaded content is not recognised media");
+    }
+  } finally {
+    await fh.close();
+  }
+}
 
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 
@@ -225,6 +473,7 @@ export async function transcribeAudioParallel(destPath, callId, opts = {}) {
   }
   return trimmed;
 }
+
 
 
 
